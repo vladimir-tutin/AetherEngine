@@ -15,10 +15,21 @@ on:
 
 jobs:
   tvos-build:
-    runs-on: macos-15
+    # MUST be a runner whose Xcode ships a tvOS 26+ SDK. VTCapabilityProbe.swift guards
+    # VTRegisterSupplementalVideoDecoderIfAvailable behind `#available(tvOS 26.2, ...)`; on an older
+    # SDK that symbol is macOS-only and the guard itself fails to compile. Codemagic uses
+    # `xcode: latest`, so matching that here is also what keeps this check representative.
+    runs-on: macos-26
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+
+      - name: Select newest Xcode
+        run: |
+          ls /Applications | grep -i '^Xcode' || true
+          newest=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -1)
+          echo "Selecting $newest"
+          sudo xcode-select -s "$newest/Contents/Developer"
 
       - name: Show toolchain
         run: |
