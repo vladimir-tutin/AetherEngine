@@ -38,6 +38,44 @@ final class AudioDecoder: @unchecked Sendable {
     /// (which clicks at every frame for non-integer-ms frame durations like 1536-sample AC-3 @ 44.1 kHz).
     private var clock = AudioClockAnchor()
 
+    // MARK: - FlexUI live DSP
+
+    /// Live DSP settings. Guarded because the decode thread reads the whole struct while the main
+    /// actor may be writing one; a torn read would apply half of two different settings to a buffer.
+    private var _dspSettings = AudioDSPSettings.identity
+    private let dspLock = NSLock()
+    private let dspProcessor = AudioDSPProcessor()
+    /// Format description for the PROCESSED output, cached per output channel count. Only built when
+    /// the mixed width differs from the source, so a pure gain change reuses the source description.
+    private var dspFormatDescription: CMAudioFormatDescription?
+    private var dspFormatChannels: Int32 = 0
+    /// Latched when an emitted buffer changed channel count. The host reads and clears it so it can
+    /// flush the audio renderer exactly once per format change (audio only; the clock is untouched).
+    private var _dspFormatDidChange = false
+    private var lastEmittedChannels: Int32 = 0
+
+    var dspSettings: AudioDSPSettings {
+        get {
+            dspLock.lock()
+            defer { dspLock.unlock() }
+            return _dspSettings
+        }
+        set {
+            dspLock.lock()
+            _dspSettings = newValue
+            dspLock.unlock()
+        }
+    }
+
+    /// True once per channel-count change since the previous read.
+    func consumeDSPFormatDidChange() -> Bool {
+        dspLock.lock()
+        defer { dspLock.unlock() }
+        let changed = _dspFormatDidChange
+        _dspFormatDidChange = false
+        return changed
+    }
+
     #if DEBUG
     private var _loggedZeroConvert = false
     #endif
@@ -177,6 +215,9 @@ final class AudioDecoder: @unchecked Sendable {
         resetPending()
         // Re-anchor the gapless clock to the post-seek PTS on the next emitted buffer.
         clock.reset()
+        // Drop the limiter envelope too: a reduction earned by a loud passage before the seek must
+        // not duck the first buffers after it.
+        dspProcessor.reset()
         #if DEBUG
         _loggedZeroConvert = false
         #endif
@@ -232,6 +273,20 @@ final class AudioDecoder: @unchecked Sendable {
     // MARK: - Format Description
 
     private func createFormatDescription() throws {
+        guard let desc = Self.makeFormatDescription(sampleRate: sampleRate, channels: channels) else {
+            throw AudioDecoderError.formatDescriptionFailed
+        }
+        audioFormatDescription = desc
+    }
+
+    /// Build an interleaved packed Float32 CMAudioFormatDescription for a channel count. Factored out
+    /// of `createFormatDescription()` so the DSP path can describe a MIXED width (e.g. a 5.1 source
+    /// folded to stereo) with the identical ASBD/layout rules the source description uses.
+    static func makeFormatDescription(
+        sampleRate: Int32,
+        channels: Int32
+    ) -> CMAudioFormatDescription? {
+        guard sampleRate > 0, channels > 0 else { return nil }
         var asbd = AudioStreamBasicDescription(
             mSampleRate: Float64(sampleRate),
             mFormatID: kAudioFormatLinearPCM,
@@ -264,10 +319,8 @@ final class AudioDecoder: @unchecked Sendable {
             extensions: nil,
             formatDescriptionOut: &formatDesc
         )
-        guard status == noErr, let desc = formatDesc else {
-            throw AudioDecoderError.formatDescriptionFailed
-        }
-        audioFormatDescription = desc
+        guard status == noErr, let desc = formatDesc else { return nil }
+        return desc
     }
 
     // MARK: - Frame → pending buffer → CMSampleBuffer
@@ -324,13 +377,85 @@ final class AudioDecoder: @unchecked Sendable {
     /// Build a CMSampleBuffer from the pending accumulator and reset it. Nil if nothing pending.
     private func emitPending() -> CMSampleBuffer? {
         guard pendingSampleCount > 0,
-              let formatDesc = audioFormatDescription,
+              let sourceFormatDesc = audioFormatDescription,
               !pendingBytes.isEmpty
         else { return nil }
 
-        let totalBytes = pendingBytes.count
         let totalSamples = pendingSampleCount
         let startPTS = pendingStartPTS
+
+        // ── FlexUI live DSP ─────────────────────────────────────────────────────────────────
+        // Read one settings snapshot per buffer. Identity short-circuits entirely: "processing off"
+        // must be the untouched source bytes, not a unity-gain pass, so it stays bit-identical to
+        // stock playback and cannot regress Atmos/passthrough-adjacent material.
+        let settings = dspSettings
+        var emitBytes = pendingBytes
+        var emitFormat = sourceFormatDesc
+        var emitChannels = channels
+
+        if !settings.isIdentity, channels > 0, totalSamples > 0 {
+            let sourceChannels = Int(channels)
+            let outChannelCount = settings.outputChannels(forSource: channels)
+            let outCh = Int(outChannelCount)
+            var processed = Data(count: totalSamples * outCh * 4)
+            let didProcess: Bool = processed.withUnsafeMutableBytes { destRaw -> Bool in
+                guard let dest = destRaw.baseAddress?.assumingMemoryBound(to: Float.self) else {
+                    return false
+                }
+                return pendingBytes.withUnsafeBytes { srcRaw -> Bool in
+                    guard let src = srcRaw.baseAddress?.assumingMemoryBound(to: Float.self) else {
+                        return false
+                    }
+                    guard srcRaw.count >= totalSamples * sourceChannels * 4 else { return false }
+                    dspProcessor.process(
+                        input: src,
+                        output: dest,
+                        frames: totalSamples,
+                        sourceChannels: channels,
+                        settings: settings,
+                        sampleRate: sampleRate
+                    )
+                    return true
+                }
+            }
+
+            if didProcess {
+                emitBytes = processed
+                emitChannels = outChannelCount
+                if outChannelCount == channels {
+                    emitFormat = sourceFormatDesc
+                } else if let cached = dspFormatDescription, dspFormatChannels == outChannelCount {
+                    emitFormat = cached
+                } else if let built = Self.makeFormatDescription(
+                    sampleRate: sampleRate,
+                    channels: outChannelCount
+                ) {
+                    dspFormatDescription = built
+                    dspFormatChannels = outChannelCount
+                    emitFormat = built
+                } else {
+                    // Could not describe the mixed width — emit the source instead of silence.
+                    emitBytes = pendingBytes
+                    emitChannels = channels
+                    emitFormat = sourceFormatDesc
+                }
+            }
+        }
+
+        if lastEmittedChannels != 0, lastEmittedChannels != emitChannels {
+            dspLock.lock()
+            _dspFormatDidChange = true
+            dspLock.unlock()
+            EngineLog.emit(
+                "[AudioDSP] emitted format change \(lastEmittedChannels)ch -> \(emitChannels)ch "
+                + "mode=\(settings.outputMode.rawValue)",
+                category: .swPlayback
+            )
+        }
+        lastEmittedChannels = emitChannels
+
+        let totalBytes = emitBytes.count
+        let formatDesc = emitFormat
 
         var blockBuffer: CMBlockBuffer?
         var status = CMBlockBufferCreateWithMemoryBlock(
@@ -349,7 +474,7 @@ final class AudioDecoder: @unchecked Sendable {
             return nil
         }
 
-        status = pendingBytes.withUnsafeBytes { bytes -> OSStatus in
+        status = emitBytes.withUnsafeBytes { bytes -> OSStatus in
             guard let base = bytes.baseAddress else { return -1 }
             return CMBlockBufferReplaceDataBytes(
                 with: base,
