@@ -1335,7 +1335,7 @@ extension AetherEngine {
     }
 
     /// Activate AVAudioSession for renderer paths (SoftwarePlaybackHost, audio hosts) that have no AVPlayerViewController. Native path deliberately skips this: AVKit activates per playback so tvOS can auto-negotiate the HDMI route (issue #24).
-    private func activateRendererAudioSession(audioSourceStreamIndex: Int32? = nil) {
+    func activateRendererAudioSession(audioSourceStreamIndex: Int32? = nil) {
         #if os(iOS) || os(tvOS)
         let session = AVAudioSession.sharedInstance()
         do { try session.setActive(true) }
