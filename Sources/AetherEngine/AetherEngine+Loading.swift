@@ -1053,6 +1053,9 @@ extension AetherEngine {
 
         activateRendererAudioSession(audioSourceStreamIndex: audioSourceStreamIndex)
         let host = SoftwarePlaybackHost()
+        if !isCustomSource {
+            host.configureAudioTrackSwitchSource(url: url, headers: sourceHTTPHeaders)
+        }
         host.deinterlaceConfig = DeinterlaceConfig(
             mode: loadedOptions.deinterlaceMode,
             fieldRate: loadedOptions.deinterlaceFieldRate

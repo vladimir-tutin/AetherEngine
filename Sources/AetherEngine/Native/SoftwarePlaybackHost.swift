@@ -78,6 +78,12 @@ final class SoftwarePlaybackHost {
     private var audioDecoder: AudioDecoder?
     private var audioOutput: AudioOutput?
     private var demuxer: Demuxer?
+    private let audioOwnershipGate = AudioOwnershipGate()
+    private let audioTrackSwitchReader = AudioTrackSwitchReader()
+    private let liveDSPSettings = AudioDSPSettingsBox()
+    private var audioSwitchURL: URL?
+    private var audioSwitchHeaders: [String: String] = [:]
+    private var sideAudioTrackIndex: Int32?
 
     private let demuxQueue = DispatchQueue(label: "engine.sw.demux", qos: .userInitiated)
 
@@ -313,6 +319,11 @@ final class SoftwarePlaybackHost {
 
     // MARK: - Load
 
+    func configureAudioTrackSwitchSource(url: URL, headers: [String: String]) {
+        audioSwitchURL = url
+        audioSwitchHeaders = headers
+    }
+
     func load(
         demuxer dem: Demuxer,
         startPosition: Double?,
@@ -321,6 +332,9 @@ final class SoftwarePlaybackHost {
         dvrWindowSeconds: Double? = nil
     ) async throws {
         self.demuxer = dem
+        audioOwnershipGate.resetToMain()
+        audioTrackSwitchReader.cancel()
+        sideAudioTrackIndex = nil
         self.duration = dem.duration
         self.isLive = isLive
 
@@ -641,6 +655,10 @@ final class SoftwarePlaybackHost {
 
         dem.seek(to: seconds)
 
+        if let sideIndex = sideAudioTrackIndex {
+            startSideAudioTrack(index: sideIndex, at: seconds, completion: nil)
+        }
+
         let targetTime = CMTime(seconds: seconds, preferredTimescale: 90000)
         videoDecoder.skipUntilPTS = targetTime
         renderer.setSkipThreshold(targetTime)
@@ -749,6 +767,9 @@ final class SoftwarePlaybackHost {
     func stop() {
         stopRequested = true
         isPlaying = false
+        audioTrackSwitchReader.cancel()
+        audioOwnershipGate.resetToMain()
+        sideAudioTrackIndex = nil
         timeTimer?.cancel()
         timeTimer = nil
         renderer.subtitleCompositor.reset()
@@ -807,8 +828,9 @@ final class SoftwarePlaybackHost {
     }
 
     var audioDSPSettings: AudioDSPSettings {
-        get { audioDecoder?.dspSettings ?? pendingDSPSettings ?? .identity }
+        get { liveDSPSettings.value }
         set {
+            liveDSPSettings.value = newValue
             guard let decoder = audioDecoder else {
                 pendingDSPSettings = newValue
                 return
@@ -841,6 +863,80 @@ final class SoftwarePlaybackHost {
         audioDecoder != nil && audioOutput != nil
     }
 
+    /// Switch an embedded VOD audio track without touching the video demuxer, decoder, display layer,
+    /// synchronizer clock, or playback position. Returns false when this source cannot be reopened
+    /// independently, allowing the engine to use its legacy full-reload fallback.
+    func selectAudioTrackInPlace(index: Int32) async -> Bool {
+        guard !isLive,
+              let url = audioSwitchURL,
+              let demuxer,
+              let stream = demuxer.stream(at: index),
+              stream.pointee.codecpar?.pointee.codec_type == AVMEDIA_TYPE_AUDIO,
+              audioOutput != nil else {
+            EngineLog.emit(
+                "[AudioTrackSwitch] in-place unavailable stream=\(index) "
+                + "live=\(isLive ? 1 : 0) reopenable=\(audioSwitchURL != nil ? 1 : 0); fallback=reload",
+                category: .swPlayback
+            )
+            return false
+        }
+
+        let target = audioOutput?.currentTimeSeconds ?? currentTime
+        return await withCheckedContinuation { continuation in
+            startSideAudioTrack(index: index, at: target) { success in
+                continuation.resume(returning: success)
+            }
+        }
+    }
+
+    private func startSideAudioTrack(
+        index: Int32,
+        at position: Double,
+        completion: (@Sendable (Bool) -> Void)?
+    ) {
+        guard let url = audioSwitchURL, let output = audioOutput else {
+            completion?(false)
+            return
+        }
+        EngineLog.emit(
+            "[AudioTrackSwitch] prepare stream=\(index) at=\(String(format: "%.3f", position))s "
+            + "owner=\(sideAudioTrackIndex == nil ? "main-demux" : "side-reader") "
+            + "videoAction=none clockAction=none",
+            category: .swPlayback
+        )
+        audioTrackSwitchReader.start(.init(
+            url: url,
+            headers: audioSwitchHeaders,
+            streamIndex: index,
+            startSeconds: position,
+            dspSettings: liveDSPSettings,
+            output: output,
+            gate: audioOwnershipGate
+        )) { [weak self] success, detail in
+            Task { @MainActor [weak self] in
+                guard let self else {
+                    completion?(false)
+                    return
+                }
+                if success {
+                    self.sideAudioTrackIndex = index
+                    self.audioStreamIndex = index
+                    EngineLog.emit(
+                        "[AudioTrackSwitch] complete stream=\(index) result=audio-only "
+                        + "videoPreserved=1 clockPreserved=1 detail=\(detail)",
+                        category: .swPlayback
+                    )
+                } else {
+                    EngineLog.emit(
+                        "[AudioTrackSwitch] failed stream=\(index) detail=\(detail) fallback=reload",
+                        category: .swPlayback
+                    )
+                }
+                completion?(success)
+            }
+        }
+    }
+
     // MARK: - Demux loop
 
     /// Capture dependencies as locals so the demux loop runs off-main without re-entering the actor.
@@ -860,6 +956,7 @@ final class SoftwarePlaybackHost {
         let ring = dvrRing
         let vTbSec = videoTimeBaseSeconds
         let aTbSec = audioTimeBaseSeconds
+        let ownershipGate = audioOwnershipGate
         let liveSession = isLive
         let noteEdge: @Sendable (Double) -> Void = { [weak self] ptsSec in
             guard let self, ptsSec.isFinite else { return }
@@ -1004,6 +1101,7 @@ final class SoftwarePlaybackHost {
                 onError: onError,
                 onEnd: onEnd,
                 audioTapSink: getAudioTapSink,
+                audioOwnershipGate: ownershipGate,
                 subtitleStreamIndices: subIndices,
                 subtitleTimeBases: subTimeBases,
                 splitDisplaySetSubtitleStreamIndices: subSplitSetIndices,
@@ -1475,6 +1573,7 @@ final class SoftwarePlaybackHost {
         onError: @Sendable (String) -> Void,
         onEnd: @Sendable () -> Void,
         audioTapSink: @Sendable () -> ((@Sendable (CMSampleBuffer) -> Void)?),
+        audioOwnershipGate: AudioOwnershipGate,
         subtitleStreamIndices: Set<Int32> = [],
         subtitleTimeBases: [Int32: AVRational] = [:],
         splitDisplaySetSubtitleStreamIndices: Set<Int32> = [],
@@ -1684,13 +1783,13 @@ final class SoftwarePlaybackHost {
                     }
                 }
                 audioPacketsSeen += 1
-                let buffers = aDec.decode(packet: packet)
+                let buffers = audioOwnershipGate.decodeAndEnqueueMain(
+                    decoder: aDec,
+                    packet: packet,
+                    output: aOut,
+                    tap: audioTapSink()
+                )
                 if !buffers.isEmpty { audioBuffersProduced = true }
-                let tapSink = audioTapSink()
-                for buf in buffers {
-                    tapSink?(buf)   // #95: mirror before enqueue
-                    aOut.enqueue(sampleBuffer: buf)
-                }
                 // Arm clock on first decoded audio buffer; latch so subsequent packets don't snap clock back.
                 if !clockArmed(), !buffers.isEmpty {
                     // #107: anchor at the buffer PTS when it deviates from the load anchor
