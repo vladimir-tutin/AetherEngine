@@ -4951,7 +4951,7 @@ public final class AetherEngine: ObservableObject {
                     self.activeAudioTrackIndex = index
                     self.activeAudioDecoder = Self.softwareAudioDecoderLabel(
                         audioTracks: self.audioTracks,
-                        activeIndex: index
+                        activeIndex: Int32(index)
                     )
                     self.activateRendererAudioSession(audioSourceStreamIndex: Int32(index))
                     EngineLog.emit(
