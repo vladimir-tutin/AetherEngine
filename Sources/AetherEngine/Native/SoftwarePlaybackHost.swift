@@ -490,6 +490,11 @@ final class SoftwarePlaybackHost {
         // AudioOutput owns the AVSampleBufferRenderSynchronizer (master clock). Created unconditionally: video-only previously got no clock (frozen frame, currentTime=0). Layer attached in play() after the engine hangs it in the view hierarchy (attaching free-floating fails FigVideoQueueRemote -12080 on tvOS 26+).
         self.audioOutput = AudioOutput()
 
+        // Adopt any DSP settings chosen before this session had a decoder (engine-level write while
+        // idle, or a value carried across a track/source change). Without this the first session after
+        // a setting change would play unprocessed while the UI reported the setting as chosen.
+        applyPendingDSPSettingsIfNeeded()
+
         // Reset the live feeder state for the new session.
         resetFeederState()
 
@@ -773,6 +778,67 @@ final class SoftwarePlaybackHost {
     var volume: Float {
         get { audioOutput?.volume ?? 1.0 }
         set { audioOutput?.volume = newValue }
+    }
+
+    // MARK: - FlexUI live audio DSP
+
+    /// Live DSP settings for the decoded-PCM audio path.
+    ///
+    /// A gain or centre change needs nothing else: the decoder reads a fresh snapshot per emitted
+    /// buffer (~21 ms), so the change is audible as soon as what the renderer has already queued
+    /// drains. A CHANNEL-COUNT change is different — it changes the CMSampleBuffer format
+    /// description — so the audio renderer is flushed once, which drops the queued audio and lets the
+    /// new width start immediately. The flush touches ONLY `AVSampleBufferAudioRenderer`: the video
+    /// renderer, the display layer, and the master `AVSampleBufferRenderSynchronizer` clock are not
+    /// involved, so video keeps running and the position does not move.
+    /// Settings written before a decoder existed, replayed by `applyPendingDSPSettingsIfNeeded()` when
+    /// the session loads.
+    private var pendingDSPSettings: AudioDSPSettings?
+
+    func applyPendingDSPSettingsIfNeeded() {
+        guard let pending = pendingDSPSettings, audioDecoder != nil else { return }
+        pendingDSPSettings = nil
+        audioDSPSettings = pending
+        EngineLog.emit(
+            "[AudioDSP] replayed pending settings on load mode=\(pending.outputMode.rawValue) "
+            + "dialogue=\(pending.dialogueGainDb)dB master=\(pending.masterGainDb)dB",
+            category: .swPlayback
+        )
+    }
+
+    var audioDSPSettings: AudioDSPSettings {
+        get { audioDecoder?.dspSettings ?? pendingDSPSettings ?? .identity }
+        set {
+            guard let decoder = audioDecoder else {
+                pendingDSPSettings = newValue
+                return
+            }
+            let previous = decoder.dspSettings
+            guard previous != newValue else { return }
+            decoder.dspSettings = newValue
+            let widthChanges = previous.outputMode != newValue.outputMode
+            EngineLog.emit(
+                "[AudioDSP] settings mode=\(newValue.outputMode.rawValue) "
+                + "dialogue=\(newValue.dialogueGainDb)dB master=\(newValue.masterGainDb)dB "
+                + "identity=\(newValue.isIdentity ? 1 : 0) widthChange=\(widthChanges ? 1 : 0)",
+                category: .swPlayback
+            )
+            if widthChanges {
+                // Flush the already-queued audio so the new width is heard now rather than after the
+                // old format drains. Audio only — the clock keeps running, so A/V stays aligned.
+                audioOutput?.flush()
+                EngineLog.emit(
+                    "[AudioDSP] audio renderer flushed for width change "
+                    + "(video + master clock untouched)",
+                    category: .swPlayback
+                )
+            }
+        }
+    }
+
+    /// True when this host is actually rendering decoded PCM, i.e. DSP can take effect at all.
+    var audioDSPIsAvailable: Bool {
+        audioDecoder != nil && audioOutput != nil
     }
 
     // MARK: - Demux loop

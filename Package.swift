@@ -38,7 +38,11 @@ let package = Package(
         // libdovi (Dolby Vision RPU parser/converter). Resolved over Git like
         // FFmpegBuild so consumers (and Xcode Cloud) build without a sibling
         // LibDovi checkout; the prebuilt xcframework needs no Rust at build time.
-        .package(url: "https://github.com/superuser404notfound/LibDovi", from: "1.0.2"),  // 1.0.2: iOS slices + x86_64 (Intel Macs)
+        // FlexUI fork: pinned EXACTLY, not `from:`. LibDovi 1.1.0 raised its tvOS floor to 17.0 while
+        // this package still declares .tvOS(.v16), so the open range let a brand-new upstream release
+        // break builds with zero commits on either side. FlexUI already pins this in its Xcode project
+        // (plugins/withFlexAetherPlayer.js); pinning here makes `swift build` and CI reproducible too.
+        .package(url: "https://github.com/superuser404notfound/LibDovi", exact: "1.0.2"),  // 1.0.2: iOS slices + x86_64 (Intel Macs)
     ],
     targets: [
         .target(

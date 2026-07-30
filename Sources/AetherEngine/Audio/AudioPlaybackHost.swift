@@ -127,6 +127,7 @@ final class AudioPlaybackHost {
         self.audioDecoder = aDec
         self.audioStreamIndex = resolvedAudioIdx
         self.audioOutput = AudioOutput()
+        applyPendingDSPSettingsIfNeeded()
 
         if let start = startPosition, start > 0 {
             dem.seek(to: start)
@@ -229,6 +230,37 @@ final class AudioPlaybackHost {
     var volume: Float {
         get { audioOutput?.volume ?? 1.0 }
         set { audioOutput?.volume = newValue }
+    }
+
+    /// FlexUI live audio DSP for the audio-only software path. Same contract as
+    /// `SoftwarePlaybackHost.audioDSPSettings`; there is no video renderer here, so a width change
+    /// only ever flushes audio.
+    private var pendingDSPSettings: AudioDSPSettings?
+
+    func applyPendingDSPSettingsIfNeeded() {
+        guard let pending = pendingDSPSettings, audioDecoder != nil else { return }
+        pendingDSPSettings = nil
+        audioDSPSettings = pending
+    }
+
+    var audioDSPSettings: AudioDSPSettings {
+        get { audioDecoder?.dspSettings ?? pendingDSPSettings ?? .identity }
+        set {
+            guard let decoder = audioDecoder else {
+                pendingDSPSettings = newValue
+                return
+            }
+            let previous = decoder.dspSettings
+            guard previous != newValue else { return }
+            decoder.dspSettings = newValue
+            if previous.outputMode != newValue.outputMode {
+                audioOutput?.flush()
+            }
+        }
+    }
+
+    var audioDSPIsAvailable: Bool {
+        audioDecoder != nil && audioOutput != nil
     }
 
     // MARK: - Demux loop

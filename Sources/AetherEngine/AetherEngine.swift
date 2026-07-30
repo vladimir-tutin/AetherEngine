@@ -3637,6 +3637,65 @@ public final class AetherEngine: ObservableObject {
         if let v = desiredVolume { host.volume = v }
     }
 
+    // MARK: - FlexUI live audio DSP
+
+    /// Live audio DSP over the decoded-PCM path: output width, front-centre dialogue emphasis, master
+    /// gain and peak limiting.
+    ///
+    /// Gain and centre changes reach the renderer without touching the media URL, the player item, the
+    /// Plex session, or the master clock. A width change flushes the AUDIO renderer only.
+    ///
+    /// Only effective on a host that actually decodes PCM (`SoftwarePlaybackHost` /
+    /// `AudioPlaybackHost`). On the native AVPlayer/HLS path there is no PCM in the app — that audio is
+    /// stream-copied — so a write is remembered in `desiredAudioDSPSettings` and applied when a PCM
+    /// host loads. Read `audioDSPIsEffective` to know which case you are in rather than assuming a
+    /// write took hold.
+    public var audioDSPSettings: AudioDSPSettings {
+        get {
+            if let host = softwareHost, host.audioDSPIsAvailable { return host.audioDSPSettings }
+            if let host = audioHost, host.audioDSPIsAvailable { return host.audioDSPSettings }
+            return desiredAudioDSPSettings ?? .identity
+        }
+        set {
+            desiredAudioDSPSettings = newValue
+            // Push unconditionally: a host without a decoder yet STASHES the value and replays it on
+            // load, so a change made between sessions is not dropped.
+            softwareHost?.audioDSPSettings = newValue
+            audioHost?.audioDSPSettings = newValue
+            let applied = audioDSPIsEffective
+            EngineLog.emit(
+                "[AudioDSP] engine set mode=\(newValue.outputMode.rawValue) "
+                + "dialogue=\(newValue.dialogueGainDb)dB master=\(newValue.masterGainDb)dB "
+                + "applied=\(applied ? 1 : 0) "
+                + "host=\(softwareHost != nil ? "software" : (audioHost != nil ? "audio" : "native-avplayer"))",
+                category: .engine
+            )
+        }
+    }
+
+    /// Whether a DSP write can currently affect what is being rendered. False on the native
+    /// AVPlayer/HLS path. The bridge publishes this so the UI can report EFFECTIVE state instead of
+    /// merely saved state.
+    public var audioDSPIsEffective: Bool {
+        if let host = softwareHost, host.audioDSPIsAvailable { return true }
+        if let host = audioHost, host.audioDSPIsAvailable { return true }
+        return false
+    }
+
+    var desiredAudioDSPSettings: AudioDSPSettings?
+
+    /// Re-apply remembered settings to a host that just finished loading, so a value chosen before or
+    /// between sessions is not silently dropped.
+    func applyDesiredAudioDSPSettings() {
+        guard let settings = desiredAudioDSPSettings, !settings.isIdentity else { return }
+        if let host = softwareHost, host.audioDSPIsAvailable {
+            host.audioDSPSettings = settings
+        }
+        if let host = audioHost, host.audioDSPIsAvailable {
+            host.audioDSPSettings = settings
+        }
+    }
+
     /// Maximum reliable forward rate: 3x for audio-only sessions, 2x for video.
     /// Above the cap AVPlayer fast-forward becomes unstable (AetherEngine#39).
     /// Hosts should size their speed picker against this. Query after load; returns 2.0 while idle.

@@ -1,0 +1,40 @@
+name: FlexUI tvOS compile check
+
+# Compile-verifies the FlexUI live-audio-DSP changes against the tvOS SDK.
+#
+# WHY THIS EXISTS: FlexUI's own Apple builds run on Codemagic and are BILLED. Discovering a Swift
+# compile error there wastes a paid build. This runs on GitHub's macOS runners, which are free for
+# public repositories, so the fork can be proven to compile before any FlexUI tag is pushed.
+
+on:
+  push:
+    branches:
+      - 'flexui/**'
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  tvos-build:
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          swift --version
+          xcodebuild -showsdks | grep -i appletv || true
+
+      - name: Resolve packages
+        run: xcodebuild -resolvePackageDependencies -scheme AetherEngine -destination 'generic/platform=tvOS'
+
+      - name: Build AetherEngine for tvOS
+        run: |
+          set -o pipefail
+          xcodebuild build \
+            -scheme AetherEngine \
+            -destination 'generic/platform=tvOS' \
+            -skipMacroValidation \
+            CODE_SIGNING_ALLOWED=NO \
+            | tail -80
