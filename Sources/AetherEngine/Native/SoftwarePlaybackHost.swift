@@ -98,6 +98,7 @@ final class SoftwarePlaybackHost {
 
     private var videoStreamIndex: Int32 = -1
     private var audioStreamIndex: Int32 = -1
+    private var primaryAudioStreamIndex: Int32 = -1
 
     private var videoTimeBaseSeconds: Double = 0
     private var audioTimeBaseSeconds: Double = 0
@@ -479,6 +480,7 @@ final class SoftwarePlaybackHost {
                 try aDec.open(stream: aStream)
                 self.audioDecoder = aDec
                 self.audioStreamIndex = resolvedAudioIdx
+                self.primaryAudioStreamIndex = resolvedAudioIdx
                 let atb = aStream.pointee.time_base
                 self.audioTimeBaseSeconds = atb.den > 0 ? Double(atb.num) / Double(atb.den) : 0
             } catch {
@@ -927,8 +929,12 @@ final class SoftwarePlaybackHost {
                         category: .swPlayback
                     )
                 } else {
+                    self.audioOwnershipGate.resetToMain()
+                    self.sideAudioTrackIndex = nil
+                    self.audioStreamIndex = self.primaryAudioStreamIndex
                     EngineLog.emit(
-                        "[AudioTrackSwitch] failed stream=\(index) detail=\(detail) fallback=reload",
+                        "[AudioTrackSwitch] failed stream=\(index) detail=\(detail) "
+                        + "owner=main-demux fallback=reload",
                         category: .swPlayback
                     )
                 }
