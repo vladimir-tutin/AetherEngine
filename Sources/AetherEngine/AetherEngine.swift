@@ -4909,9 +4909,10 @@ public final class AetherEngine: ObservableObject {
 
     // MARK: - Audio / subtitle track selection
 
-    /// Switch the active audio track mid-playback. Restarts the HLS pipeline with the new audio stream;
-    /// expects ~0.5-1 s black frame (AVPlayer.replaceCurrentItem tears the surface). Display-criteria handshake
-    /// is suppressed (video unchanged). `index` is the container stream index (TrackInfo.id). No-op if
+    /// Switch the active audio track mid-playback. The decoded-PCM software host opens an independent
+    /// audio reader and transfers only audio-renderer ownership, preserving video, clock, position and
+    /// session. Native loopback-HLS sessions retain the legacy pipeline reload until they expose
+    /// alternate audio renditions. `index` is the container stream index (TrackInfo.id). No-op if
     /// out-of-range, pointing at a non-audio stream, or already active.
     public func selectAudioTrack(index: Int) {
         // Forward-only custom sources (incl. live HLS-ingest) can't rewind; rebuilding would re-consume a
@@ -4943,6 +4944,24 @@ public final class AetherEngine: ObservableObject {
         let gen = loadGeneration
         Task { @MainActor [weak self] in
             guard let self = self else { return }
+            if let softwareHost = self.softwareHost {
+                let switched = await softwareHost.selectAudioTrackInPlace(index: Int32(index))
+                guard self.loadGeneration == gen else { return }
+                if switched {
+                    self.activeAudioTrackIndex = index
+                    self.activeAudioDecoder = Self.softwareAudioDecoderLabel(
+                        audioTracks: self.audioTracks,
+                        activeIndex: index
+                    )
+                    self.activateRendererAudioSession(audioSourceStreamIndex: Int32(index))
+                    EngineLog.emit(
+                        "[AetherEngine] selectAudioTrack: stream \(index) switched in-place "
+                        + "backend=software videoReload=0 sessionReload=0",
+                        category: .engine
+                    )
+                    return
+                }
+            }
             await self.reloadWithAudioOverride(
                 url: url,
                 audioStreamIndex: Int32(index),

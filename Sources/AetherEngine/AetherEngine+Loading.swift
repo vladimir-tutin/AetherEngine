@@ -1398,6 +1398,9 @@ extension AetherEngine {
         // of such a wiring work in isolation, which is why a dead sink here reads as a working one.
         softwareCancellables.removeAll()
         let host = SoftwarePlaybackHost()
+        if !isCustomSource {
+            host.configureAudioTrackSwitchSource(url: url, headers: sourceHTTPHeaders)
+        }
         host.deinterlaceConfig = DeinterlaceConfig(
             mode: loadedOptions.deinterlaceMode,
             fieldRate: loadedOptions.deinterlaceFieldRate
