@@ -20,6 +20,7 @@ struct LoadOptionsTests {
         #expect(opts.audioBridgeMode == .surroundCompat)
         #expect(opts.isLive == false)
         #expect(opts.audioOnly == false)
+        #expect(opts.decodedPCMAudio == false)
         // #68: probe-budget overrides default to nil so the engine keeps the
         // built-in .playback budget (50 MB / 60 s) unless a caller opts in.
         #expect(opts.probesize == nil)
@@ -64,6 +65,14 @@ struct LoadOptionsTests {
         let audio = LoadOptions(audioOnly: true)
         #expect(audio.audioOnly == true)
         #expect(video != audio)
+    }
+
+    @Test("decoded PCM audio routing is opt-in and affects equality")
+    func decodedPCMAudioPreservedAndEquatable() {
+        let native = LoadOptions(decodedPCMAudio: false)
+        let pcm = LoadOptions(decodedPCMAudio: true)
+        #expect(pcm.decodedPCMAudio == true)
+        #expect(native != pcm)
     }
 
     // MARK: - Probe budget (#68)
