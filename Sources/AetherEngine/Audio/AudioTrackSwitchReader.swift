@@ -67,8 +67,7 @@ final class AudioTrackSwitchReader: @unchecked Sendable {
                     }
                     defer {
                         av_packet_unref(packet)
-                        var owned: UnsafeMutablePointer<AVPacket>? = packet
-                        av_packet_free_safe(&owned)
+                        av_packet_free_safe(packet)
                     }
                     guard packet.pointee.stream_index == request.streamIndex else { continue }
 
