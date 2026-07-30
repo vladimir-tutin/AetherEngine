@@ -76,7 +76,12 @@ final class AudioTrackSwitchReader: @unchecked Sendable {
                     for buffer in buffers {
                         guard self.isCurrent(myGeneration) else { return }
                         let pts = CMSampleBufferGetPresentationTimeStamp(buffer).seconds
-                        guard pts.isFinite, pts >= request.startSeconds - 0.050 else { continue }
+                        // Opening/probing the side demuxer takes real wall time while video keeps
+                        // advancing. Chase the LIVE synchronizer clock, not the stale clock captured
+                        // when the user pressed the track, so the first buffer handed over is never
+                        // already in the renderer's past.
+                        let liveTarget = max(request.startSeconds, request.output.currentTimeSeconds)
+                        guard pts.isFinite, pts >= liveTarget - 0.050 else { continue }
 
                         if !activated {
                             firstAcceptedPTS = pts
