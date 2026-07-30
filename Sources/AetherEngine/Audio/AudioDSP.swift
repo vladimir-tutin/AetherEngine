@@ -112,12 +112,14 @@ final class AudioDSPProcessor {
         let outCh = Int(settings.outputChannels(forSource: sourceChannels))
         guard frames > 0, inCh > 0, outCh > 0 else { return Int32(outCh) }
 
-        let dialogueGain = settings.dialogueGainDb == 0
+        // Explicit Float throughout: a bare `1.0` in a ternary infers Double and then every
+        // Float-times-gain multiply below fails to type-check.
+        let dialogueGain: Float = settings.dialogueGainDb == 0
             ? 1.0
-            : pow(10.0, settings.dialogueGainDb / 20.0)
-        let masterGain = settings.masterGainDb == 0
+            : powf(10.0, settings.dialogueGainDb / 20.0)
+        let masterGain: Float = settings.masterGainDb == 0
             ? 1.0
-            : pow(10.0, settings.masterGainDb / 20.0)
+            : powf(10.0, settings.masterGainDb / 20.0)
 
         // ── 1/2. Centre emphasis + channel mixing, in one pass ──────────────────────────────
         // Centre is interleaved index 2 for the 5.1/7.1 layouts this decoder declares; for anything
@@ -200,9 +202,9 @@ final class AudioDSPProcessor {
         let hasCentre = inCh >= 6
         let hasSurround = inCh >= 6
         var worstCase: Float = 1.0
-        if hasCentre { worstCase += centreCoefficient * max(1.0, dialogueGain) }
+        if hasCentre { worstCase += centreCoefficient * max(Float(1.0), dialogueGain) }
         if hasSurround { worstCase += surroundCoefficient }
-        let normalise = worstCase > 1.0 ? 1.0 / worstCase : 1.0
+        let normalise: Float = worstCase > 1.0 ? 1.0 / worstCase : 1.0
 
         for frame in 0..<frames {
             let inBase = frame * inCh
@@ -276,8 +278,8 @@ final class AudioDSPProcessor {
         sampleRate: Int32
     ) {
         let rate = Float(max(sampleRate, 8000))
-        let attackCoefficient = 1.0 - exp(-1.0 / (Self.attackSeconds * rate))
-        let releaseCoefficient = 1.0 - exp(-1.0 / (Self.releaseSeconds * rate))
+        let attackCoefficient: Float = 1.0 - expf(-1.0 / (Self.attackSeconds * rate))
+        let releaseCoefficient: Float = 1.0 - expf(-1.0 / (Self.releaseSeconds * rate))
 
         for frame in 0..<frames {
             let base = frame * channels

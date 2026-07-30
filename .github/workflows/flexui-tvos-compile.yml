@@ -31,10 +31,21 @@ jobs:
 
       - name: Build AetherEngine for tvOS
         run: |
-          set -o pipefail
+          # Capture the whole log, then surface diagnostics explicitly. Piping straight to `tail`
+          # truncated the actual `error:` lines and left only "BUILD FAILED", which is useless.
+          set +e
           xcodebuild build \
             -scheme AetherEngine \
             -destination 'generic/platform=tvOS' \
             -skipMacroValidation \
-            CODE_SIGNING_ALLOWED=NO \
-            | tail -80
+            CODE_SIGNING_ALLOWED=NO > build.log 2>&1
+          status=$?
+          echo "::group::Diagnostics"
+          grep -nE "error:|warning:.*(Sendable|actor|concurrency)" build.log | head -60 || true
+          echo "::endgroup::"
+          if [ $status -ne 0 ]; then
+            echo "::group::Tail"
+            tail -120 build.log
+            echo "::endgroup::"
+          fi
+          exit $status
