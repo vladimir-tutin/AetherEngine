@@ -2413,6 +2413,33 @@ public final class AetherEngine: ObservableObject {
             useSoftwarePath = true
             EngineLog.emit("[AetherEngine] source is forward-only, forcing software path", category: .engine)
         }
+        // FlexUI live audio processing needs decoded PCM. Keep sources whose Dolby Vision signal
+        // cannot be represented correctly by the software/display-layer path on native AVPlayer;
+        // the bridge will report DSP ineffective instead of trading correct video for audio controls.
+        if options.decodedPCMAudio, probeOpened,
+           let vStream = probe.stream(at: probe.videoStreamIndex) {
+            let dvConfig = Self.dvConfig(stream: vStream)
+            let cannotRepresent = dvConfig.map {
+                VideoRoutingPolicy.softwarePathCannotRepresent(
+                    codecID: detectedCodecID,
+                    dvProfile: $0.profile,
+                    dvBlCompatID: $0.blCompatID
+                )
+            } ?? false
+            if cannotRepresent {
+                EngineLog.emit(
+                    "[AudioDSP] decoded-PCM route unavailable for this Dolby Vision representation; "
+                    + "keeping native AVPlayer path",
+                    category: .engine
+                )
+            } else {
+                useSoftwarePath = true
+                EngineLog.emit(
+                    "[AudioDSP] decoded-PCM option enabled; routing compatible source to software host",
+                    category: .engine
+                )
+            }
+        }
         // TEST-ONLY: forces SW path for aetherctl live --sw; unset in shipping builds.
         if Self.forceSoftwarePathForTesting {
             useSoftwarePath = true

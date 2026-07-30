@@ -164,6 +164,13 @@ public struct LoadOptions: Sendable, Equatable {
     /// Lean audio-only path (FFmpeg + AVSampleBufferAudioRenderer): skips video probe, display-criteria handshake, HLS/muxer/loopback stack. Also set automatically when the probe finds no video stream. Default `false`.
     public var audioOnly: Bool
 
+    /// Route compatible video sessions through `SoftwarePlaybackHost` so the host receives decoded
+    /// PCM and can apply `audioDSPSettings` live. Despite the host name, VideoToolbox remains available
+    /// for formats supported by `HardwareVideoDecoder`. Sources whose Dolby Vision representation
+    /// cannot be rendered correctly on this path stay native and report DSP as ineffective. Default
+    /// `false`.
+    public var decodedPCMAudio: Bool
+
     /// DVR rewind window in seconds; nil = live-only (seek is a no-op). Engine retains roughly this much past content disk-backed. Suggested default: 1800. Ignored when `isLive == false`. Default nil.
     public var dvrWindowSeconds: Double?
 
@@ -318,6 +325,7 @@ public struct LoadOptions: Sendable, Equatable {
         audioBridgeMode: AudioBridgeMode = .surroundCompat,
         isLive: Bool = false,
         audioOnly: Bool = false,
+        decodedPCMAudio: Bool = false,
         dvrWindowSeconds: Double? = nil,
         liveBlockingReload: Bool? = nil,
         liveJoinProfile: LiveJoinProfile = .standard,
@@ -348,6 +356,7 @@ public struct LoadOptions: Sendable, Equatable {
         self.audioBridgeMode = audioBridgeMode
         self.isLive = isLive
         self.audioOnly = audioOnly
+        self.decodedPCMAudio = decodedPCMAudio
         self.dvrWindowSeconds = dvrWindowSeconds
         self.liveBlockingReload = liveBlockingReload
         self.liveJoinProfile = liveJoinProfile
