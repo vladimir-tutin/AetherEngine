@@ -196,7 +196,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     // THESE ARE NOW THE FLOOR, NOT THE POLICY. They are the values `AetherSourceBufferPolicy`
     // resolves to whenever the time-aware policy is off or the media rate is unknown, and the
     // values it can never go below. See SourceBufferPolicy.swift for why bytes are the wrong unit
-    // for a playback cushion (8 MB = 2.54 s at 25.2 Mbps, 0.8 s at 80 Mbps) and for the field
+    // for a playback cushion (8 MB = 2.66 s at 25.2 Mbps, 0.84 s at 80 Mbps) and for the field
     // capture that indicted them.
     private static let winHighWater = AetherSourceBufferStock.highWaterBytes
     private static let winLowWater = AetherSourceBufferStock.lowWaterBytes

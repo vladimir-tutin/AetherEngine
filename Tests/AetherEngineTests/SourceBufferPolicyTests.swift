@@ -6,9 +6,9 @@ import Foundation
 ///
 /// The defect: the persistent reader's forward buffer was bounded by FIXED BYTES (suspend above
 /// 16 MB, resume below 8 MB). Apple TV field capture on a 25.2 Mbps direct-play MKV showed 8 MB =
-/// 2.54 s of media, the transfer parked ~97% of wall clock, and two reads blocking 3.003 s and
+/// 2.66 s of media, the transfer parked ~97% of wall clock, and two reads blocking 3.003 s and
 /// 3.810 s with `reconnects=0 connect=0ms lockWait=0ms unaccounted=0ms` — a healthy connection
-/// that simply did not resume at rate before the 2.54 s cushion ran out.
+/// that simply did not resume at rate before the 2.66 s cushion ran out.
 struct SourceBufferPolicyTests {
 
     private let rate25Mbps = 25.2 * 1_000_000 / 8   // 3.15 MB/s
@@ -42,8 +42,13 @@ struct SourceBufferPolicyTests {
         // 3.15 MB/s * 15 s = 47.25 MB (45.1 MiB), * 30 s = 94.5 MB (90.1 MiB).
         #expect(resolved.lowWaterBytes > 44 * 1024 * 1024)
         #expect(resolved.highWaterBytes > 88 * 1024 * 1024)
-        // The stock 8 MB low water was 2.54 s; anything at/below that is the defect.
-        #expect(Double(AetherSourceBufferStock.lowWaterBytes) / rate25Mbps < 2.6)
+        // The stock low water is 8 MiB = 8,388,608 B, which at 3.15 MB/s is 2.66 s — the entire
+        // cushion the reader had when it resumed a fully idle connection.
+        #expect(Double(AetherSourceBufferStock.lowWaterBytes) / rate25Mbps < 2.7)
+        #expect(Double(AetherSourceBufferStock.lowWaterBytes) / rate25Mbps > 2.6)
+        // The new low water is >5x that.
+        #expect(resolved.lowWaterSeconds
+                / (Double(AetherSourceBufferStock.lowWaterBytes) / rate25Mbps) > 5)
     }
 
     @Test("the memory ceiling wins over the duration target and says so")
@@ -56,7 +61,7 @@ struct SourceBufferPolicyTests {
         // the high water (which would resume-and-re-suspend on every delivery).
         #expect(resolved.lowWaterBytes < resolved.highWaterBytes)
         #expect(abs(Double(resolved.lowWaterBytes) / Double(resolved.highWaterBytes) - 0.5) < 0.02)
-        // Even clamped, it is still far better than stock: >12 s instead of 0.8 s.
+        // Even clamped, it is still far better than stock: >12 s instead of 0.84 s.
         #expect(resolved.lowWaterSeconds > 6)
         #expect(Double(AetherSourceBufferStock.lowWaterBytes) / rate80Mbps < 0.9)
     }

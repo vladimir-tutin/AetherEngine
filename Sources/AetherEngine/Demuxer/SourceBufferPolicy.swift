@@ -8,16 +8,16 @@ import Foundation
 /// watermarks: suspend the transfer above 16 MB, resume it below 8 MB (#174/#220). Bytes are the
 /// wrong unit for a playback cushion. Measured on Apple TV against a 25.2 Mbps direct-play MKV:
 ///
-///   - 8 MB low water  = 2.54 s of media. That is the ENTIRE margin available when the transfer
-///     is resumed, i.e. the reader wakes a fully idle HTTP connection with 2.5 s left to live.
-///   - 16 MB high water = 5.08 s, so the cycle repeats every ~2.5 s: ~24 suspend/resume rounds
+///   - 8 MB low water  = 2.66 s of media. That is the ENTIRE margin available when the transfer
+///     is resumed, i.e. the reader wakes a fully idle HTTP connection with 2.66 s left to live.
+///   - 16 MB high water = 5.33 s, so the cycle repeats every ~2.66 s: ~22 suspend/resume rounds
 ///     per minute, ~1000 per 45-minute episode.
 ///   - Field capture (`logs/tvos-metro.log`, 2026-08-02): `pumpSusp=1` in 40 of 41 memprobes, so
 ///     the connection is parked ~97% of wall clock. Two reads then blocked 3.003 s and 3.810 s
 ///     with `reconnects=0 backoff=0ms connect=0ms lockWait=0ms unaccounted=0ms` — the connection
-///     was never lost; the origin simply did not resume at rate, and 2.54 s of cushion ran out.
+///     was never lost; the origin simply did not resume at rate, and 2.66 s of cushion ran out.
 ///
-/// The same 8 MB is 0.8 s at 80 Mbps. A byte watermark silently gets MORE fragile exactly where
+/// The same 8 MB is 0.84 s at 80 Mbps. A byte watermark silently gets MORE fragile exactly where
 /// the media is most demanding, which is backwards.
 ///
 /// # What the industry does
