@@ -3723,6 +3723,59 @@ public final class AetherEngine: ObservableObject {
         }
     }
 
+    // MARK: - Source buffer policy (FlexUI)
+
+    /// Host-facing forward-buffer control for the playback pump reader (see `SourceBufferPolicy`).
+    /// Setting it mid-session re-derives the watermarks on the live lane immediately, and it
+    /// persists into `loadedOptions` so a session-preserving reload (`reloadAtCurrentPosition`)
+    /// and every in-session demuxer restart keep it. nil restores stock fixed watermarks.
+    public func setSourceBufferPolicy(_ policy: SourceBufferPolicy?) {
+        loadedOptions.sourceBufferPolicy = policy
+        softwareHost?.applySourceBufferPolicy(policy, reason: "runtime")
+        audioHost?.applySourceBufferPolicy(policy, reason: "runtime")
+        nativeVideoSession?.demuxer?.applySourceBufferPolicy(policy, reason: "runtime")
+    }
+
+    /// Applied source-buffer state of the active lane. `policyActive` is what the live reader
+    /// ACTUALLY applied — a requested policy stays inactive on live sources, lanes without a
+    /// persistent network window, and the AVPlayer remote-HLS lane — so hosts report truth
+    /// instead of echoing their own request.
+    public func sourceBufferState() -> SourceBufferState {
+        let policy = loadedOptions.sourceBufferPolicy
+        let lane: String
+        let diag: (lowBytes: Int, highBytes: Int, capBytes: Int, active: Bool, bytesPerSecond: Double)?
+        let win: (windowBytes: Int, aheadBytes: Int, suspended: Bool, postSuspendBytes: Int64)?
+        if let host = softwareHost {
+            lane = "software"
+            diag = host.sourceBufferDiagnostics
+            win = host.ioWindowDiagnostics
+        } else if let session = nativeVideoSession {
+            lane = "native-hls"
+            diag = session.demuxer?.sourceBufferDiagnostics
+            win = session.demuxer?.ioWindowDiagnostics
+        } else if let host = audioHost {
+            lane = "audio"
+            diag = host.sourceBufferDiagnostics
+            win = host.ioWindowDiagnostics
+        } else {
+            lane = "none"
+            diag = nil
+            win = nil
+        }
+        return SourceBufferState(
+            policyRequested: policy?.enabled == true,
+            policyActive: diag?.active ?? false,
+            lane: lane,
+            lowWaterBytes: diag?.lowBytes ?? 0,
+            highWaterBytes: diag?.highBytes ?? 0,
+            hardCapBytes: diag?.capBytes ?? 0,
+            bytesPerSecond: diag?.bytesPerSecond ?? 0,
+            windowBytes: win?.windowBytes ?? 0,
+            aheadBytes: win?.aheadBytes ?? 0,
+            suspended: win?.suspended ?? false
+        )
+    }
+
     /// Maximum reliable forward rate: 3x for audio-only sessions, 2x for video.
     /// Above the cap AVPlayer fast-forward becomes unstable (AetherEngine#39).
     /// Hosts should size their speed picker against this. Query after load; returns 2.0 while idle.

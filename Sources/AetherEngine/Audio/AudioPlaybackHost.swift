@@ -28,6 +28,21 @@ final class AudioPlaybackHost {
     private var audioOutput: AudioOutput?
     private var demuxer: Demuxer?
 
+    /// Applied source-buffer watermarks of this host's reader (the demuxer is private).
+    var sourceBufferDiagnostics: (lowBytes: Int, highBytes: Int, capBytes: Int, active: Bool, bytesPerSecond: Double)? {
+        demuxer?.sourceBufferDiagnostics
+    }
+
+    /// Sliding-window snapshot of this host's reader, mirroring `SoftwarePlaybackHost`.
+    var ioWindowDiagnostics: (windowBytes: Int, aheadBytes: Int, suspended: Bool, postSuspendBytes: Int64)? {
+        demuxer?.ioWindowDiagnostics
+    }
+
+    /// Forward the engine's source-buffer policy to this host's reader. See `Demuxer.applySourceBufferPolicy`.
+    func applySourceBufferPolicy(_ policy: SourceBufferPolicy?, reason: String) {
+        demuxer?.applySourceBufferPolicy(policy, reason: reason)
+    }
+
     /// One demux queue per host so rapid load() calls don't fight over the same execution context.
     private let demuxQueue = DispatchQueue(label: "engine.audio.demux", qos: .userInitiated)
 

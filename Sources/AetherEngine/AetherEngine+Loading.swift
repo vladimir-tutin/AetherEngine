@@ -397,7 +397,8 @@ extension AetherEngine {
             // Caller-bounded probe budget (#68) for the fallback open / live reopen; the happy path reuses preopenedDemuxer.
             probesize: loadedOptions.probesize,
             maxAnalyzeDuration: loadedOptions.maxAnalyzeDuration,
-            forwardBufferSegments: loadedOptions.forwardBufferSegments
+            forwardBufferSegments: loadedOptions.forwardBufferSegments,
+            sourceBufferPolicy: loadedOptions.sourceBufferPolicy
         )
         session.onFirstHDR10PlusDetected = { [weak self] in
             Task { @MainActor in self?.handleHDR10PlusDetected() }
@@ -1142,12 +1143,13 @@ extension AetherEngine {
         // Capture the caller's probe budget (#68) before the detach: loadedOptions is @MainActor-isolated and unreachable inside the closure. Only used on the fallback open (probe absent).
         let probesize = loadedOptions.probesize
         let maxAnalyzeDuration = loadedOptions.maxAnalyzeDuration
+        let sourceBufferPolicy = loadedOptions.sourceBufferPolicy
         // Built on the main actor, captured into the detach: surfaces source stall/reconnect to playbackPhase (#85).
         let networkPhaseSink: @Sendable (ReaderNetworkPhase) -> Void = { [weak self] phase in
             Task { @MainActor in self?.setReaderNetworkPhase(phase) }
         }
         try await Task.detached(priority: .userInitiated) {
-            [host, preopenedDemuxer, url, sourceHTTPHeaders, isLive, dvrWindowSeconds, probesize, maxAnalyzeDuration, networkPhaseSink] in
+            [host, preopenedDemuxer, url, sourceHTTPHeaders, isLive, dvrWindowSeconds, probesize, maxAnalyzeDuration, sourceBufferPolicy, networkPhaseSink] in
             let dem: Demuxer
             if let pre = preopenedDemuxer {
                 dem = pre
@@ -1156,6 +1158,11 @@ extension AetherEngine {
                 try dem.open(url: url, extraHeaders: sourceHTTPHeaders, profile: .playback.withProbeBudget(probesize: probesize, maxAnalyzeDuration: maxAnalyzeDuration), isLive: isLive)
             }
             dem.onNetworkPhaseChanged = networkPhaseSink
+            // Time-based source buffering (stock when nil/disabled). This lane's ONLY network
+            // cushion is the reader window — there is no segment cache in front of the decoder —
+            // so the stock 8/16 MB window is what made it stall on origin hiccups. Applied after
+            // open (covers the pre-opened probe demuxer too); duration/fileSize are known here.
+            dem.applySourceBufferPolicy(sourceBufferPolicy, reason: "load-software")
             try await host.load(
                 demuxer: dem,
                 startPosition: startPosition,
@@ -1209,12 +1216,13 @@ extension AetherEngine {
         // Caller's probe budget (#68) captured before the detach; only used on the fallback open (probe absent).
         let probesize = loadedOptions.probesize
         let maxAnalyzeDuration = loadedOptions.maxAnalyzeDuration
+        let sourceBufferPolicy = loadedOptions.sourceBufferPolicy
         // Built on the main actor, captured into the detach: surfaces source stall/reconnect to playbackPhase (#85).
         let networkPhaseSink: @Sendable (ReaderNetworkPhase) -> Void = { [weak self] phase in
             Task { @MainActor in self?.setReaderNetworkPhase(phase) }
         }
         try await Task.detached(priority: .userInitiated) {
-            [host, preopenedDemuxer, url, sourceHTTPHeaders, probesize, maxAnalyzeDuration, networkPhaseSink] in
+            [host, preopenedDemuxer, url, sourceHTTPHeaders, probesize, maxAnalyzeDuration, sourceBufferPolicy, networkPhaseSink] in
             let dem: Demuxer
             if let pre = preopenedDemuxer {
                 dem = pre
@@ -1223,6 +1231,9 @@ extension AetherEngine {
                 try dem.open(url: url, extraHeaders: sourceHTTPHeaders, profile: .playback.withProbeBudget(probesize: probesize, maxAnalyzeDuration: maxAnalyzeDuration))
             }
             dem.onNetworkPhaseChanged = networkPhaseSink
+            // Time-based source buffering (stock when nil/disabled): audio-only sessions rarely
+            // clamp (the byte floor dominates at audio bitrates), but a lossless remux benefits.
+            dem.applySourceBufferPolicy(sourceBufferPolicy, reason: "load-audio")
             try await host.load(
                 demuxer: dem,
                 startPosition: startPosition,

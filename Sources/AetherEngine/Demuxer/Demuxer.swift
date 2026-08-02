@@ -179,6 +179,21 @@ public final class Demuxer: @unchecked Sendable {
         (avioProvider as? AVIOReader)?.windowDiagnostics
     }
 
+    /// Applied flow-control watermark snapshot for the host state surface; nil for disc /
+    /// custom / file providers, which have no persistent network window.
+    var sourceBufferDiagnostics: (lowBytes: Int, highBytes: Int, capBytes: Int, active: Bool, bytesPerSecond: Double)? {
+        (avioProvider as? AVIOReader)?.bufferPolicyDiagnostics
+    }
+
+    /// Forward the host's source-buffer policy to this demuxer's network reader, deriving byte
+    /// watermarks from the media's average bitrate (reader fileSize / this demuxer's duration).
+    /// No-op for providers without a persistent HTTP window. Safe from any thread — the reader
+    /// guards its own state (same access model as `ioWindowDiagnostics`).
+    func applySourceBufferPolicy(_ policy: SourceBufferPolicy?, reason: String) {
+        (avioProvider as? AVIOReader)?.applySourceBufferPolicy(
+            policy, mediaDurationSeconds: duration, reason: reason)
+    }
+
     /// Forwarded to the playback `AVIOReader` so source stall/reconnect transitions reach the engine (#85).
     /// `didSet` re-forwards so it works whether set before or after `open()`. Set only on the playback
     /// demuxer; the subtitle side-demuxer leaves it nil so its stalls never move `playbackPhase`. Disc /

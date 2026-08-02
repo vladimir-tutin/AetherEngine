@@ -584,7 +584,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
         companionAudioReader: IOReader? = nil,
         probesize: Int64? = nil,
         maxAnalyzeDuration: Int64? = nil,
-        forwardBufferSegments: Int? = nil
+        forwardBufferSegments: Int? = nil,
+        sourceBufferPolicy: SourceBufferPolicy? = nil
     ) {
         self.sourceURL = url
         self.sourceHTTPHeaders = sourceHTTPHeaders
@@ -623,7 +624,13 @@ public final class HLSVideoEngine: @unchecked Sendable {
         self.customSourceReopenFactory = customSourceReopenFactory
         self.companionAudioReader = companionAudioReader
         self.forwardWindowSegments = Self.clampedForwardWindow(forwardBufferSegments)
+        self.sourceBufferPolicy = sourceBufferPolicy
     }
+
+    /// Host source-buffer policy applied to every pump demuxer this session adopts (initial
+    /// open, pre-opened probe demuxer, wedge restart). nil = stock fixed watermarks. The side
+    /// audio demuxer deliberately stays stock (see `SourceBufferPolicy`).
+    let sourceBufferPolicy: SourceBufferPolicy?
 
     /// Session forward-buffer window in segments. Drives BOTH the producer's race-ahead
     /// (`HLSSegmentProducer.bufferAheadSegments`) and the cache's forward window
@@ -722,6 +729,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
         }
         demuxer = dem
         dem.onNetworkPhaseChanged = onNetworkPhaseChanged   // surface source stall/reconnect to playbackPhase (#85)
+        // Time-based source buffering for the pump reader (stock when nil/disabled). Applied
+        // after adoption so the pre-opened probe demuxer path is covered too.
+        dem.applySourceBufferPolicy(sourceBufferPolicy, reason: "hls-start")
 
         let videoIndex = dem.videoStreamIndex
         guard videoIndex >= 0, let videoStream = dem.stream(at: videoIndex) else {
@@ -2067,6 +2077,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
                     // the bulk of a 44 s wedge-reopen over WAN (#93 residual). The pass itself must
                     // run so video_delay resolves, else B-frame dts arrive broken (#93 judder).
                     try fresh.open(url: sourceURL, extraHeaders: sourceHTTPHeaders, profile: .restartReopen, isLive: false)
+                    // The session policy must survive the restart: a fresh demuxer starts on
+                    // stock watermarks, exactly the fragile window the policy exists to replace.
+                    fresh.applySourceBufferPolicy(sourceBufferPolicy, reason: "wedge-restart")
                     dem.markClosed() // abort any wedged read now that the replacement is ready
                     freshDemuxer = fresh
                     activeDem = fresh

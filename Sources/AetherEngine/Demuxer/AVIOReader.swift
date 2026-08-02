@@ -295,6 +295,89 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// and the 16 MB high water bounds nothing. winCond-guarded.
     private var suspendedDeliveryBytes: Int64 = 0
 
+    // MARK: - Source buffer policy (time-based watermarks, FlexUI)
+
+    // Watermarks ACTUALLY applied to the persistent window. They start at the stock fixed
+    // constants and `applySourceBufferPolicy` swaps in time-derived values once the media's
+    // average bitrate is known. Fixed bytes are the wrong unit for flow control over media:
+    // 8/16 MB is 2.5/5.1 s of 25 Mbps video and under a second at 80 Mbps, so the connection
+    // was parked with only seconds of cushion and any origin that resumes slowly (cold
+    // file-server pipeline behind the HTTP source) drained the window and stalled playback.
+    // All winCond-guarded like every other window field.
+    private var winLowWaterActive = AVIOReader.winLowWater
+    private var winHighWaterActive = AVIOReader.winHighWater
+    private var winHardCapActive = AVIOReader.winHardCap
+    private var bufferPolicyActive = false
+    private var bufferPolicyBytesPerSecond: Double = 0
+
+    /// Applied watermark snapshot for diagnostics and the host state surface.
+    var bufferPolicyDiagnostics: (lowBytes: Int, highBytes: Int, capBytes: Int, active: Bool, bytesPerSecond: Double) {
+        winCond.lock()
+        defer { winCond.unlock() }
+        return (winLowWaterActive, winHighWaterActive, winHardCapActive,
+                bufferPolicyActive, bufferPolicyBytesPerSecond)
+    }
+
+    /// Swap the persistent-window watermarks to time-based values derived from the media's
+    /// average bitrate, or back to the stock byte constants (nil or disabled policy).
+    ///
+    /// The rate is fileSize / duration — both authoritative for VOD by the time this runs
+    /// (fileSize from this reader's own open-time size probe, duration from the demuxer).
+    /// Live keeps stock: its size/duration are non-authoritative and the live window is
+    /// bounded elsewhere. Every clamp floors at the stock constant, so a mis-tuned policy can
+    /// never buffer LESS than stock, and the resume threshold is forced below the fill target
+    /// so the suspend/resume hysteresis (and its balanced suspend count) survives any input.
+    /// The hard cap scales with the fill target but keeps the #220 sizing rule: the window is
+    /// one contiguous `Data`, a growth realloc transiently holds old+new, so the cap is chosen
+    /// against the affordable peak (fill target + bounded overshoot allowance, max +128 MB).
+    ///
+    /// Safe from any thread. If the task is currently suspended and the backlog already sits
+    /// at or under the new resume threshold, it is resumed here — otherwise a mid-session
+    /// policy raise would deliberately keep parked a connection it wants warm.
+    func applySourceBufferPolicy(_ policy: SourceBufferPolicy?, mediaDurationSeconds: Double, reason: String) {
+        var newLow = Self.winLowWater
+        var newHigh = Self.winHighWater
+        var newCap = Self.winHardCap
+        var active = false
+        var rate: Double = 0
+        winCond.lock()
+        if let policy, policy.enabled, !isLive, mediaDurationSeconds > 1, fileSize > 0 {
+            rate = Double(fileSize) / mediaDurationSeconds
+            let ceiling = max(Self.winHighWater, policy.memoryCeilingBytes)
+            newHigh = min(max(Int(rate * policy.highWaterSeconds), Self.winHighWater), ceiling)
+            newLow = min(max(Int(rate * policy.lowWaterSeconds), Self.winLowWater), newHigh * 3 / 4)
+            newCap = max(Self.winHardCap, min(newHigh * 2, newHigh + 128 * 1024 * 1024))
+            active = true
+        }
+        winLowWaterActive = newLow
+        winHighWaterActive = newHigh
+        winHardCapActive = newCap
+        bufferPolicyActive = active
+        bufferPolicyBytesPerSecond = rate
+        // A raised resume threshold can strand a suspended task above the OLD low water with no
+        // read in flight to notice; wake it now (same bookkeeping as the readPersistent resume).
+        var toResume: URLSessionDataTask?
+        let ahead = window.count - max(0, Int(position - winStart))
+        if persistentTaskSuspended, ahead <= winLowWaterActive {
+            persistentTaskSuspended = false
+            toResume = activeTask
+        }
+        winCond.broadcast()
+        winCond.unlock()
+        toResume?.resume()
+        EngineLog.emit(
+            "[AVIOReader] buffer policy reason=\(reason) mode=\(active ? "time" : "stock") "
+            + "low=\(newLow / 1024 / 1024)MB high=\(newHigh / 1024 / 1024)MB cap=\(newCap / 1024 / 1024)MB"
+            + (active
+                ? String(format: " rate=%.1fMbps lowS=%.0f highS=%.0f resumed=%d",
+                         rate * 8 / 1_000_000,
+                         policy?.lowWaterSeconds ?? 0,
+                         policy?.highWaterSeconds ?? 0,
+                         toResume != nil ? 1 : 0)
+                : ""),
+            category: .demux)
+    }
+
     /// #220: set when WE ended the connection at `winHardCap`, so the read loop re-requests at
     /// the frontier without charging the reconnect to the unproductive-reconnect streak. Left
     /// unset, a deliberate cap would spend the streak that exists to detect a dead source and
@@ -1063,7 +1146,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 // #174: resume the suspended transfer once the drain crosses lowWater.
                 var toResume: URLSessionDataTask?
                 if persistentTaskSuspended,
-                   window.count - max(0, Int(position - winStart)) <= Self.winLowWater {
+                   window.count - max(0, Int(position - winStart)) <= winLowWaterActive {
                     persistentTaskSuspended = false
                     toResume = activeTask
                 }
@@ -1488,7 +1571,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         var toCancel: URLSessionDataTask?
         var cancelSession: URLSession?
         let ahead = window.count - max(0, Int(position - winStart))
-        if ahead > Self.winHighWater, !persistentTaskSuspended, !isClosed {
+        if ahead > winHighWaterActive, !persistentTaskSuspended, !isClosed {
             persistentTaskSuspended = true
             toSuspend = activeTask
         }
@@ -1496,7 +1579,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         // window keeps every byte already delivered (they are valid and the consumer reads
         // them) and the read loop re-requests at the frontier once it has drained. Nothing is
         // discarded and nothing is re-fetched.
-        if ahead > Self.winHardCap, !connEndedByBackpressure, !isClosed {
+        if ahead > winHardCapActive, !connEndedByBackpressure, !isClosed {
             connEndedByBackpressure = true
             connEnded = true
             cancelSession = activeSession

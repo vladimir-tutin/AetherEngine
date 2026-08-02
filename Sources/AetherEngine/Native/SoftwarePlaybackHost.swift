@@ -36,6 +36,16 @@ final class SoftwarePlaybackHost {
         demuxer?.ioWindowDiagnostics
     }
 
+    /// Applied source-buffer watermarks of the pump reader (the demuxer is private to this host).
+    var sourceBufferDiagnostics: (lowBytes: Int, highBytes: Int, capBytes: Int, active: Bool, bytesPerSecond: Double)? {
+        demuxer?.sourceBufferDiagnostics
+    }
+
+    /// Forward the engine's source-buffer policy to the pump reader. See `Demuxer.applySourceBufferPolicy`.
+    func applySourceBufferPolicy(_ policy: SourceBufferPolicy?, reason: String) {
+        demuxer?.applySourceBufferPolicy(policy, reason: reason)
+    }
+
     @Published private(set) var isReady: Bool = false
     @Published private(set) var currentTime: Double = 0
     /// Raw synchronizer clock in the SOURCE axis (same axis as demuxed packet PTS and

@@ -134,6 +134,68 @@ public enum LiveJoinProfile: Sendable, Equatable {
     case fastZap
 }
 
+/// Time-based forward-buffer targets for the pump reader's persistent network window
+/// (`AVIOReader`). The stock flow control parks the source connection at a FIXED 16 MB of
+/// undrained bytes and resumes it at 8 MB — 5.1/2.5 seconds of 25 Mbps video and under
+/// 1.6/0.8 seconds at 80 Mbps — so any origin that resumes slowly (a cold file-server
+/// pipeline behind the HTTP source) empties the window and stalls playback. This policy
+/// expresses the same watermarks in seconds of playable media (derived from the source's
+/// average bitrate, fileSize / duration) and clamps them to a byte ceiling so a high-bitrate
+/// source cannot buffer itself into jetsam territory.
+///
+/// Scope: the PLAYBACK pump reader only (software/PCM host demuxer and the native HLS
+/// loopback demuxer). Auxiliary readers over the same origin — subtitle side/prefetch,
+/// Atmos confirmation, seamless audio-track switch — deliberately keep stock watermarks:
+/// their stalls never stop playback and doubling large windows doubles resident memory.
+/// Live sources always keep stock watermarks (size/duration are non-authoritative).
+public struct SourceBufferPolicy: Sendable, Equatable {
+    /// Master switch. `false` (or a nil policy) keeps the stock fixed 8/16/48 MB behavior
+    /// exactly — the host-facing kill switch maps to this.
+    public var enabled: Bool
+    /// Seconds of playable media at which a suspended source connection is resumed.
+    /// Clamped to at least the stock 8 MB and to at most 3/4 of the applied high water.
+    public var lowWaterSeconds: Double
+    /// Seconds of playable media the window fills to before the connection is suspended.
+    /// Clamped to at least the stock 16 MB and to at most `memoryCeilingBytes`.
+    public var highWaterSeconds: Double
+    /// Byte ceiling on the applied high water. The window is one contiguous `Data`, and a
+    /// growth realloc transiently holds old+new buffers (#220), so this is chosen against
+    /// the affordable PEAK, not the steady state. Default 128 MB (~40 s of 25 Mbps media;
+    /// an 80 Mbps source clamps to ~12.8 s, still an order of magnitude above stock).
+    public var memoryCeilingBytes: Int
+
+    public init(
+        enabled: Bool = false,
+        lowWaterSeconds: Double = 15,
+        highWaterSeconds: Double = 30,
+        memoryCeilingBytes: Int = 128 * 1024 * 1024
+    ) {
+        self.enabled = enabled
+        self.lowWaterSeconds = lowWaterSeconds
+        self.highWaterSeconds = highWaterSeconds
+        self.memoryCeilingBytes = memoryCeilingBytes
+    }
+}
+
+/// Applied source-buffer state for the active session (`AetherEngine.sourceBufferState()`).
+/// `policyActive` reports what the live reader ACTUALLY applied (a requested policy stays
+/// inactive on live sources, on lanes without a persistent network window, and before the
+/// bitrate is known), so a host can display truth rather than echoing its own request.
+public struct SourceBufferState: Sendable, Equatable {
+    public let policyRequested: Bool
+    public let policyActive: Bool
+    /// "software" | "native-hls" | "audio" | "none"
+    public let lane: String
+    public let lowWaterBytes: Int
+    public let highWaterBytes: Int
+    public let hardCapBytes: Int
+    /// Average media byte rate the watermarks were derived from; 0 when stock.
+    public let bytesPerSecond: Double
+    public let windowBytes: Int
+    public let aheadBytes: Int
+    public let suspended: Bool
+}
+
 /// Options for `AetherEngine.load(url:options:)`. All flags default to safe values.
 public struct LoadOptions: Sendable, Equatable {
     /// Diagnostic lever: omit BT.2020 / transfer / YCbCr matrix from AVDisplayCriteria so AVPlayer re-reads color from the bitstream. Default off.
@@ -280,6 +342,12 @@ public struct LoadOptions: Sendable, Equatable {
     /// remote server directly.
     public var forwardBufferSegments: Int?
 
+    /// Time-based forward-buffer targets for the playback pump reader; nil keeps the stock fixed
+    /// 8/16 MB suspend/resume window. Applied per session at load and re-applied across
+    /// session-preserving reloads and in-session demuxer restarts; `AetherEngine.setSourceBufferPolicy`
+    /// updates the live session without a reload. See `SourceBufferPolicy`. Default nil.
+    public var sourceBufferPolicy: SourceBufferPolicy? = nil
+
     /// Autostart at load completion. Default `true`: every load path ends in `host.play()` and a
     /// `.playing` state (current behavior, byte-identical). Set `false` to mount PAUSED: a host that
     /// holds a pause at mount (synchronized-start lobby that loads several devices and starts them on
@@ -342,6 +410,7 @@ public struct LoadOptions: Sendable, Equatable {
         preferredSubtitleLanguages: [String] = [],
         externalSubtitles: [ExternalSubtitleTrack] = [],
         forwardBufferSegments: Int? = nil,
+        sourceBufferPolicy: SourceBufferPolicy? = nil,
         autoplay: Bool = true,
         teletextPage: Int? = nil,
         deinterlaceMode: DeinterlaceMode = .auto,
@@ -373,6 +442,7 @@ public struct LoadOptions: Sendable, Equatable {
         self.preferredSubtitleLanguages = preferredSubtitleLanguages
         self.externalSubtitles = externalSubtitles
         self.forwardBufferSegments = forwardBufferSegments
+        self.sourceBufferPolicy = sourceBufferPolicy
         self.autoplay = autoplay
         self.teletextPage = teletextPage
         self.deinterlaceMode = deinterlaceMode

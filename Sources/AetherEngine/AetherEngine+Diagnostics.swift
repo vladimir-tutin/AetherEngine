@@ -137,6 +137,16 @@ extension AetherEngine {
                     ?? self.nativeVideoSession?.demuxer?.ioWindowDiagnostics
                 let prefetchWin = self.subtitleForwardPrefetchDemuxer?.ioWindowDiagnostics
                 let readerStr = Self.readerWindowFragment(pump: pumpWin, prefetch: prefetchWin)
+                // Applied pump watermarks (FlexUI source-buffer policy): the memprobe must show
+                // what the reader is ACTUALLY gating on, or an inert policy reads like a working
+                // one. pumpPolicy=0 with a host-enabled policy means it never engaged.
+                let pumpPolicy = self.softwareHost?.sourceBufferDiagnostics
+                    ?? self.nativeVideoSession?.demuxer?.sourceBufferDiagnostics
+                let policyStr = pumpPolicy.map {
+                    "pumpLowMB=\($0.lowBytes / 1024 / 1024) "
+                    + "pumpHighMB=\($0.highBytes / 1024 / 1024) "
+                    + "pumpPolicy=\($0.active ? 1 : 0) "
+                } ?? ""
 
                 let line = "[AetherEngine] memprobe t=\(elapsed)s "
                     + "rss=\(rssMB)MB "
@@ -158,6 +168,7 @@ extension AetherEngine {
                     + "pktAlive=\(pktAlive) pktTotal=\(pktTotal) "
                     + "subCues=\(cueCount) "
                     + readerStr
+                    + policyStr
                     // #220: the lead is the live tell. It is visible minutes before a kill and
                     // separates "reads fast while building its lead" from "the lead never settles".
                     + SubtitlePrefetchTelemetry.probeFragment(playhead: self.sourceTime)
