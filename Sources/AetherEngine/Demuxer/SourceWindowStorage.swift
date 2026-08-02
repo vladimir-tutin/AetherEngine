@@ -36,13 +36,13 @@ final class ContiguousSourceWindow: SourceWindowStorage {
 
     var count: Int { data.count }
 
-    func append(_ data newData: Data) {
+    func append(_ incoming: Data) {
         let base = data.count
-        data.count = base + newData.count
+        data.count = base + incoming.count
         data.withUnsafeMutableBytes { dst in
-            newData.withUnsafeBytes { src in
+            incoming.withUnsafeBytes { src in
                 if let d = dst.baseAddress, let s = src.baseAddress {
-                    (d + base).copyMemory(from: s, byteCount: newData.count)
+                    (d + base).copyMemory(from: s, byteCount: incoming.count)
                 }
             }
         }
