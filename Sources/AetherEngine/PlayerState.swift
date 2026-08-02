@@ -163,17 +163,51 @@ public struct SourceBufferPolicy: Sendable, Equatable {
     /// the affordable PEAK, not the steady state. Default 128 MB (~40 s of 25 Mbps media;
     /// an 80 Mbps source clamps to ~12.8 s, still an order of magnitude above stock).
     public var memoryCeilingBytes: Int
+    /// hardCap = highWater x this, clamped to 1.25...4 at apply and floored at the stock
+    /// 48 MB cap. #220's "transport ignored suspend()" bound; the realloc-peak rule above is
+    /// why it multiplies the fill target instead of being its own absolute.
+    public var hardCapMultiplier: Double
+    /// Longest the transfer may sit fully parked before it is woken for a top-up anyway.
+    /// The measured stall was a COLD restart (origin read-ahead abandoned, TCP slow-start
+    /// after idle): the connection was never lost, it just did not resume at rate before the
+    /// cushion ran out. Bounding the idle converts one long cold refill into short warm
+    /// top-ups. 0 disables (park until low water, the stock shape).
+    public var keepWarmSeconds: Double
+    /// Bytes kept behind the read cursor for small matroska backward re-reads (stock 2 MB).
+    public var lookbackBytes: Int
+    /// Forward seeks within this distance of the buffered frontier keep the live connection;
+    /// beyond it the reader reconnects at the target. 0 = auto: the larger of the stock 8 MB
+    /// and the applied low water, so a big window never reconnects INSIDE its own cushion.
+    public var seekKeepForwardBytes: Int
+    /// Circuit breaker: this many deliberate hard-cap connection ends within
+    /// `breakerWindowSeconds` halve the applied watermarks (floored at stock). Repeated trips
+    /// converge on stock behavior without touching the host's persisted choice; re-applying
+    /// the policy (new session or an explicit runtime set) restores the full targets.
+    public var breakerHardCapEvents: Int
+    public var breakerWindowSeconds: Double
 
     public init(
         enabled: Bool = false,
         lowWaterSeconds: Double = 15,
         highWaterSeconds: Double = 30,
-        memoryCeilingBytes: Int = 128 * 1024 * 1024
+        memoryCeilingBytes: Int = 128 * 1024 * 1024,
+        hardCapMultiplier: Double = 1.5,
+        keepWarmSeconds: Double = 4,
+        lookbackBytes: Int = 2 * 1024 * 1024,
+        seekKeepForwardBytes: Int = 0,
+        breakerHardCapEvents: Int = 3,
+        breakerWindowSeconds: Double = 60
     ) {
         self.enabled = enabled
         self.lowWaterSeconds = lowWaterSeconds
         self.highWaterSeconds = highWaterSeconds
         self.memoryCeilingBytes = memoryCeilingBytes
+        self.hardCapMultiplier = hardCapMultiplier
+        self.keepWarmSeconds = keepWarmSeconds
+        self.lookbackBytes = lookbackBytes
+        self.seekKeepForwardBytes = seekKeepForwardBytes
+        self.breakerHardCapEvents = breakerHardCapEvents
+        self.breakerWindowSeconds = breakerWindowSeconds
     }
 }
 
@@ -194,6 +228,17 @@ public struct SourceBufferState: Sendable, Equatable {
     public let windowBytes: Int
     public let aheadBytes: Int
     public let suspended: Bool
+    /// Backpressure/underrun telemetry of the live reader, cumulative for the session:
+    /// suspends = times the transfer was parked at high water; keepWarmResumes = keep-warm
+    /// wakes of a parked transfer; underruns = reads that blocked on an EMPTY forward window
+    /// (includes initial fill and post-seek refills, so compare deltas during steady
+    /// playback); hardCapEnds = connections deliberately ended at the hard cap (#220);
+    /// breakerTrips = watermark halvings by the circuit breaker.
+    public let suspends: Int
+    public let keepWarmResumes: Int
+    public let underruns: Int
+    public let hardCapEnds: Int
+    public let breakerTrips: Int
 }
 
 /// Options for `AetherEngine.load(url:options:)`. All flags default to safe values.

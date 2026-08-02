@@ -185,6 +185,11 @@ public final class Demuxer: @unchecked Sendable {
         (avioProvider as? AVIOReader)?.bufferPolicyDiagnostics
     }
 
+    /// Backpressure/underrun counters of the network reader; nil without one.
+    var sourceBufferTelemetry: (suspends: Int, keepWarmResumes: Int, underruns: Int, hardCapEnds: Int, breakerTrips: Int)? {
+        (avioProvider as? AVIOReader)?.bufferTelemetry
+    }
+
     /// Forward the host's source-buffer policy to this demuxer's network reader, deriving byte
     /// watermarks from the media's average bitrate (reader fileSize / this demuxer's duration).
     /// No-op for providers without a persistent HTTP window. Safe from any thread — the reader

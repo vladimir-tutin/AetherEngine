@@ -3745,22 +3745,27 @@ public final class AetherEngine: ObservableObject {
         let lane: String
         let diag: (lowBytes: Int, highBytes: Int, capBytes: Int, active: Bool, bytesPerSecond: Double)?
         let win: (windowBytes: Int, aheadBytes: Int, suspended: Bool, postSuspendBytes: Int64)?
+        let tele: (suspends: Int, keepWarmResumes: Int, underruns: Int, hardCapEnds: Int, breakerTrips: Int)?
         if let host = softwareHost {
             lane = "software"
             diag = host.sourceBufferDiagnostics
             win = host.ioWindowDiagnostics
+            tele = host.sourceBufferTelemetry
         } else if let session = nativeVideoSession {
             lane = "native-hls"
             diag = session.demuxer?.sourceBufferDiagnostics
             win = session.demuxer?.ioWindowDiagnostics
+            tele = session.demuxer?.sourceBufferTelemetry
         } else if let host = audioHost {
             lane = "audio"
             diag = host.sourceBufferDiagnostics
             win = host.ioWindowDiagnostics
+            tele = host.sourceBufferTelemetry
         } else {
             lane = "none"
             diag = nil
             win = nil
+            tele = nil
         }
         return SourceBufferState(
             policyRequested: policy?.enabled == true,
@@ -3772,7 +3777,12 @@ public final class AetherEngine: ObservableObject {
             bytesPerSecond: diag?.bytesPerSecond ?? 0,
             windowBytes: win?.windowBytes ?? 0,
             aheadBytes: win?.aheadBytes ?? 0,
-            suspended: win?.suspended ?? false
+            suspended: win?.suspended ?? false,
+            suspends: tele?.suspends ?? 0,
+            keepWarmResumes: tele?.keepWarmResumes ?? 0,
+            underruns: tele?.underruns ?? 0,
+            hardCapEnds: tele?.hardCapEnds ?? 0,
+            breakerTrips: tele?.breakerTrips ?? 0
         )
     }
 

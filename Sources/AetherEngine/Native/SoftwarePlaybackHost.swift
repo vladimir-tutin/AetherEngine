@@ -41,6 +41,11 @@ final class SoftwarePlaybackHost {
         demuxer?.sourceBufferDiagnostics
     }
 
+    /// Backpressure/underrun counters of the pump reader.
+    var sourceBufferTelemetry: (suspends: Int, keepWarmResumes: Int, underruns: Int, hardCapEnds: Int, breakerTrips: Int)? {
+        demuxer?.sourceBufferTelemetry
+    }
+
     /// Forward the engine's source-buffer policy to the pump reader. See `Demuxer.applySourceBufferPolicy`.
     func applySourceBufferPolicy(_ policy: SourceBufferPolicy?, reason: String) {
         demuxer?.applySourceBufferPolicy(policy, reason: reason)

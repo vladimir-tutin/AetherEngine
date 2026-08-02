@@ -307,8 +307,31 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     private var winLowWaterActive = AVIOReader.winLowWater
     private var winHighWaterActive = AVIOReader.winHighWater
     private var winHardCapActive = AVIOReader.winHardCap
+    private var winLookbackActive = AVIOReader.winLookback
+    private var seekKeepForwardActive = AVIOReader.seekKeepForwardLimit
     private var bufferPolicyActive = false
     private var bufferPolicyBytesPerSecond: Double = 0
+    // Keep-warm: longest the transfer may sit parked before a top-up wake. 0 = stock parking.
+    private var keepWarmSecondsActive: Double = 0
+    // Generation guard for the keep-warm one-shot: bumped at every suspend (each schedules its
+    // own wake) and at every keep-warm resume, so a stale timer that fires after an ordinary
+    // low-water resume or a later re-suspend validates against BOTH the generation and the
+    // still-suspended flag and no-ops. The suspend count stays balanced via the flag exactly
+    // like every other resume path.
+    private var keepWarmGeneration = 0
+    // Circuit breaker over deliberate hard-cap connection ends (policy mode only): N events
+    // inside the window halve the applied watermarks toward stock. Protects the device when
+    // the transport demonstrably ignores suspend() at the scaled-up watermarks (#220).
+    private var breakerHardCapEventsActive = 0
+    private var breakerWindowSecondsActive: Double = 60
+    private var breakerWindowStartedAt: TimeInterval = 0
+    private var breakerEventCount = 0
+    // Session-cumulative telemetry (winCond-guarded).
+    private var suspendCount = 0
+    private var keepWarmResumeCount = 0
+    private var underrunWaitCount = 0
+    private var hardCapEndCount = 0
+    private var breakerTripCount = 0
 
     /// Applied watermark snapshot for diagnostics and the host state surface.
     var bufferPolicyDiagnostics: (lowBytes: Int, highBytes: Int, capBytes: Int, active: Bool, bytesPerSecond: Double) {
@@ -316,6 +339,15 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         defer { winCond.unlock() }
         return (winLowWaterActive, winHighWaterActive, winHardCapActive,
                 bufferPolicyActive, bufferPolicyBytesPerSecond)
+    }
+
+    /// Backpressure/underrun counters, cumulative for this reader. `underruns` counts reads
+    /// that blocked on an empty forward window — including the initial fill and post-seek
+    /// refills, so consumers should compare deltas during steady playback.
+    var bufferTelemetry: (suspends: Int, keepWarmResumes: Int, underruns: Int, hardCapEnds: Int, breakerTrips: Int) {
+        winCond.lock()
+        defer { winCond.unlock() }
+        return (suspendCount, keepWarmResumeCount, underrunWaitCount, hardCapEndCount, breakerTripCount)
     }
 
     /// Swap the persistent-window watermarks to time-based values derived from the media's
@@ -338,6 +370,9 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         var newLow = Self.winLowWater
         var newHigh = Self.winHighWater
         var newCap = Self.winHardCap
+        var newLookback = Self.winLookback
+        var newSeekKeep = Self.seekKeepForwardLimit
+        var newKeepWarm: Double = 0
         var active = false
         var rate: Double = 0
         winCond.lock()
@@ -346,14 +381,31 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             let ceiling = max(Self.winHighWater, policy.memoryCeilingBytes)
             newHigh = min(max(Int(rate * policy.highWaterSeconds), Self.winHighWater), ceiling)
             newLow = min(max(Int(rate * policy.lowWaterSeconds), Self.winLowWater), newHigh * 3 / 4)
-            newCap = max(Self.winHardCap, min(newHigh * 2, newHigh + 128 * 1024 * 1024))
+            let capMultiplier = min(4, max(1.25, policy.hardCapMultiplier))
+            newCap = max(Self.winHardCap, Int(Double(newHigh) * capMultiplier))
+            newLookback = max(64 * 1024, policy.lookbackBytes)
+            // 0 = auto: never reconnect INSIDE the cushion the policy itself maintains.
+            newSeekKeep = policy.seekKeepForwardBytes > 0
+                ? policy.seekKeepForwardBytes
+                : max(Self.seekKeepForwardLimit, newLow)
+            newKeepWarm = max(0, policy.keepWarmSeconds)
+            breakerHardCapEventsActive = max(0, policy.breakerHardCapEvents)
+            breakerWindowSecondsActive = max(5, policy.breakerWindowSeconds)
             active = true
+        } else {
+            breakerHardCapEventsActive = 0
         }
         winLowWaterActive = newLow
         winHighWaterActive = newHigh
         winHardCapActive = newCap
+        winLookbackActive = newLookback
+        seekKeepForwardActive = newSeekKeep
+        keepWarmSecondsActive = newKeepWarm
         bufferPolicyActive = active
         bufferPolicyBytesPerSecond = rate
+        // A fresh application is a fresh contract: forget breaker history from earlier values.
+        breakerEventCount = 0
+        breakerWindowStartedAt = 0
         // A raised resume threshold can strand a suspended task above the OLD low water with no
         // read in flight to notice; wake it now (same bookkeeping as the readPersistent resume).
         var toResume: URLSessionDataTask?
@@ -376,6 +428,33 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                          toResume != nil ? 1 : 0)
                 : ""),
             category: .demux)
+    }
+
+    /// One-shot keep-warm wake for a parked transfer. The measured stall shape was a COLD
+    /// resume: the connection was never lost, but after seconds fully parked the origin's
+    /// read-ahead was gone and TCP had left slow-start, so the refill arrived too slowly for
+    /// the remaining cushion. Waking the task before the park grows cold converts one long
+    /// cold refill into short warm top-ups (each top-up immediately re-suspends at high water,
+    /// which schedules the next wake, so the cycle is bounded by design). Validates BOTH the
+    /// generation and the still-suspended flag, so a stale timer after an ordinary low-water
+    /// resume or a later re-suspend no-ops and the suspend count stays balanced.
+    private func scheduleKeepWarmWake(generation: Int, delay: Double) {
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self else { return }
+            var toResume: URLSessionDataTask?
+            self.winCond.lock()
+            if self.keepWarmGeneration == generation,
+               self.persistentTaskSuspended,
+               !self.isClosed {
+                self.persistentTaskSuspended = false
+                self.keepWarmGeneration += 1
+                self.keepWarmResumeCount += 1
+                toResume = self.activeTask
+                self.winCond.broadcast()
+            }
+            self.winCond.unlock()
+            toResume?.resume()
+        }
     }
 
     /// #220: set when WE ended the connection at `winHardCap`, so the read loop re-requests at
@@ -1169,7 +1248,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 return totalRead > 0 ? Int32(totalRead) : FFmpegErr.eof
             }
 
-            if curPosition > frontier + Int64(Self.seekKeepForwardLimit) {
+            if curPosition > frontier + Int64(seekKeepForwardActive) {
                 winCond.unlock()
                 // Far-forward seek. Serve from the detour cache ONLY if the block is already
                 // resident (e.g. the moov region the parser revisits); a genuine forward scrub
@@ -1208,6 +1287,10 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 }
                 // Wait for the live connection to fill forward. A false return
                 // means connStallTimeout elapsed with no data (socket stall).
+                // Telemetry: the forward window is EMPTY here — an underrun from the
+                // consumer's perspective (includes initial fill and post-seek refills;
+                // consumers compare deltas during steady playback).
+                underrunWaitCount += 1
                 let waitStart = DispatchTime.now()
                 let signaled = winCond.wait(until: min(Date(timeIntervalSinceNow: Self.connStallTimeout), readDeadline))
                 winCond.unlock()
@@ -1284,9 +1367,9 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// storage. Caller holds `winCond`.
     private func trimWindowLocked() {
         let behind = Int(position - winStart)
-        let dropThreshold = Self.winLookback + Self.winTrimBatch
+        let dropThreshold = winLookbackActive + Self.winTrimBatch
         if behind > dropThreshold {
-            let drop = behind - Self.winLookback
+            let drop = behind - winLookbackActive
             window = window.subdata(in: drop..<window.count)
             winStart += Int64(drop)
         }
@@ -1571,9 +1654,16 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         var toCancel: URLSessionDataTask?
         var cancelSession: URLSession?
         let ahead = window.count - max(0, Int(position - winStart))
+        var keepWarmWake: (generation: Int, delay: Double)? = nil
+        var breakerMessage: String? = nil
         if ahead > winHighWaterActive, !persistentTaskSuspended, !isClosed {
             persistentTaskSuspended = true
             toSuspend = activeTask
+            suspendCount += 1
+            keepWarmGeneration += 1
+            if keepWarmSecondsActive > 0 {
+                keepWarmWake = (keepWarmGeneration, keepWarmSecondsActive)
+            }
         }
         // #220: the suspend did not take. Ending the connection is the only bound left; the
         // window keeps every byte already delivered (they are valid and the consumer reads
@@ -1587,10 +1677,38 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             activeSession = nil
             activeTask = nil
             persistentTaskSuspended = false
+            hardCapEndCount += 1
+            // Circuit breaker (policy mode only): repeated deliberate cap ends mean the
+            // transport is ignoring suspend() at the scaled-up watermarks, so halve them
+            // toward stock instead of paying the cap cycle indefinitely. The host's persisted
+            // choice is untouched; a fresh applySourceBufferPolicy restores the full targets.
+            if bufferPolicyActive, breakerHardCapEventsActive > 0 {
+                let now = Date().timeIntervalSinceReferenceDate
+                if breakerWindowStartedAt == 0 || now - breakerWindowStartedAt > breakerWindowSecondsActive {
+                    breakerWindowStartedAt = now
+                    breakerEventCount = 0
+                }
+                breakerEventCount += 1
+                if breakerEventCount >= breakerHardCapEventsActive {
+                    let oldHigh = winHighWaterActive
+                    winHighWaterActive = max(Self.winHighWater, winHighWaterActive / 2)
+                    winLowWaterActive = max(Self.winLowWater, min(winLowWaterActive / 2, winHighWaterActive * 3 / 4))
+                    winHardCapActive = max(Self.winHardCap, winHighWaterActive * 2)
+                    breakerTripCount += 1
+                    breakerEventCount = 0
+                    breakerWindowStartedAt = 0
+                    breakerMessage = "[AVIOReader] buffer policy breaker tripped: "
+                        + "\(hardCapEndCount) hard-cap ends; high \(oldHigh / 1024 / 1024)MB -> "
+                        + "\(winHighWaterActive / 1024 / 1024)MB low -> \(winLowWaterActive / 1024 / 1024)MB "
+                        + "(trip #\(breakerTripCount), stock floor 16/8MB, persisted setting untouched)"
+                }
+            }
             winCond.broadcast()
         }
         winCond.unlock()
         toSuspend?.suspend()
+        if let keepWarmWake { scheduleKeepWarmWake(generation: keepWarmWake.generation, delay: keepWarmWake.delay) }
+        if let breakerMessage { EngineLog.emit(breakerMessage, category: .demux) }
         if let toCancel {
             EngineLog.emit(
                 "[AVIOReader] window hard cap: \(ahead / 1024 / 1024)MB resident with the task "

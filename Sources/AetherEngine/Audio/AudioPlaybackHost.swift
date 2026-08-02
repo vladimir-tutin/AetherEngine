@@ -33,6 +33,11 @@ final class AudioPlaybackHost {
         demuxer?.sourceBufferDiagnostics
     }
 
+    /// Backpressure/underrun counters of this host's reader.
+    var sourceBufferTelemetry: (suspends: Int, keepWarmResumes: Int, underruns: Int, hardCapEnds: Int, breakerTrips: Int)? {
+        demuxer?.sourceBufferTelemetry
+    }
+
     /// Sliding-window snapshot of this host's reader, mirroring `SoftwarePlaybackHost`.
     var ioWindowDiagnostics: (windowBytes: Int, aheadBytes: Int, suspended: Bool, postSuspendBytes: Int64)? {
         demuxer?.ioWindowDiagnostics
