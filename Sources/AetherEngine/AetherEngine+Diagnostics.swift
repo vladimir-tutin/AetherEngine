@@ -158,6 +158,10 @@ extension AetherEngine {
                     + "pktAlive=\(pktAlive) pktTotal=\(pktTotal) "
                     + "subCues=\(cueCount) "
                     + readerStr
+                    // Time-aware buffer policy: the APPLIED watermarks (never the requested
+                    // ones) plus park/keep-warm/underrun counts. Empty while the policy is off,
+                    // so the stock memprobe line is unchanged.
+                    + AetherSourceBuffer.probeFragment()
                     // #220: the lead is the live tell. It is visible minutes before a kill and
                     // separates "reads fast while building its lead" from "the lead never settles".
                     + SubtitlePrefetchTelemetry.probeFragment(playhead: self.sourceTime)

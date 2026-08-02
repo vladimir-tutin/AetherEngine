@@ -163,6 +163,9 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     private var isPrefetching = false
     private let prefetchReady = DispatchSemaphore(value: 0)
     private let prefetchQueue = DispatchQueue(label: "com.aetherengine.avio.prefetch", qos: .userInitiated)
+    /// Timer queue for `scheduleKeepWarmResume`. Never touched by the demux thread's read path;
+    /// its work item takes `winCond` for the same short critical section the delegate does.
+    private let keepWarmQueue = DispatchQueue(label: "com.aetherengine.avio.keepwarm", qos: .utility)
     private static let maxRetries = 3
 
     // MARK: - Streaming Mode (sequential GET)
@@ -189,8 +192,14 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     // water is the target, and `winHardCap` is the bound: past it the connection is ended
     // deliberately and re-requested at the frontier once the window drains. See
     // `endPersistentConnectionForBackpressure`.
-    private static let winHighWater = 16 * 1024 * 1024
-    private static let winLowWater = 8 * 1024 * 1024
+    //
+    // THESE ARE NOW THE FLOOR, NOT THE POLICY. They are the values `AetherSourceBufferPolicy`
+    // resolves to whenever the time-aware policy is off or the media rate is unknown, and the
+    // values it can never go below. See SourceBufferPolicy.swift for why bytes are the wrong unit
+    // for a playback cushion (8 MB = 2.54 s at 25.2 Mbps, 0.8 s at 80 Mbps) and for the field
+    // capture that indicted them.
+    private static let winHighWater = AetherSourceBufferStock.highWaterBytes
+    private static let winLowWater = AetherSourceBufferStock.lowWaterBytes
     // #220 hard bound on the resident window. Above this the transport is demonstrably
     // ignoring the suspend, and no amount of waiting brings it back down.
     //
@@ -207,13 +216,18 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     // Lower costs reconnects only in the regime that is already broken: a healthy link never
     // reaches it, and at the rates where the defect appears the excess is 1-2 MB/s, so the
     // cycle is tens of seconds. No byte is discarded or re-fetched either way.
-    static let winHardCap = 48 * 1024 * 1024
+    //
+    // The "cap sets the peak at roughly twice its own value" reasoning holds for the CONTIGUOUS
+    // window only. `BlockRingSourceWindow` never reallocates retained bytes, so under the
+    // time-aware policy the peak is the window plus one block, which is what lets the resolver
+    // scale this bound with the high water instead of pinning it at 48 MB.
+    static let winHardCap = AetherSourceBufferStock.hardCapBytes
     // Keep this many bytes behind the cursor for small matroska backward re-reads.
-    private static let winLookback = 2 * 1024 * 1024
+    private static let winLookback = AetherSourceBufferStock.lookbackBytes
     // Trim in batches to avoid O(n^2) memmove storm on every 256 KB read.
     private static let winTrimBatch = 4 * 1024 * 1024
     // Forward seeks within this distance keep the live connection; beyond it, reconnect.
-    private static let seekKeepForwardLimit = 8 * 1024 * 1024
+    private static let seekKeepForwardLimit = AetherSourceBufferStock.seekKeepForwardBytes
     // CDN stall threshold: no bytes for this long triggers reconnect.
     private static let connStallTimeout: TimeInterval = 20
     // A reconnect that delivers at least this much counts as progress; resets streak.
@@ -265,8 +279,74 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     private let winCond = NSCondition()
     /// Sliding window of bytes from the live connection, starting at `winStart`.
     /// `position - winStart` is the read offset within `window`.
-    private var window = Data()
+    /// Storage is chosen per connection from `AetherSourceBuffer.policy`: the stock contiguous
+    /// `Data` while the time-aware policy is off, a fixed-block ring when it is on (a 95 MB
+    /// contiguous window cannot be trimmed with `subdata` affordably — see SourceWindowStorage).
+    private var window: SourceWindowStorage = ContiguousSourceWindow()
     private var winStart: Int64 = 0
+
+    // MARK: - Time-aware buffer policy (applied watermarks + telemetry)
+
+    /// Watermarks this reader ACTUALLY installed. Recomputed at every connection start and
+    /// whenever the media bitrate resolves, so a mid-playback policy change lands on the next
+    /// fill cycle without another native build. winCond-guarded.
+    private var applied = AetherResolvedWatermarks.stock
+    /// Media rate the durations resolve against, bytes/sec. Set by `Demuxer` after
+    /// `avformat_find_stream_info`; 0 until then, which forces the stock watermarks.
+    private var mediaBytesPerSecond: Double = 0
+    /// Memory circuit breaker: hard-cap ends observed, and the shrink factor they produced.
+    private var hardCapEventTimes: [Date] = []
+    private var breakerShrink: Double = 1
+    /// Field telemetry for the memprobe.
+    private var suspendCount = 0
+    private var keepWarmResumeCount = 0
+    private var underrunCount = 0
+    private var wasStarvedLastWait = false
+    /// Bumped on every suspend so a stale keep-warm timer cannot resume a newer connection.
+    private var keepWarmToken = 0
+    /// Only the main playback reader reports its applied policy to the host; side readers
+    /// (subtitle, thumbnail) share the process-global policy but must not overwrite the report.
+    var isPrimaryPlaybackReader = false
+
+    /// Recompute and install the watermarks. Caller holds `winCond`.
+    private func refreshWatermarksLocked(reason: String) {
+        let policy = AetherSourceBuffer.policy
+        let next = policy.resolve(bytesPerSecond: mediaBytesPerSecond, shrinkFactor: breakerShrink)
+        guard next != applied else { return }
+        applied = next
+        guard isPrimaryPlaybackReader else { return }
+        AetherSourceBuffer.recordApplied(next)
+        EngineLog.emit(
+            "[AVIOReader] buffer policy applied (\(reason)): \(AetherSourceBuffer.appliedDescription())",
+            category: .demux)
+    }
+
+    /// Entry point for `Demuxer`: the container's resolved bitrate in bits/sec.
+    /// Idempotent; a zero/negative value leaves the stock watermarks in place.
+    func applyMediaBitrate(bitsPerSecond: Int64) {
+        guard bitsPerSecond > 0 else { return }
+        let next = Double(bitsPerSecond) / 8.0
+        winCond.lock()
+        // Ignore jitter: only a materially different rate is worth re-resolving.
+        if mediaBytesPerSecond > 0, abs(next - mediaBytesPerSecond) / mediaBytesPerSecond < 0.05 {
+            winCond.unlock()
+            return
+        }
+        mediaBytesPerSecond = next
+        refreshWatermarksLocked(reason: "bitrate")
+        winCond.unlock()
+    }
+
+    /// winCond-guarded telemetry snapshot for the memprobe.
+    var bufferPolicyDiagnostics: (lowBytes: Int, highBytes: Int, hardCapBytes: Int,
+                                  bytesPerSecond: Double, reason: String,
+                                  suspends: Int, keepWarmResumes: Int, underruns: Int) {
+        winCond.lock()
+        defer { winCond.unlock() }
+        return (applied.lowWaterBytes, applied.highWaterBytes, applied.hardCapBytes,
+                applied.bytesPerSecond, applied.reason,
+                suspendCount, keepWarmResumeCount, underrunCount)
+    }
     // Connection state.
     private var connEnded = false
     private var connStatus = 0
@@ -404,6 +484,9 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     }
 
     func open() throws {
+        // New playback source: zero the buffer-policy counters so `bufSusp`/`bufWarm`/`bufUnder`
+        // in the memprobe describe THIS title, not the process lifetime.
+        if isPrimaryPlaybackReader { AetherSourceBuffer.beginSession() }
         guard let buf = av_malloc(Int(Self.avioBufferSize)) else {
             throw AVIOReaderError.allocationFailed
         }
@@ -523,10 +606,10 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     private func awaitFirstPersistentData() -> Bool {
         winCond.lock()
         let deadline = Date(timeIntervalSinceNow: 15)
-        while window.isEmpty && !connEnded && !isClosed {
+        while window.count == 0 && !connEnded && !isClosed {
             if !winCond.wait(until: deadline) { break }
         }
-        let gotData = !window.isEmpty
+        let gotData = window.count > 0
         winCond.unlock()
         return gotData
     }
@@ -537,8 +620,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     private func firstWindowPrefix(max: Int = 16) -> [UInt8] {
         winCond.lock()
         defer { winCond.unlock() }
-        let n = Swift.min(max, window.count)
-        return n > 0 ? Array(window.prefix(n)) : []
+        return window.prefixBytes(max)
     }
 
     /// True when a body's leading bytes are the HLS playlist tag `#EXTM3U`, tolerating a UTF-8 BOM and
@@ -574,7 +656,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         persistentTaskSuspended = false
         activeSession = nil
         activeTask = nil
-        window = Data()
+        window.removeAll()
         connEnded = true
         winCond.broadcast()
         return (false, session, task, suspended)
@@ -729,7 +811,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         persistentTaskSuspended = false
         activeSession = nil
         activeTask = nil
-        window = Data()
+        window.removeAll()
         winCond.broadcast()
         winCond.unlock()
         if persistentWasSuspended { task?.resume() }
@@ -1049,22 +1131,20 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             let available = window.count - posInWindow
             if available > 0 {
                 let copyNow = min(available, requestSize - totalRead)
-                window.withUnsafeBytes { raw in
-                    let src = raw.baseAddress!.advanced(by: posInWindow)
-                        .assumingMemoryBound(to: UInt8.self)
-                    buf.advanced(by: totalRead).update(from: src, count: copyNow)
-                }
+                window.copyOut(from: posInWindow, into: buf.advanced(by: totalRead), count: copyNow)
                 position = curPosition + Int64(copyNow)
                 totalRead += copyNow
                 trimWindowLocked()
                 unproductiveReconnects = 0      // real progress
                 rateLimitStreak = 0             // real progress clears the 429 give-up streak (#71)
                 emitNetworkPhase(.flowing)      // recovered: source delivering again (#85)
+                wasStarvedLastWait = false
                 // #174: resume the suspended transfer once the drain crosses lowWater.
                 var toResume: URLSessionDataTask?
                 if persistentTaskSuspended,
-                   window.count - max(0, Int(position - winStart)) <= Self.winLowWater {
+                   window.count - max(0, Int(position - winStart)) <= applied.lowWaterBytes {
                     persistentTaskSuspended = false
+                    keepWarmToken &+= 1     // this resume wins; cancel any pending keep-warm
                     toResume = activeTask
                 }
                 winCond.broadcast()
@@ -1086,7 +1166,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 return totalRead > 0 ? Int32(totalRead) : FFmpegErr.eof
             }
 
-            if curPosition > frontier + Int64(Self.seekKeepForwardLimit) {
+            if curPosition > frontier + Int64(applied.seekKeepForwardBytes) {
                 winCond.unlock()
                 // Far-forward seek. Serve from the detour cache ONLY if the block is already
                 // resident (e.g. the moov region the parser revisits); a genuine forward scrub
@@ -1122,6 +1202,14 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                     winCond.unlock()
                     toResume?.resume()
                     continue
+                }
+                // Telemetry: the forward buffer is empty at the read cursor, so playback is
+                // now living on the decoder's own queue. Counted once per contiguous starve so
+                // the memprobe shows underruns, not wait events.
+                if !wasStarvedLastWait {
+                    wasStarvedLastWait = true
+                    underrunCount += 1
+                    if isPrimaryPlaybackReader { AetherSourceBuffer.noteUnderrun() }
                 }
                 // Wait for the live connection to fill forward. A false return
                 // means connStallTimeout elapsed with no data (socket stall).
@@ -1194,6 +1282,44 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         return Int32(totalRead)
     }
 
+    /// Keep-warm: resume a task that has been parked for `after` seconds even though the window
+    /// has not drained to the low water.
+    ///
+    /// Why this is not just "a smaller high water": the failure being fixed is a COLD RESTART,
+    /// not a small buffer alone. The field capture showed `reconnects=0 connect=0ms` with the
+    /// bytes arriving in ~64 KB dribbles for 3-3.8 s, i.e. the connection was alive but its
+    /// delivery pipeline had gone cold across the park (Node `fs.ReadStream` -> SMB read-ahead
+    /// abandoned; TCP slow-start-after-idle resetting cwnd). Resuming on a bounded timer converts
+    /// one long cold refill into several short warm top-ups, and as a side effect holds the
+    /// resident window near the HIGH water instead of sawtoothing down to the low water.
+    ///
+    /// Cheap by construction: each top-up transfers only what drained since the suspend, and the
+    /// suspend flag is re-applied by `appendPersistentData` as soon as the high water is crossed.
+    private func scheduleKeepWarmResume(task: URLSessionDataTask, generation: Int,
+                                        token: Int, after: Double) {
+        keepWarmQueue.asyncAfter(deadline: .now() + after) { [weak self] in
+            guard let self else { return }
+            self.winCond.lock()
+            // Every one of these can invalidate the wake: the read loop already resumed at the
+            // low water (token bumped), the connection was replaced (generation), the reader is
+            // closing, or the task was cancelled at the hard cap.
+            guard self.keepWarmToken == token,
+                  self.connGeneration == generation,
+                  self.persistentTaskSuspended,
+                  !self.isClosed,
+                  self.activeTask === task else {
+                self.winCond.unlock()
+                return
+            }
+            self.persistentTaskSuspended = false
+            self.keepWarmResumeCount += 1
+            let primary = self.isPrimaryPlaybackReader
+            self.winCond.unlock()
+            if primary { AetherSourceBuffer.noteKeepWarmResume() }
+            task.resume()
+        }
+    }
+
     /// Drop consumed bytes in ~winTrimBatch steps to avoid O(n^2) memmove.
     /// MUST use `subdata` (not `removeFirst`): removeFirst only advances the slice's
     /// lower bound but backing storage grows with count.setter in appendPersistentData,
@@ -1201,10 +1327,10 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// storage. Caller holds `winCond`.
     private func trimWindowLocked() {
         let behind = Int(position - winStart)
-        let dropThreshold = Self.winLookback + Self.winTrimBatch
+        let dropThreshold = applied.lookbackBytes + Self.winTrimBatch
         if behind > dropThreshold {
-            let drop = behind - Self.winLookback
-            window = window.subdata(in: drop..<window.count)
+            let drop = behind - applied.lookbackBytes
+            window.trimFront(drop)
             winStart += Int64(drop)
         }
     }
@@ -1382,7 +1508,21 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         connGeneration &+= 1
         let generation = connGeneration
         winStart = offset
-        window = Data()
+        // Re-read the host policy on every connection so a runtime change (Settings/Metro) takes
+        // effect without another native build, and install matching storage. The stock policy
+        // keeps the contiguous `Data` window so `enabled == false` is the pre-change binary.
+        refreshWatermarksLocked(reason: "connect")
+        let policy = AetherSourceBuffer.policy
+        let wantRing = policy.enabled && policy.useBlockRing
+        let haveRing = window is BlockRingSourceWindow
+        if wantRing != haveRing {
+            window = wantRing
+                ? BlockRingSourceWindow(blockSize: policy.blockSizeBytes)
+                : ContiguousSourceWindow()
+        } else {
+            window.removeAll()
+        }
+        keepWarmToken &+= 1     // no keep-warm timer may outlive the old connection
         connEnded = false
         connEndedByBackpressure = false
         suspendedDeliveryBytes = 0
@@ -1470,15 +1610,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         // #220: delivery that lands with the suspend flag already set. Counted before the
         // append so it is attributable to the transport, not to our own bookkeeping.
         if persistentTaskSuspended { suspendedDeliveryBytes += Int64(count) }
-        let base = window.count
-        window.count = base + count
-        window.withUnsafeMutableBytes { dst in
-            data.withUnsafeBytes { src in
-                if let d = dst.baseAddress, let s = src.baseAddress {
-                    (d + base).copyMemory(from: s, byteCount: count)
-                }
-            }
-        }
+        window.append(data)
         addBytesFetched(count)
         winCond.broadcast()
         // Deliveries already dispatched before the suspend takes effect still land here
@@ -1488,15 +1620,31 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         var toCancel: URLSessionDataTask?
         var cancelSession: URLSession?
         let ahead = window.count - max(0, Int(position - winStart))
-        if ahead > Self.winHighWater, !persistentTaskSuspended, !isClosed {
+        var keepWarmAfter: Double = 0
+        var keepWarmStamp = 0
+        if ahead > applied.highWaterBytes, !persistentTaskSuspended, !isClosed {
             persistentTaskSuspended = true
+            suspendCount += 1
+            if isPrimaryPlaybackReader { AetherSourceBuffer.noteSuspend() }
             toSuspend = activeTask
+            // Keep-warm: bound how long the socket may sit fully idle. The measured failure is a
+            // COLD restart — the origin pipeline (here Node -> SMB) and TCP's congestion window
+            // both decay across a multi-second park, so the resume dribbles instead of bursting.
+            // Waking early tops the window back to the high water in small increments and keeps
+            // the path warm, at the cost of more (much cheaper) resumes. 0 disables it.
+            let policy = AetherSourceBuffer.policy
+            if policy.enabled, policy.keepWarmSeconds > 0 {
+                keepWarmToken &+= 1
+                keepWarmStamp = keepWarmToken
+                keepWarmAfter = policy.keepWarmSeconds
+            }
         }
         // #220: the suspend did not take. Ending the connection is the only bound left; the
         // window keeps every byte already delivered (they are valid and the consumer reads
         // them) and the read loop re-requests at the frontier once it has drained. Nothing is
         // discarded and nothing is re-fetched.
-        if ahead > Self.winHardCap, !connEndedByBackpressure, !isClosed {
+        var breakerTripped = false
+        if ahead > applied.hardCapBytes, !connEndedByBackpressure, !isClosed {
             connEndedByBackpressure = true
             connEnded = true
             cancelSession = activeSession
@@ -1504,10 +1652,38 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             activeSession = nil
             activeTask = nil
             persistentTaskSuspended = false
+            // MEMORY circuit breaker. Deliberately memory-triggered, not stall-triggered: the
+            // stock watermarks ARE the stall defect, so falling back to them on a stall would
+            // make the symptom worse. What the enlarged window can genuinely break is memory, so
+            // that is what trips it — repeated hard-cap ends halve the applied watermarks for the
+            // rest of the session (never below stock) without touching the persisted policy.
+            let now = Date()
+            let policy = AetherSourceBuffer.policy
+            hardCapEventTimes.append(now)
+            hardCapEventTimes.removeAll { now.timeIntervalSince($0) > policy.breakerWindowSeconds }
+            if policy.enabled, hardCapEventTimes.count >= policy.breakerHardCapEvents,
+               breakerShrink > 0.25 {
+                breakerShrink /= 2
+                hardCapEventTimes.removeAll()
+                breakerTripped = true
+                refreshWatermarksLocked(reason: "memory-breaker")
+            }
             winCond.broadcast()
         }
+        let breakerShrinkNow = breakerShrink
         winCond.unlock()
+        if breakerTripped {
+            EngineLog.emit(
+                "[AVIOReader] buffer policy MEMORY BREAKER: repeated hard-cap ends; "
+                + "shrink=\(breakerShrinkNow) now \(AetherSourceBuffer.appliedDescription()) "
+                + "(session-only; persisted policy unchanged)",
+                category: .demux)
+        }
         toSuspend?.suspend()
+        if keepWarmAfter > 0, let warmTask = toSuspend {
+            scheduleKeepWarmResume(task: warmTask, generation: generation,
+                                   token: keepWarmStamp, after: keepWarmAfter)
+        }
         if let toCancel {
             EngineLog.emit(
                 "[AVIOReader] window hard cap: \(ahead / 1024 / 1024)MB resident with the task "

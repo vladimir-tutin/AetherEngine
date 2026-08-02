@@ -40,4 +40,14 @@ protocol AVIOProvider: AnyObject {
 
     /// Free the `AVIOContext` and release the underlying source. Idempotent.
     func close()
+
+    /// Resolved media rate in bits/sec, published once `avformat_find_stream_info` has run.
+    /// Lets a network reader size its forward buffer in seconds of media rather than in fixed
+    /// bytes (see `AetherSourceBufferPolicy`). Sources with no network buffer ignore it.
+    func applyMediaBitrate(bitsPerSecond: Int64)
+}
+
+extension AVIOProvider {
+    /// Default no-op: only `AVIOReader`'s persistent path has a watermarked forward buffer.
+    func applyMediaBitrate(bitsPerSecond: Int64) {}
 }

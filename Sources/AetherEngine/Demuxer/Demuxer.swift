@@ -380,6 +380,10 @@ public final class Demuxer: @unchecked Sendable {
             boundedInitialFetch: openProfile.boundedInitialFetch
         )
         reader.onNetworkPhaseChanged = onNetworkPhaseChanged
+        // Only the persistent, full-probe reader is the playback source; the subtitle/Atmos side
+        // demuxers share the process-global policy but must not own the host-visible "applied"
+        // report, and still-extraction never runs the persistent path at all.
+        reader.isPrimaryPlaybackReader = openProfile.avioPrefetch && !openProfile.skipStreamInfo
         try openWithProvider(reader, isLive: isLive)
     }
 
@@ -485,6 +489,24 @@ public final class Demuxer: @unchecked Sendable {
             throw DemuxerError.streamInfoFailed(code: findRet)
         }
         logStreams(ctx)
+        publishMediaBitrate(ctx)
+    }
+
+    /// Hand the resolved media rate to the source reader so its forward buffer can be sized in
+    /// SECONDS instead of bytes (see SourceBufferPolicy). Container `bit_rate` first; if the
+    /// container does not declare one, derive it from total size / duration, which is exact enough
+    /// for a watermark and is always available on a ranged VOD source.
+    private func publishMediaBitrate(_ ctx: UnsafeMutablePointer<AVFormatContext>) {
+        var bps = ctx.pointee.bit_rate
+        if bps <= 0, let size = avioProvider?.resolvedByteSize, size > 0 {
+            let durUs = ctx.pointee.duration
+            if durUs > 0 {
+                let seconds = Double(durUs) / Double(AV_TIME_BASE)
+                if seconds > 1 { bps = Int64((Double(size) * 8 / seconds).rounded()) }
+            }
+        }
+        guard bps > 0 else { return }
+        avioProvider?.applyMediaBitrate(bitsPerSecond: bps)
     }
 
     /// Run a bounded `avformat_find_stream_info` on an already-open context (#87). Used by the subtitle
