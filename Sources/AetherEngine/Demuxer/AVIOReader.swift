@@ -1367,7 +1367,13 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// storage. Caller holds `winCond`.
     private func trimWindowLocked() {
         let behind = Int(position - winStart)
-        let dropThreshold = winLookbackActive + Self.winTrimBatch
+        // Each trim `subdata` copies the whole forward remainder and transiently holds old+new
+        // (#220's realloc-peak rule). At the stock 16 MB window a 4 MB batch is fine; at a
+        // policy-scaled 95 MB window it would be a ~90 MB alloc+copy every 4 MB consumed. Scale
+        // the batch with the applied high water (1/8 of it) so a large window pays ~8 large
+        // copies per window-full instead of ~24, without growing the retained lookback.
+        let trimBatch = max(Self.winTrimBatch, winHighWaterActive / 8)
+        let dropThreshold = winLookbackActive + trimBatch
         if behind > dropThreshold {
             let drop = behind - winLookbackActive
             window = window.subdata(in: drop..<window.count)
