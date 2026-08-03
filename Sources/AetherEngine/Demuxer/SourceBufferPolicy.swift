@@ -76,7 +76,35 @@ public struct AetherSourceBufferPolicy: Sendable, Equatable {
 
     /// Longest the data task may stay suspended before it is resumed anyway, seconds.
     /// `0` disables keep-warm (pure hysteresis, the stock shape at the new thresholds).
+    ///
+    /// INDEPENDENT of `enabled`. The 2026-08-03 field capture lost a connection that was parked
+    /// under the STOCK watermarks, so gating this behind the time-based sizing would leave the
+    /// shipped default configuration unprotected. It costs no extra memory.
     public var keepWarmSeconds: Double
+
+    /// Replace a persistent connection the moment its loss is reported, at the window frontier,
+    /// instead of waiting for the forward buffer to drain to zero.
+    ///
+    /// MEASURED (Apple TV, 2026-08-03): a parked connection was reported dead at `17:34:22.458Z`
+    /// and the reader did not open a replacement until `17:34:46.874Z` — 24.416 s later, once
+    /// `pumpAheadMB` hit 0 — whereupon the replacement's first byte arrived in 28 ms. The read
+    /// loop only consults `connEnded` after the window has drained at the cursor, so a loss that
+    /// happens while comfortably buffered is known and deliberately ignored until starvation.
+    ///
+    /// ALSO INDEPENDENT of `enabled`, and DEFAULT ON: unlike the watermark sizing this is not a
+    /// tuning experiment with a memory cost, it is a defect fix for a path that currently
+    /// guarantees a multi-second freeze. It issues exactly the request the drain path would have
+    /// issued (`bytes=<frontier>-`), only without first burning the buffer. Its own kill switch.
+    public var replaceOnConnectionLoss: Bool
+
+    /// Consecutive replacements that die before delivering a byte, after which proactive
+    /// replacement stops for the session and recovery returns to the drain path — which owns
+    /// backoff, Retry-After and the give-up budget. Real read progress re-arms it.
+    public var proactiveDeadStreakLimit: Int
+
+    /// Floor on the interval between proactive replacements, so a flapping source cannot become
+    /// a reconnect storm.
+    public var proactiveMinIntervalMs: Int
 
     /// Allocation granularity of the block-ring window.
     public var blockSizeBytes: Int
@@ -107,6 +135,9 @@ public struct AetherSourceBufferPolicy: Sendable, Equatable {
         maxWindowBytes: Int = 128 * 1024 * 1024,
         hardCapMultiplier: Double = 1.5,
         keepWarmSeconds: Double = 4,
+        replaceOnConnectionLoss: Bool = true,
+        proactiveDeadStreakLimit: Int = 2,
+        proactiveMinIntervalMs: Int = 250,
         blockSizeBytes: Int = 1024 * 1024,
         useBlockRing: Bool = true,
         lookbackBytes: Int = 2 * 1024 * 1024,
@@ -120,6 +151,9 @@ public struct AetherSourceBufferPolicy: Sendable, Equatable {
         self.maxWindowBytes = maxWindowBytes
         self.hardCapMultiplier = hardCapMultiplier
         self.keepWarmSeconds = keepWarmSeconds
+        self.replaceOnConnectionLoss = replaceOnConnectionLoss
+        self.proactiveDeadStreakLimit = proactiveDeadStreakLimit
+        self.proactiveMinIntervalMs = proactiveMinIntervalMs
         self.blockSizeBytes = blockSizeBytes
         self.useBlockRing = useBlockRing
         self.lookbackBytes = lookbackBytes
@@ -128,11 +162,88 @@ public struct AetherSourceBufferPolicy: Sendable, Equatable {
         self.breakerWindowSeconds = breakerWindowSeconds
     }
 
-    /// Shipped default: stock behaviour, byte watermarks, contiguous window.
+    /// Shipped default: stock BYTE WATERMARKS and the stock contiguous window, but with the two
+    /// defect fixes that carry no memory cost already active — keep-warm (so the transfer never
+    /// sits parked long enough to be dropped) and proactive replacement (so a dropped transfer is
+    /// replaced at once instead of after the buffer starves). `enabled` governs only the
+    /// time-based SIZING, which does have a memory cost and stays opt-in.
     public static let stock = AetherSourceBufferPolicy(enabled: false)
+
+    /// Literally the pre-change binary: byte watermarks AND no keep-warm AND no proactive
+    /// replacement. This is the true off switch for everything in this file.
+    public static let preChange = AetherSourceBufferPolicy(
+        enabled: false,
+        keepWarmSeconds: 0,
+        replaceOnConnectionLoss: false,
+        useBlockRing: false
+    )
 
     /// The recommended time-aware policy. Not the default; the host opts in.
     public static let timeAware = AetherSourceBufferPolicy(enabled: true)
+}
+
+/// Whether a just-ended persistent connection should be replaced immediately.
+public enum AetherProactiveReplaceDecision: Equatable, Sendable {
+    case replace
+    /// Recovery is handed back to the read loop's drain path, which owns backoff, Retry-After,
+    /// the unproductive-reconnect streak and the give-up budget. The string is logged verbatim.
+    case skip(String)
+}
+
+/// Everything the decision depends on, so it can be exercised without a socket.
+public struct AetherProactiveReplaceInputs: Sendable {
+    public var isClosed: Bool
+    public var alreadyInFlight: Bool
+    /// WE ended it at the #220 hard cap; re-requesting now would refill straight back over it.
+    public var endedByBackpressure: Bool
+    public var connStatus: Int
+    public var isLive: Bool
+    /// <= 0 when unknown.
+    public var fileSize: Int64
+    public var frontier: Int64
+    public var deadStreak: Int
+    /// Milliseconds since the previous proactive replacement; nil if there has not been one.
+    public var msSinceLastReplace: Double?
+
+    public init(isClosed: Bool = false, alreadyInFlight: Bool = false,
+                endedByBackpressure: Bool = false, connStatus: Int = 206,
+                isLive: Bool = false, fileSize: Int64 = 0, frontier: Int64 = 0,
+                deadStreak: Int = 0, msSinceLastReplace: Double? = nil) {
+        self.isClosed = isClosed
+        self.alreadyInFlight = alreadyInFlight
+        self.endedByBackpressure = endedByBackpressure
+        self.connStatus = connStatus
+        self.isLive = isLive
+        self.fileSize = fileSize
+        self.frontier = frontier
+        self.deadStreak = deadStreak
+        self.msSinceLastReplace = msSinceLastReplace
+    }
+}
+
+public extension AetherSourceBufferPolicy {
+    /// Pure: policy + connection state -> replace now, or defer to the drain path.
+    ///
+    /// The proactive path deliberately implements no backoff or give-up logic of its own. It
+    /// exists only for the healthy-source case where the right answer is "ask again, now"; every
+    /// other case is skipped so the existing, well-tested drain path stays in charge.
+    func decideProactiveReplace(_ i: AetherProactiveReplaceInputs) -> AetherProactiveReplaceDecision {
+        guard replaceOnConnectionLoss else { return .skip("disabled") }
+        guard !i.isClosed else { return .skip("closing") }
+        guard !i.alreadyInFlight else { return .skip("already-in-flight") }
+        guard !i.endedByBackpressure else { return .skip("backpressure-cap") }
+        guard i.connStatus != 429, i.connStatus != 503 else {
+            return .skip("rate-limited-\(i.connStatus)")
+        }
+        if !i.isLive, i.fileSize > 0, i.frontier >= i.fileSize { return .skip("eof") }
+        guard i.deadStreak < proactiveDeadStreakLimit else {
+            return .skip("dead-streak-\(i.deadStreak)")
+        }
+        if let since = i.msSinceLastReplace, since < Double(proactiveMinIntervalMs) {
+            return .skip("min-interval-\(Int(since))ms")
+        }
+        return .replace
+    }
 }
 
 /// The stock byte watermarks, kept in one place so `enabled == false` is provably identical to
@@ -306,6 +417,12 @@ public enum AetherSourceBuffer {
     nonisolated(unsafe) private static var _suspends = 0
     nonisolated(unsafe) private static var _keepWarmResumes = 0
     nonisolated(unsafe) private static var _underruns = 0
+    nonisolated(unsafe) private static var _proactiveReplaces = 0
+    nonisolated(unsafe) private static var _proactiveRecovered = 0
+    nonisolated(unsafe) private static var _proactiveFailures = 0
+    nonisolated(unsafe) private static var _proactiveSuppressions = 0
+    nonisolated(unsafe) private static var _proactiveLastRecoveryMs = 0
+    nonisolated(unsafe) private static var _proactivePreservedBytes: Int64 = 0
 
     /// Zero the counters for a new playback source. Called when the primary reader opens.
     public static func beginSession() {
@@ -313,32 +430,75 @@ public enum AetherSourceBuffer {
         _suspends = 0
         _keepWarmResumes = 0
         _underruns = 0
+        _proactiveReplaces = 0
+        _proactiveRecovered = 0
+        _proactiveFailures = 0
+        _proactiveSuppressions = 0
+        _proactiveLastRecoveryMs = 0
+        _proactivePreservedBytes = 0
         lock.unlock()
     }
 
     static func noteSuspend() { lock.lock(); _suspends += 1; lock.unlock() }
     static func noteKeepWarmResume() { lock.lock(); _keepWarmResumes += 1; lock.unlock() }
     static func noteUnderrun() { lock.lock(); _underruns += 1; lock.unlock() }
+    static func noteProactiveReplace() { lock.lock(); _proactiveReplaces += 1; lock.unlock() }
+    static func noteProactiveFailure() { lock.lock(); _proactiveFailures += 1; lock.unlock() }
+    static func noteProactiveSuppressed() { lock.lock(); _proactiveSuppressions += 1; lock.unlock() }
+
+    static func noteProactiveRecovered(ms: Double, preservedBytes: Int64) {
+        lock.lock()
+        _proactiveRecovered += 1
+        _proactiveLastRecoveryMs = Int(ms.rounded())
+        _proactivePreservedBytes = preservedBytes
+        lock.unlock()
+    }
 
     /// `suspends` = transfer parks (each one is a restart opportunity), `keepWarmResumes` = early
     /// wakes that avoided a long cold park, `underruns` = times the forward buffer hit empty at
     /// the read cursor, i.e. the events that become visible freezes.
-    public static var telemetry: (suspends: Int, keepWarmResumes: Int, underruns: Int) {
+    ///
+    /// The proactive fields answer the 2026-08-03 defect directly: `proactiveReplaces` counts
+    /// connection losses replaced immediately, `proactiveRecovered`/`lastRecoveryMs` how fast the
+    /// replacement produced its first byte (28 ms and 22 ms in that capture, against a 24.416 s
+    /// deferred recovery), `preservedBytes` proves the buffer survived the swap, and
+    /// `proactiveFailures`/`proactiveSuppressions` expose a genuinely failing source rather than
+    /// hiding it behind a retry loop.
+    public static var telemetry: (
+        suspends: Int, keepWarmResumes: Int, underruns: Int,
+        proactiveReplaces: Int, proactiveRecovered: Int, proactiveFailures: Int,
+        proactiveSuppressions: Int, lastRecoveryMs: Int, preservedBytes: Int64
+    ) {
         lock.lock(); defer { lock.unlock() }
-        return (_suspends, _keepWarmResumes, _underruns)
+        return (_suspends, _keepWarmResumes, _underruns,
+                _proactiveReplaces, _proactiveRecovered, _proactiveFailures,
+                _proactiveSuppressions, _proactiveLastRecoveryMs, _proactivePreservedBytes)
     }
 
-    /// Compact memprobe fragment. Empty while the policy is off so the stock log is unchanged.
+    /// Compact memprobe fragment.
+    ///
+    /// The sizing block is emitted only when the time-based watermarks are on, so a stock-sizing
+    /// log keeps its old shape. The recovery block is emitted whenever keep-warm or proactive
+    /// replacement is armed, because those run in the DEFAULT configuration and their counters are
+    /// the on-device proof that the freeze defect is closed.
     public static func probeFragment() -> String {
         let p = policy
-        guard p.enabled else { return "" }
         let a = lastApplied
         let t = telemetry
-        return "bufLowMB=\(a.lowWaterBytes / 1024 / 1024) "
-            + "bufHighMB=\(a.highWaterBytes / 1024 / 1024) "
-            + String(format: "bufLowS=%.1f bufHighS=%.1f ", a.lowWaterSeconds, a.highWaterSeconds)
-            + "bufReason=\(a.reason) "
-            + "bufSusp=\(t.suspends) bufWarm=\(t.keepWarmResumes) bufUnder=\(t.underruns) "
+        var out = ""
+        if p.enabled {
+            out += "bufLowMB=\(a.lowWaterBytes / 1024 / 1024) "
+                + "bufHighMB=\(a.highWaterBytes / 1024 / 1024) "
+                + String(format: "bufLowS=%.1f bufHighS=%.1f ", a.lowWaterSeconds, a.highWaterSeconds)
+                + "bufReason=\(a.reason) "
+        }
+        if p.enabled || p.keepWarmSeconds > 0 || p.replaceOnConnectionLoss {
+            out += "bufSusp=\(t.suspends) bufWarm=\(t.keepWarmResumes) bufUnder=\(t.underruns) "
+                + "bufRepl=\(t.proactiveReplaces) bufReplOK=\(t.proactiveRecovered) "
+                + "bufReplFail=\(t.proactiveFailures) bufReplOff=\(t.proactiveSuppressions) "
+                + "bufReplMs=\(t.lastRecoveryMs) bufReplKeptKB=\(t.preservedBytes / 1024) "
+        }
+        return out
     }
 
     /// One-line applied-state summary for the host bridge / memprobe.
@@ -346,7 +506,7 @@ public enum AetherSourceBuffer {
         let p = policy
         let a = lastApplied
         let kbps = a.bytesPerSecond > 0 ? Int((a.bytesPerSecond * 8 / 1000).rounded()) : 0
-        return "enabled=\(p.enabled) reason=\(a.reason) "
+        return "enabled=\(p.enabled) replaceOnLoss=\(p.replaceOnConnectionLoss) reason=\(a.reason) "
             + "lowMB=\(a.lowWaterBytes / 1024 / 1024) highMB=\(a.highWaterBytes / 1024 / 1024) "
             + "hardCapMB=\(a.hardCapBytes / 1024 / 1024) "
             + String(format: "lowS=%.1f highS=%.1f ", a.lowWaterSeconds, a.highWaterSeconds)

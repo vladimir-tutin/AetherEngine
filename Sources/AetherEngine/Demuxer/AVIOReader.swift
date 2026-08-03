@@ -304,13 +304,60 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     private var wasStarvedLastWait = false
     /// Bumped on every suspend so a stale keep-warm timer cannot resume a newer connection.
     private var keepWarmToken = 0
+
+    // MARK: - Proactive replacement on connection loss
+    //
+    // MEASURED DEFECT (Apple TV, 2026-08-03 live session, PRE-FIX binary):
+    //   17:34:12.156Z  the reader parks the transfer for backpressure (pumpSusp=1, ~10 MB ahead)
+    //   17:34:22.458Z  CFNetwork reports THAT PARKED GENERATION DEAD ("network connection lost")
+    //   ...            the reader keeps serving the resident window and does nothing
+    //   17:34:46.874Z  only once pumpAheadMB hit 0 does it open gen 6 — 24.416 s later
+    //                  the replacement's FIRST BYTE arrived in 28 ms
+    // Generation 6 repeated it (parked 17:36:42.857Z, lost 17:36:44.476Z, replacement 22 ms).
+    //
+    // The read loop only inspects `connEnded` on the path where `available <= 0`, i.e. after the
+    // window has drained at the cursor. So a connection that dies while the reader is comfortably
+    // buffered is KNOWN to be dead and deliberately ignored until starvation. The origin is
+    // instant when finally asked; the whole freeze is manufactured here.
+    //
+    // The fix replaces the connection the moment the loss is reported, at the window FRONTIER, so
+    // no resident byte is discarded and playback position is untouched. It does exactly what the
+    // drain path would have done (`timedReconnect(seek: false, at: frontier)`) — only without
+    // first burning the entire buffer.
+
+    /// The byte offset the CURRENT generation requested. Not `winStart` for a continuation.
+    private var connRequestedOffset: Int64 = 0
+    /// True while the current generation is a frontier continuation (window preserved).
+    private var connIsContinuation = false
+    /// Guards against two replacements racing for the same death.
+    private var proactiveReplaceInFlight = false
+    /// Consecutive proactive replacements that died before delivering a byte. Past the policy
+    /// limit the reader stops replacing proactively and lets the drain path own recovery, which
+    /// is where the backoff, Retry-After and give-up accounting live.
+    private var proactiveDeadStreak = 0
+    /// Wall clock of the last proactive replacement; enforces the minimum interval.
+    private var lastProactiveReplaceAt: Date?
+    /// Session telemetry.
+    private var proactiveReplaceCount = 0
+    private var proactivePreservedBytes: Int64 = 0
+    private var proactiveSuppressed = false
     /// Only the main playback reader reports its applied policy to the host; side readers
     /// (subtitle, thumbnail) share the process-global policy but must not overwrite the report.
     var isPrimaryPlaybackReader = false
 
+    /// Per-reader policy override. Production leaves this nil and reads the process global, which
+    /// is what makes a Settings change reach a running session. Tests set it so a case can pin the
+    /// policy it needs without mutating shared state that a parallel test is also reading.
+    var policyOverrideForTesting: AetherSourceBufferPolicy?
+
+    /// The policy this reader obeys.
+    private func currentPolicy() -> AetherSourceBufferPolicy {
+        policyOverrideForTesting ?? AetherSourceBuffer.policy
+    }
+
     /// Recompute and install the watermarks. Caller holds `winCond`.
     private func refreshWatermarksLocked(reason: String) {
-        let policy = AetherSourceBuffer.policy
+        let policy = currentPolicy()
         let next = policy.resolve(bytesPerSecond: mediaBytesPerSecond, shrinkFactor: breakerShrink)
         guard next != applied else { return }
         applied = next
@@ -1137,6 +1184,8 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 trimWindowLocked()
                 unproductiveReconnects = 0      // real progress
                 rateLimitStreak = 0             // real progress clears the 429 give-up streak (#71)
+                proactiveDeadStreak = 0         // real progress re-arms proactive replacement
+                proactiveSuppressed = false
                 emitNetworkPhase(.flowing)      // recovered: source delivering again (#85)
                 wasStarvedLastWait = false
                 // #174: resume the suspended transfer once the drain crosses lowWater.
@@ -1503,24 +1552,40 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
 
     /// Open a fresh Range: bytes=<offset>- connection. Bumps generation so
     /// late callbacks from the old connection are ignored.
-    private func startPersistentConnection(at offset: Int64, boundedTo: Int64? = nil) {
+    ///
+    /// `preserveWindow` is the CONTINUATION mode used by `replaceConnectionAtFrontier`: the new
+    /// request starts exactly where the resident window ends, so every buffered byte stays valid
+    /// and playback never rewinds. `offset` is ignored in that mode and recomputed under the lock,
+    /// because the demux thread can trim and consume between the caller's read and this one.
+    private func startPersistentConnection(at offset: Int64, boundedTo: Int64? = nil,
+                                           preserveWindow: Bool = false) {
         winCond.lock()
         connGeneration &+= 1
         let generation = connGeneration
-        winStart = offset
+        // Frontier = the first byte we do NOT have. `trimWindowLocked` only drops from the front
+        // and advances `winStart` by the same amount, so `winStart + window.count` is invariant
+        // under consumption — it is safe to compute here and to have kept the window.
+        let requestOffset = preserveWindow ? (winStart + Int64(window.count)) : offset
+        if !preserveWindow {
+            winStart = requestOffset
+        }
         // Re-read the host policy on every connection so a runtime change (Settings/Metro) takes
         // effect without another native build, and install matching storage. The stock policy
         // keeps the contiguous `Data` window so `enabled == false` is the pre-change binary.
-        refreshWatermarksLocked(reason: "connect")
-        let policy = AetherSourceBuffer.policy
-        let wantRing = policy.enabled && policy.useBlockRing
-        let haveRing = window is BlockRingSourceWindow
-        if wantRing != haveRing {
-            window = wantRing
-                ? BlockRingSourceWindow(blockSize: policy.blockSizeBytes)
-                : ContiguousSourceWindow()
-        } else {
-            window.removeAll()
+        refreshWatermarksLocked(reason: preserveWindow ? "replace" : "connect")
+        let policy = currentPolicy()
+        if !preserveWindow {
+            // Storage may only be swapped when the window is being discarded anyway; a
+            // continuation must keep the bytes it already holds.
+            let wantRing = policy.enabled && policy.useBlockRing
+            let haveRing = window is BlockRingSourceWindow
+            if wantRing != haveRing {
+                window = wantRing
+                    ? BlockRingSourceWindow(blockSize: policy.blockSizeBytes)
+                    : ContiguousSourceWindow()
+            } else {
+                window.removeAll()
+            }
         }
         keepWarmToken &+= 1     // no keep-warm timer may outlive the old connection
         connEnded = false
@@ -1530,6 +1595,8 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         connRetryAfter = 0
         connStartedAt = DispatchTime.now()   // #93: time-to-first-data per generation
         connFirstDataSeen = false
+        connRequestedOffset = requestOffset
+        connIsContinuation = preserveWindow
         let oldSession = activeSession
         let oldTask = activeTask
         let oldSuspended = persistentTaskSuspended
@@ -1550,9 +1617,10 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         // the open-ended `bytes=0-` stream serves it as a fast finite GET. The 206 Content-Range still
         // carries the total size, so fileSize resolution (issue #70) is unaffected.
         if let boundedTo {
-            request.setValue("bytes=\(offset)-\(offset + boundedTo - 1)", forHTTPHeaderField: "Range")
+            request.setValue("bytes=\(requestOffset)-\(requestOffset + boundedTo - 1)",
+                             forHTTPHeaderField: "Range")
         } else {
-            request.setValue("bytes=\(offset)-", forHTTPHeaderField: "Range")
+            request.setValue("bytes=\(requestOffset)-", forHTTPHeaderField: "Range")
         }
         request.timeoutInterval = 0  // long-lived; stalls handled by the reader
         applyExtraHeaders(&request)
@@ -1582,7 +1650,8 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
 
         task.resume()
         #if DEBUG
-        EngineLog.emit("[AVIOReader] Persistent conn start gen=\(generation) offset=\(offset)", category: .demux)
+        EngineLog.emit("[AVIOReader] Persistent conn start gen=\(generation) offset=\(requestOffset)"
+                       + (preserveWindow ? " (frontier continuation)" : ""), category: .demux)
         #endif
     }
 
@@ -1602,9 +1671,20 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             return
         }
         var firstDataMs: Double? = nil
+        var continuationRecoveredMs: Double? = nil
+        var continuationPreservedBytes: Int64 = 0
         if !connFirstDataSeen {
             connFirstDataSeen = true
             firstDataMs = Double(DispatchTime.now().uptimeNanoseconds - connStartedAt.uptimeNanoseconds) / 1_000_000
+            if connIsContinuation {
+                // The replacement is alive: the source was healthy all along, so clear the failure
+                // streak and let the next loss be replaced immediately too.
+                continuationRecoveredMs = firstDataMs
+                continuationPreservedBytes = Int64(window.count)
+                proactiveReplaceInFlight = false
+                proactiveDeadStreak = 0
+                proactiveSuppressed = false
+            }
         }
         let count = data.count
         // #220: delivery that lands with the suspend flag already set. Counted before the
@@ -1632,8 +1712,15 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             // both decay across a multi-second park, so the resume dribbles instead of bursting.
             // Waking early tops the window back to the high water in small increments and keeps
             // the path warm, at the cost of more (much cheaper) resumes. 0 disables it.
-            let policy = AetherSourceBuffer.policy
-            if policy.enabled, policy.keepWarmSeconds > 0 {
+            //
+            // NOT gated on `policy.enabled`. The 2026-08-03 capture killed the connection while it
+            // was parked under the STOCK 8/16 MB watermarks, so gating keep-warm behind the
+            // time-based sizing would have left the shipped default configuration — the one that
+            // actually froze — completely unprotected. Keep-warm costs no extra memory; it only
+            // changes how often an already-bounded window is topped up, so it is safe to run with
+            // stock watermarks and is controlled by its own `keepWarmSeconds` (0 = off).
+            let policy = currentPolicy()
+            if policy.keepWarmSeconds > 0 {
                 keepWarmToken &+= 1
                 keepWarmStamp = keepWarmToken
                 keepWarmAfter = policy.keepWarmSeconds
@@ -1658,7 +1745,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             // that is what trips it — repeated hard-cap ends halve the applied watermarks for the
             // rest of the session (never below stock) without touching the persisted policy.
             let now = Date()
-            let policy = AetherSourceBuffer.policy
+            let policy = currentPolicy()
             hardCapEventTimes.append(now)
             hardCapEventTimes.removeAll { now.timeIntervalSince($0) > policy.breakerWindowSeconds }
             if policy.enabled, hardCapEventTimes.count >= policy.breakerHardCapEvents,
@@ -1693,6 +1780,20 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             toCancel.resume()   // balance the suspend so the cancel is not charged to a parked task
             toCancel.cancel()
             cancelSession?.invalidateAndCancel()
+        }
+        if let continuationRecoveredMs {
+            // Release-visible on purpose: this line is the direct answer to the 24.416 s deferred
+            // recovery. `recoveredMs` is how long the replacement took to produce its first byte
+            // (28 ms and 22 ms in the field capture), and `preservedKB` proves the buffer was
+            // carried across the replacement rather than refetched.
+            EngineLog.emit(
+                "[AVIOReader] proactive replace gen=\(generation) RECOVERED in "
+                + "\(Int(continuationRecoveredMs))ms preservedKB=\(continuationPreservedBytes / 1024)",
+                category: .demux)
+            if isPrimaryPlaybackReader {
+                AetherSourceBuffer.noteProactiveRecovered(ms: continuationRecoveredMs,
+                                                          preservedBytes: continuationPreservedBytes)
+            }
         }
         if let firstDataMs {
             // #93/#96 residual: a slow first-data gap is release-visible so a device trace can pair it
@@ -1736,7 +1837,12 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         // VOD: 200 at offset > 0 means server ignored Range and sent the full body
         // from byte 0 (silent corruption). Reject it. Live is exempt: transcode
         // reconnect legitimately answers 200 with "from now".
-        let requestedOffset = (generation == connGeneration) ? winStart : 0
+        // The byte offset THIS generation actually asked for. It is `winStart` for a normal
+        // (re)anchoring connection, but for a `preserveWindow` continuation it is the frontier,
+        // which is strictly greater. Deriving it from `winStart` would mis-scale the
+        // Content-Range total and, at winStart == 0, would let a Range-ignoring `200` full-file
+        // body be accepted and appended at the frontier — silent stream corruption.
+        let requestedOffset = (generation == connGeneration) ? connRequestedOffset : 0
         // Issue #70: the first from-0 data connection doubles as the size probe, so the
         // playback open skips probeFileSize() entirely. Derive the total from this
         // response (206 Content-Range, or Content-Length on a from-0 2xx). Write-once
@@ -1781,17 +1887,105 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     fileprivate func persistentConnectionEnded(error: Error?, generation: Int) {
         winCond.lock()
         let isCurrentGen = (generation == connGeneration)
+        var continuationDied = false
         if isCurrentGen {
             connEnded = true
+            // Whatever attempt was outstanding has now concluded.
+            proactiveReplaceInFlight = false
+            // A continuation that ended without ever delivering a byte is a FAILED replacement.
+            // Counting it is what eventually hands recovery to the drain path's backoff instead
+            // of retrying a dead source forever.
+            if connIsContinuation && !connFirstDataSeen {
+                proactiveDeadStreak += 1
+                continuationDied = true
+            }
         }
+        let deadStreakNow = proactiveDeadStreak
         let windowAhead = isCurrentGen ? (window.count - max(0, Int(position - winStart))) : 0
+        let frontier = winStart + Int64(window.count)
+        let decision = isCurrentGen ? proactiveReplaceDecisionLocked(frontier: frontier) : .notCurrent
+        if case .replace = decision {
+            proactiveReplaceInFlight = true
+            lastProactiveReplaceAt = Date()
+            proactiveReplaceCount += 1
+            proactivePreservedBytes = Int64(window.count)
+        }
         winCond.broadcast()
         winCond.unlock()
+
         if let error {
             EngineLog.emit("[AVIOReader] Persistent conn gen=\(generation) ended with error: \(error.localizedDescription)", category: .demux)
         }
-        if isCurrentGen && isLive {
-            EngineLog.emit("[AVIOReader] Live source: connection ended gen=\(generation) buffered=\(windowAhead / 1024)KB; reconnect will fire when buffer drains", category: .demux)
+        if continuationDied {
+            EngineLog.emit(
+                "[AVIOReader] proactive replacement gen=\(generation) died before first byte "
+                + "(deadStreak=\(deadStreakNow))",
+                category: .demux)
+            if isPrimaryPlaybackReader { AetherSourceBuffer.noteProactiveFailure() }
+        }
+
+        switch decision {
+        case .replace:
+            // The window is KEPT: the continuation requests `bytes=<frontier>-`, so every resident
+            // byte stays valid and the demux cursor never moves. This is the same request the
+            // drain path would issue, issued now instead of after the buffer is gone.
+            EngineLog.emit(
+                "[AVIOReader] proactive replace gen=\(generation) frontier=\(frontier) "
+                + "preservedKB=\(proactivePreservedBytes / 1024) aheadKB=\(windowAhead / 1024) "
+                + "reason=conn-\(error == nil ? "closed" : "lost")",
+                category: .demux)
+            if isPrimaryPlaybackReader { AetherSourceBuffer.noteProactiveReplace() }
+            // Off the delegate queue: `startPersistentConnection` calls `invalidateAndCancel()` on
+            // the session that owns THIS callback, which must not be done from its own queue.
+            keepWarmQueue.async { [weak self] in
+                guard let self, !self.isClosed else { return }
+                self.startPersistentConnection(at: 0, preserveWindow: true)
+            }
+        case .skip(let why):
+            // Never silent: a deferred recovery is exactly the defect this path exists to kill, so
+            // the log always states why the reader chose to wait for the drain path instead.
+            EngineLog.emit(
+                "[AVIOReader] conn ended gen=\(generation) buffered=\(windowAhead / 1024)KB "
+                + "proactive-replace SKIPPED (\(why)); recovery deferred to the drain path",
+                category: .demux)
+        case .notCurrent:
+            break
+        }
+    }
+
+    private enum ProactiveReplaceDecision {
+        case replace
+        case skip(String)
+        case notCurrent
+    }
+
+    /// Whether a connection that just ended should be replaced immediately. Caller holds `winCond`.
+    /// The rules themselves live in `AetherSourceBufferPolicy.decideProactiveReplace`, which is
+    /// pure and unit-tested; this only gathers the state and records the suppression transition.
+    private func proactiveReplaceDecisionLocked(frontier: Int64) -> ProactiveReplaceDecision {
+        let policy = currentPolicy()
+        let inputs = AetherProactiveReplaceInputs(
+            isClosed: isClosed,
+            alreadyInFlight: proactiveReplaceInFlight,
+            endedByBackpressure: connEndedByBackpressure,
+            connStatus: connStatus,
+            isLive: isLive,
+            fileSize: fileSize,
+            frontier: frontier,
+            deadStreak: proactiveDeadStreak,
+            msSinceLastReplace: lastProactiveReplaceAt.map { Date().timeIntervalSince($0) * 1000 }
+        )
+        switch policy.decideProactiveReplace(inputs) {
+        case .replace:
+            return .replace
+        case .skip(let why):
+            // A source that keeps killing its replacements is genuinely failing; surface that
+            // transition once rather than letting it hide inside a repeated skip reason.
+            if why.hasPrefix("dead-streak"), !proactiveSuppressed {
+                proactiveSuppressed = true
+                if isPrimaryPlaybackReader { AetherSourceBuffer.noteProactiveSuppressed() }
+            }
+            return .skip(why)
         }
     }
 
