@@ -335,8 +335,14 @@ struct ProactiveConnectionReplacementTests {
         #expect(starts[1] <= written,
                 "replacement asked for \(starts[1]), past the \(written) bytes ever sent")
         #expect(starts[1] >= written - 256 * 1024,
-                "replacement asked for \(starts[1]) but \(written) bytes had been sent — "
-                + "more than one chunk of the window was discarded")
+                // One interpolated literal, NOT a `+` concatenation: swift-testing takes a
+                // `Comment?`, which is ExpressibleByStringInterpolation but not constructible from
+                // a runtime String, so concatenating here fails to compile and takes the whole
+                // test target down with it.
+                """
+                replacement asked for \(starts[1]) but \(written) bytes had been sent — \
+                more than one chunk of the window was discarded
+                """)
     }
 
     /// End-to-end continuity: read straight through the drop and verify every byte, so a
