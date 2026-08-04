@@ -39,8 +39,8 @@ public struct AudioDSPDiagnostics: Sendable, Equatable {
     /// True replaces the program audio on the toned channels; false adds the tone on top.
     /// Replacing is the decisive test — silence anywhere else cannot be mistaken for the tone.
     public var toneReplacesProgram: Bool
-    /// Auto-stop after this many seconds of tone. 0 disables the timeout, which is deliberately
-    /// possible but not the default: an un-timed tone survives until someone turns it off.
+    /// Auto-stop after this many seconds of tone. A live tone always has a timeout; allowing zero
+    /// would let a forgotten diagnostic survive indefinitely and defeat the build's safety gate.
     public var toneTimeoutSeconds: Double
 
     /// When non-zero, ONLY these channels pass; everything else is silenced. Applied to program
@@ -87,7 +87,7 @@ public struct AudioDSPDiagnostics: Sendable, Equatable {
         copy.toneFrequencyHz = min(max(toneFrequencyHz.isFinite ? toneFrequencyHz : 440, 20), 20_000)
         copy.toneLevelDb = min(max(toneLevelDb.isFinite ? toneLevelDb : -18, -60), -6)
         copy.toneTimeoutSeconds = toneTimeoutSeconds.isFinite
-            ? min(max(toneTimeoutSeconds, 0), 600)
+            ? min(max(toneTimeoutSeconds, 1), 600)
             : 30
         return copy
     }
