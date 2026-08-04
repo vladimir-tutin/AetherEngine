@@ -994,32 +994,69 @@ extension AetherEngine {
         forceNativeLegibleDeselectedUntilHostSelects()
     }
 
-    /// Activate AVAudioSession for renderer paths (SoftwarePlaybackHost, audio hosts) that have no AVPlayerViewController. Native path deliberately skips this: AVKit activates per playback so tvOS can auto-negotiate the HDMI route (issue #24).
-    func activateRendererAudioSession(audioSourceStreamIndex: Int32? = nil) {
+    /// Pure policy for renderer-path HDMI negotiation. The route must be sized for the PCM that the
+    /// DSP EMITS, not merely the compressed source width. A stereo source upmixed to 5.1 therefore
+    /// requests six output channels; requesting the source's two channels makes CoreMedia fold the
+    /// correctly tagged six-channel buffer back into the front pair.
+    nonisolated static func rendererPreferredOutputChannels(
+        sourceChannels: Int?,
+        settings: AudioDSPSettings,
+        maximumOutputChannels: Int
+    ) -> Int {
+        let maximum = max(maximumOutputChannels, 1)
+        let source = max(sourceChannels ?? maximum, 1)
+        let emitted = Int(settings.outputChannels(forSource: Int32(source)))
+        return min(max(emitted, 1), maximum)
+    }
+
+    /// Apply renderer-path channel negotiation before activation and whenever live DSP changes the
+    /// emitted PCM width. Native AVPlayer deliberately skips this: AVKit owns its route negotiation.
+    func configureRendererAudioSession(sourceChannels: Int?, reason: String) {
         #if os(iOS) || os(tvOS)
         let session = AVAudioSession.sharedInstance()
-        do { try session.setActive(true) }
-        catch {
-            EngineLog.emit("[AetherEngine] activateRendererAudioSession error: \(error)", category: .engine)
+        let maxCh = session.maximumOutputNumberOfChannels
+        let settings = desiredAudioDSPSettings ?? audioDSPSettings
+        let emittedCh = sourceChannels.map {
+            Int(settings.outputChannels(forSource: Int32($0)))
         }
-        
-        // Resolve the active audio track's channel count from the already-published track list.
-        // so the HDMI / AirPlay link negotiates at the correct channel count.
-        // Accept an explicit stream index parameter because during a reload (track change)
-        // `activeAudioTrackIndex` is temporarily nil (cleared by stopInternal), so the
-        // published property cannot be relied on here.
+        let requestedCh = Self.rendererPreferredOutputChannels(
+            sourceChannels: sourceChannels,
+            settings: settings,
+            maximumOutputChannels: maxCh
+        )
+        var preferenceError = "none"
+        var activationError = "none"
+        do { try session.setPreferredOutputNumberOfChannels(requestedCh) }
+        catch { preferenceError = String(describing: error) }
+        do { try session.setActive(true) }
+        catch { activationError = String(describing: error) }
+        let ports = session.currentRoute.outputs.map { $0.portType.rawValue }.joined(separator: "+")
+        EngineLog.emit(
+            "[AudioRouteWidth] action=configure-renderer reason=\(reason) "
+            + "sourceCh=\(sourceChannels?.formatted() ?? "unknown") "
+            + "dspMode=\(settings.outputMode.rawValue) emittedCh=\(emittedCh?.formatted() ?? "unknown") "
+            + "requestedCh=\(requestedCh) maxCh=\(maxCh) "
+            + "preferredCh=\(session.preferredOutputNumberOfChannels) actualCh=\(session.outputNumberOfChannels) "
+            + "ports=\(ports.isEmpty ? "none" : ports) preferenceError=\(preferenceError) "
+            + "activationError=\(activationError) decision=negotiate-from-effective-pcm-width",
+            category: .engine
+        )
+        #endif
+    }
+
+    /// Activate AVAudioSession for renderer paths (SoftwarePlaybackHost, audio hosts) that have no
+    /// AVPlayerViewController. Accept an explicit stream index because during a track reload
+    /// `activeAudioTrackIndex` is temporarily nil.
+    func activateRendererAudioSession(audioSourceStreamIndex: Int32? = nil) {
         let lookupIndex = audioSourceStreamIndex.flatMap { Int(exactly: $0) } ?? activeAudioTrackIndex
-        let sourceChannels: Int? = if let index = lookupIndex, let track = audioTracks.first(where: { $0.id == index }), track.channels > 0 {
+        let sourceChannels: Int? = if let index = lookupIndex,
+                                      let track = audioTracks.first(where: { $0.id == index }),
+                                      track.channels > 0 {
             track.channels
         } else {
             nil
         }
-        
-        let maxCh = session.maximumOutputNumberOfChannels
-        let prefCh = min(sourceChannels ?? maxCh, maxCh)
-        try? session.setPreferredOutputNumberOfChannels(prefCh) 
-        EngineLog.emit("[AetherEngine] renderer audio session active: sourceCh=\(sourceChannels?.formatted() ?? "unknown") maxChannels=\(maxCh) preferred=\(session.preferredOutputNumberOfChannels) output=\(session.outputNumberOfChannels)", category: .engine)
-        #endif
+        configureRendererAudioSession(sourceChannels: sourceChannels, reason: "session-load")
     }
 
     func loadSoftware(

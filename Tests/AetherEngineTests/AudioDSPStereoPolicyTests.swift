@@ -24,6 +24,47 @@ final class AudioDSPStereoPolicyTests: XCTestCase {
             AudioDSPSettings(outputMode: .surround51, upmix: .defaults).outputChannels(forSource: 6), 6)
     }
 
+    func testRendererRouteNegotiatesEffectiveUpmixWidthNotStereoSourceWidth() {
+        XCTAssertEqual(
+            AetherEngine.rendererPreferredOutputChannels(
+                sourceChannels: 2,
+                settings: AudioDSPSettings(outputMode: .surround51, upmix: .defaults),
+                maximumOutputChannels: 8
+            ),
+            6
+        )
+    }
+
+    func testRendererRoutePreservesStockStereoWidthWhenUpmixIsOff() {
+        XCTAssertEqual(
+            AetherEngine.rendererPreferredOutputChannels(
+                sourceChannels: 2,
+                settings: AudioDSPSettings(outputMode: .surround51, upmix: .off),
+                maximumOutputChannels: 8
+            ),
+            2
+        )
+        XCTAssertEqual(
+            AetherEngine.rendererPreferredOutputChannels(
+                sourceChannels: 2,
+                settings: AudioDSPSettings(outputMode: .stereo, upmix: .defaults),
+                maximumOutputChannels: 8
+            ),
+            2
+        )
+    }
+
+    func testRendererRouteClampsEffectiveWidthToHardwareMaximum() {
+        XCTAssertEqual(
+            AetherEngine.rendererPreferredOutputChannels(
+                sourceChannels: 2,
+                settings: AudioDSPSettings(outputMode: .surround51, upmix: .defaults),
+                maximumOutputChannels: 2
+            ),
+            2
+        )
+    }
+
     func testLayoutDecisionNeverLabelsStereoAsSurround() {
         let off = AudioDSPSettings(outputMode: .surround51, upmix: .off).layoutDecision(forSource: 2)
         XCTAssertEqual(off.effectiveChannels, 2)

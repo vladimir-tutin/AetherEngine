@@ -3684,7 +3684,24 @@ public final class AetherEngine: ObservableObject {
             return desiredAudioDSPSettings ?? .identity
         }
         set {
+            let sourceChannels = audioDSPSourceChannels
+            let previousSettings = audioDSPSettings
+            let previousWidth = sourceChannels > 0
+                ? previousSettings.outputChannels(forSource: sourceChannels)
+                : 0
+            let requestedWidth = sourceChannels > 0
+                ? newValue.outputChannels(forSource: sourceChannels)
+                : 0
             desiredAudioDSPSettings = newValue
+            // Route width is process-global and sits downstream of the PCM renderer. Negotiate the
+            // NEW width before the decoder starts emitting it; otherwise a 2ch source upmixed to 6ch
+            // is accepted by CoreMedia but folded into the already-negotiated stereo front pair.
+            if audioDSPIsEffective, sourceChannels > 0, previousWidth != requestedWidth {
+                configureRendererAudioSession(
+                    sourceChannels: Int(sourceChannels),
+                    reason: "live-dsp-width-\(previousWidth)-to-\(requestedWidth)"
+                )
+            }
             // Push unconditionally: a host without a decoder yet STASHES the value and replays it on
             // load, so a change made between sessions is not dropped.
             softwareHost?.audioDSPSettings = newValue
