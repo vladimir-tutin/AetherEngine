@@ -1598,7 +1598,82 @@ final class SoftwarePlaybackHost {
         var audioPacketsSeen = 0
         var audioBuffersProduced = false
 
+        // Video packets held while the video renderer is full but audio still needs data. See
+        // SWVideoBackpressurePolicy: parking on the video gate used to stop ALL reading, which
+        // starved AAC and produced a ~0.5 s on / ~0.5 s off audio cadence.
+        // The generation is captured per packet so a seek that lands while packets are held
+        // discards exactly the pre-seek ones, matching the inline path's own generation check.
+        var stashedVideo: [(packet: UnsafeMutablePointer<AVPacket>, generation: UInt64)] = []
+        var stashedBytes = 0
+        // Telemetry state: audio lead is the single number that proves the dropout is gone.
+        var lastFedAudioPTS = Double.nan
+        var lastLeadLogAt = DispatchTime(uptimeNanoseconds: 0)
+        var stashHighWater = 0
+        var starvationEvents = 0
+        var loggedFirstStash = false
+
+        func releaseStashedVideo(reason: String) {
+            guard !stashedVideo.isEmpty else { return }
+            for entry in stashedVideo {
+                av_packet_unref(entry.packet)
+                av_packet_free_safe(entry.packet)
+            }
+            EngineLog.emit(
+                "[SWVideoStash] action=release count=\(stashedVideo.count) "
+                + "bytes=\(stashedBytes) reason=\(reason)",
+                category: .swPlayback
+            )
+            stashedVideo.removeAll(keepingCapacity: true)
+            stashedBytes = 0
+        }
+
+        /// Feed held video packets while the renderer has room. Runs before each read so held
+        /// packets are always decoded ahead of newly read ones and playback order is preserved.
+        func drainStashedVideo() {
+            while !stashedVideo.isEmpty,
+                  renderer.isReadyForMoreMediaData,
+                  !stopRequested(),
+                  isPlaying(),
+                  !backgroundAudioOnly() {
+                let entry = stashedVideo.removeFirst()
+                stashedBytes -= Int(entry.packet.pointee.size)
+                if seekGeneration() == entry.generation {
+                    videoDecoder.decode(packet: entry.packet)
+                }
+                av_packet_unref(entry.packet)
+                av_packet_free_safe(entry.packet)
+            }
+            if stashedBytes < 0 { stashedBytes = 0 }
+        }
+
+        /// One periodic line proving audio is continuously ahead of the clock — the direct
+        /// counter-evidence to the dropout. `leadS` collapsing toward zero IS the defect.
+        func logAudioLead(force: Bool) {
+            guard let aOut = audioOutput else { return }
+            let now = DispatchTime.now()
+            let sinceLast = Double(now.uptimeNanoseconds - lastLeadLogAt.uptimeNanoseconds) / 1_000_000_000
+            guard force || sinceLast >= 2.0 else { return }
+            lastLeadLogAt = now
+            let clockSeconds = aOut.currentTimeSeconds
+            let lead = lastFedAudioPTS.isFinite ? lastFedAudioPTS - clockSeconds : Double.nan
+            EngineLog.emit(
+                "[SWAudioLead] leadS=\(lead.isFinite ? String(format: "%.2f", lead) : "nan") "
+                + "lastFedPts=\(lastFedAudioPTS.isFinite ? String(format: "%.2f", lastFedAudioPTS) : "nan") "
+                + "clockS=\(String(format: "%.2f", clockSeconds)) "
+                + "audioReady=\(aOut.isReadyForMoreMediaData ? 1 : 0) "
+                + "videoReady=\(renderer.isReadyForMoreMediaData ? 1 : 0) "
+                + "stashed=\(stashedVideo.count) stashHighWater=\(stashHighWater) "
+                + "stashKB=\(stashedBytes / 1024) starvations=\(starvationEvents) "
+                + "decision=\(lead.isFinite && lead <= 0.05 ? "STARVED" : "healthy")",
+                category: .swPlayback
+            )
+        }
+
         func demuxIteration() -> Bool {
+            // Held video first: the renderer may have opened up since the last read.
+            drainStashedVideo()
+            logAudioLead(force: false)
+
             if !isPlaying() {
                 condition.lock()
                 while !isPlaying() && !stopRequested() {
@@ -1621,9 +1696,21 @@ final class SoftwarePlaybackHost {
             }
 
             guard let packet else {
+                // End of stream: held video packets are real content, so they must be decoded
+                // before the flush rather than discarded — dropping them would truncate the tail.
+                // Bounded wait: the renderer drains in real time, and the stash is capped.
+                var drainGuard = 0
+                while !stashedVideo.isEmpty, !stopRequested(), isPlaying(), drainGuard < 4000 {
+                    drainStashedVideo()
+                    if stashedVideo.isEmpty { break }
+                    Thread.sleep(forTimeInterval: 0.005)
+                    drainGuard += 1
+                }
+                releaseStashedVideo(reason: "eof-residual")
                 videoDecoder.flush()
                 audioDecoder?.flush()
                 renderer.drainReorderBuffer()
+                logAudioLead(force: true)
                 onEnd()
                 return false
             }
@@ -1714,7 +1801,38 @@ final class SoftwarePlaybackHost {
                     av_packet_free_safe(packet)
                     return true
                 }
-                // Back-pressure via SampleBufferRenderer.isReadyForMoreMediaData (not the deprecated layer property). Park on condition while paused to avoid 200 Hz CPU spin.
+                // Back-pressure via SampleBufferRenderer.isReadyForMoreMediaData (not the deprecated layer property).
+                //
+                // AUDIO INDEPENDENCE (SWVideoBackpressurePolicy): a full video renderer is the
+                // NORMAL steady state, and parking here used to stop the single demux thread from
+                // reading ANY packet — starving AAC and chopping audio ~0.5 s on / ~0.5 s off.
+                // While the audio renderer still wants data we now hold the video packet and keep
+                // reading, so audio decode/enqueue proceeds independently of video pacing. Parking
+                // resumes only once audio is satisfied too, when it can no longer starve anything.
+                let stashDecision = SWVideoBackpressurePolicy.decide(
+                    videoRendererReady: renderer.isReadyForMoreMediaData,
+                    audioRendererReady: audioOutput?.isReadyForMoreMediaData ?? false,
+                    hasAudioStream: audioDecoder != nil && audioOutput != nil,
+                    stashedPackets: stashedVideo.count,
+                    stashedBytes: stashedBytes
+                )
+                if case .stashAndKeepReading(let reason) = stashDecision {
+                    stashedVideo.append((packet: packet, generation: genBeforeRead))
+                    stashedBytes += Int(packet.pointee.size)
+                    stashHighWater = max(stashHighWater, stashedVideo.count)
+                    if !loggedFirstStash {
+                        loggedFirstStash = true
+                        EngineLog.emit(
+                            "[SWVideoStash] action=first-stash reason=\(reason) "
+                            + "decision=keep-reading-for-audio "
+                            + "cap=\(SWVideoBackpressurePolicy.maxStashedPackets)",
+                            category: .swPlayback
+                        )
+                    }
+                    // Ownership moved to the stash — do NOT free it here.
+                    return true
+                }
+
                 // DEADLOCK GUARD (SWClockArmPolicy): this park is the one place where an unarmed
                 // clock becomes self-sustaining — the renderer cannot drain until the clock runs,
                 // and the clock cannot arm because THIS thread is the only reader of audio packets.
@@ -1722,7 +1840,32 @@ final class SoftwarePlaybackHost {
                 // waiting for an audio buffer that no longer has a path to arrive.
                 let backpressureStart = DispatchTime.now()
                 var armedFromBackpressure = false
+                var loggedStarvationThisPark = false
                 while !renderer.isReadyForMoreMediaData && !stopRequested() && !backgroundAudioOnly() {
+                    // Re-check every tick: audio drains WHILE we are parked, so a park that was
+                    // safe when it began stops being safe the moment audio wants data again.
+                    if case .stashAndKeepReading = SWVideoBackpressurePolicy.decide(
+                        videoRendererReady: renderer.isReadyForMoreMediaData,
+                        audioRendererReady: audioOutput?.isReadyForMoreMediaData ?? false,
+                        hasAudioStream: audioDecoder != nil && audioOutput != nil,
+                        stashedPackets: stashedVideo.count,
+                        stashedBytes: stashedBytes
+                    ) {
+                        if !loggedStarvationThisPark {
+                            loggedStarvationThisPark = true
+                            starvationEvents += 1
+                            EngineLog.emit(
+                                "[SWVideoStash] action=abandon-park reason=audio-drained-while-parked "
+                                + "parkedMs=\(Int(Double(DispatchTime.now().uptimeNanoseconds - backpressureStart.uptimeNanoseconds) / 1_000_000)) "
+                                + "starvations=\(starvationEvents) decision=resume-reading-for-audio",
+                                category: .swPlayback
+                            )
+                        }
+                        stashedVideo.append((packet: packet, generation: genBeforeRead))
+                        stashedBytes += Int(packet.pointee.size)
+                        stashHighWater = max(stashHighWater, stashedVideo.count)
+                        return true
+                    }
                     autoreleasepool {
                         if !isPlaying() {
                             condition.lock()
@@ -1833,6 +1976,12 @@ final class SoftwarePlaybackHost {
                     tap: audioTapSink()
                 )
                 if !buffers.isEmpty { audioBuffersProduced = true }
+                // Track the newest enqueued audio PTS so `[SWAudioLead]` can report how far audio is
+                // ahead of the clock. This number collapsing toward zero IS the dropout.
+                if let newest = buffers.last {
+                    let pts = CMSampleBufferGetPresentationTimeStamp(newest)
+                    if pts.isValid, pts.seconds.isFinite { lastFedAudioPTS = pts.seconds }
+                }
                 // Arm clock on first decoded audio buffer; latch so subsequent packets don't snap clock back.
                 if !clockArmed(), !buffers.isEmpty {
                     // #107: anchor at the buffer PTS when it deviates from the load anchor
@@ -1865,6 +2014,9 @@ final class SoftwarePlaybackHost {
             }
             if !keepGoing { break }
         }
+        // The stash owns real AVPackets. Any exit path — stop, teardown, read error, EOF — must
+        // free them here or the session leaks every packet it was holding.
+        releaseStashedVideo(reason: "demux-loop-exit")
     }
 
     // MARK: - Time updates
