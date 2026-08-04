@@ -432,9 +432,12 @@ final class AudioDSPProcessor {
             }
 
             // Surrounds: delayed side component, opposite polarity across the pair for width.
+            // WRITE BEFORE READ: reading first made `surroundDelayMs = 0` still delay by one frame,
+            // which silenced the surrounds entirely for a single-frame buffer. Writing first means
+            // delayFrames == 0 reads back the sample just stored, i.e. genuinely no delay.
+            surroundDelayLine[surroundDelayWrite] = side
             let readIndex = (surroundDelayWrite + capacity - delayFrames) % capacity
             let delayedSide = surroundDelayLine[readIndex]
-            surroundDelayLine[surroundDelayWrite] = side
             surroundDelayWrite = (surroundDelayWrite + 1) % capacity
 
             output[outBase + 4] = delayedSide * surroundGain
