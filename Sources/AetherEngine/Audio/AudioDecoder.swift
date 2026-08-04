@@ -56,6 +56,9 @@ final class AudioDecoder: @unchecked Sendable {
     /// Last logged (source, requested, effective) layout triple, so the decision line appears on
     /// change rather than 47 times a second.
     private var lastLoggedLayoutDecision: AudioDSPLayoutDecision?
+    /// Width is not proof of audible surround. Measure the post-DSP samples that are actually
+    /// copied into CoreMedia: immediately on an upmix decision, then at most every two seconds.
+    private var lastDSPLevelLogAt = Date.distantPast
 
     var dspSettings: AudioDSPSettings {
         get {
@@ -448,10 +451,13 @@ final class AudioDecoder: @unchecked Sendable {
         // Layout decision telemetry: one line whenever the (source, requested, effective) triple
         // changes. Derived from `layoutDecision`, the same pure rule the UI label uses, so the log
         // and the panel can never disagree about whether a stereo source really became 5.1.
+        var layoutChanged = false
         if channels > 0 {
             let decision = settings.layoutDecision(forSource: channels)
             if decision != lastLoggedLayoutDecision {
+                layoutChanged = true
                 lastLoggedLayoutDecision = decision
+                let upmix = settings.upmix.sanitized
                 EngineLog.emit(
                     "[AudioDSP] layout sourceCh=\(decision.sourceChannels) "
                     + "requestedCh=\(decision.requestedChannels) "
@@ -459,17 +465,27 @@ final class AudioDecoder: @unchecked Sendable {
                     + "mode=\(settings.outputMode.rawValue) "
                     + "upmixActive=\(decision.upmixActive ? 1 : 0) "
                     + "upmixEnabled=\(settings.upmix.enabled ? 1 : 0) "
-                    + "matrix=\(decision.upmixActive ? "mid-side-5.1" : "none") "
-                    + "centerExtraction=\(String(format: "%.2f", settings.upmix.sanitized.centerExtraction)) "
-                    + "centerDb=\(String(format: "%.1f", settings.upmix.sanitized.centerLevelDb)) "
-                    + "surroundDb=\(String(format: "%.1f", settings.upmix.sanitized.surroundLevelDb)) "
-                    + "surroundDelayMs=\(String(format: "%.1f", settings.upmix.sanitized.surroundDelayMs)) "
-                    + "lfe=\(settings.upmix.sanitized.lfeEnabled ? 1 : 0) "
-                    + "lfeDb=\(String(format: "%.1f", settings.upmix.sanitized.lfeLevelDb)) "
-                    + "lfeCutoffHz=\(String(format: "%.0f", settings.upmix.sanitized.lfeCutoffHz)) "
+                    + "matrix=\(decision.upmixActive ? "crossmix-rear-fill-5.1" : "none") "
+                    + "centerExtraction=\(String(format: "%.2f", upmix.centerExtraction)) "
+                    + "centerDb=\(String(format: "%.1f", upmix.centerLevelDb)) "
+                    + "surroundDb=\(String(format: "%.1f", upmix.surroundLevelDb)) "
+                    + "surroundDelayMs=\(String(format: "%.1f", upmix.surroundDelayMs)) "
+                    + "rearFill=\(String(format: "%.2f", upmix.rearFill)) "
+                    + "rearLowPassHz=\(String(format: "%.0f", upmix.rearLowPassHz)) "
+                    + "lfe=\(upmix.lfeEnabled ? 1 : 0) "
+                    + "lfeDb=\(String(format: "%.1f", upmix.lfeLevelDb)) "
+                    + "lfeCutoffHz=\(String(format: "%.0f", upmix.lfeCutoffHz)) "
                     + "decision=\(decision.reason)",
                     category: .swPlayback
                 )
+            }
+
+            if decision.upmixActive, emitChannels == 6 {
+                let now = Date()
+                if layoutChanged || now.timeIntervalSince(lastDSPLevelLogAt) >= 2.0 {
+                    lastDSPLevelLogAt = now
+                    emitDSPLevels(bytes: emitBytes, frames: totalSamples, channels: 6, settings: settings)
+                }
             }
         }
 
@@ -553,6 +569,43 @@ final class AudioDecoder: @unchecked Sendable {
         guard status == noErr, let sample = sampleBuffer else { return nil }
         clock.commit(pts: outPTS, reanchor: reanchor, sampleCount: totalSamples)
         return sample
+    }
+
+    /// Measure the post-limiter, post-upmix PCM immediately before the renderer receives it.
+    /// MPEG_5_1_A interleaved order is L R C LFE Ls Rs.
+    private func emitDSPLevels(
+        bytes: Data,
+        frames: Int,
+        channels: Int,
+        settings: AudioDSPSettings
+    ) {
+        guard frames > 0, channels == 6, bytes.count >= frames * channels * 4 else { return }
+        var sums = [Double](repeating: 0, count: channels)
+        var peaks = [Float](repeating: 0, count: channels)
+        bytes.withUnsafeBytes { raw in
+            guard let samples = raw.baseAddress?.assumingMemoryBound(to: Float.self) else { return }
+            for frame in 0..<frames {
+                let base = frame * channels
+                for channel in 0..<channels {
+                    let value = samples[base + channel]
+                    sums[channel] += Double(value * value)
+                    peaks[channel] = max(peaks[channel], abs(value))
+                }
+            }
+        }
+        let rms = sums.map { sqrt($0 / Double(frames)) }
+        let rearNonZero = peaks[4] > 0.000_001 || peaks[5] > 0.000_001
+        let upmix = settings.upmix.sanitized
+        EngineLog.emit(
+            "[AudioDSPLevels] schema=2 point=post-dsp-pre-render frames=\(frames) "
+            + "rmsL=\(String(format: "%.6f", rms[0])) rmsR=\(String(format: "%.6f", rms[1])) "
+            + "rmsC=\(String(format: "%.6f", rms[2])) rmsLFE=\(String(format: "%.6f", rms[3])) "
+            + "rmsLs=\(String(format: "%.6f", rms[4])) rmsRs=\(String(format: "%.6f", rms[5])) "
+            + "peakLs=\(String(format: "%.6f", peaks[4])) peakRs=\(String(format: "%.6f", peaks[5])) "
+            + "rearNonZero=\(rearNonZero ? 1 : 0) rearFill=\(String(format: "%.2f", upmix.rearFill)) "
+            + "rearLowPassHz=\(String(format: "%.0f", upmix.rearLowPassHz))",
+            category: .swPlayback
+        )
     }
 
     private func resetPending() {
