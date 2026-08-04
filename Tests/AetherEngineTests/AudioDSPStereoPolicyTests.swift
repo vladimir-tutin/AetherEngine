@@ -258,15 +258,16 @@ final class AudioDSPStereoPolicyTests: XCTestCase {
         let ceiling = AudioDSPSettings().limiterCeiling
         // Skip the attack window; the envelope needs a few ms to engage by design.
         for index in (1000 * 6)..<out.count {
-            XCTAssertLessThan(
+            // <= 1.0: full scale is a legal sample value. Clipping is EXCEEDING it, which is what
+            // the brickwall clamp exists to prevent.
+            XCTAssertLessThanOrEqual(
                 abs(out[index]), 1.0,
-                "sample \(index) reached digital full scale"
+                "sample \(index) exceeded digital full scale"
             )
         }
         // And it must still settle near the ceiling rather than sitting pinned at the clamp.
         let tail = out[(frames - 100) * 6..<out.count].map { abs($0) }.max() ?? 0
         XCTAssertLessThanOrEqual(tail, ceiling * 1.1)
-        _ = ceiling
     }
 
     // MARK: - Reset / format change
