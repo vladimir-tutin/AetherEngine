@@ -168,6 +168,24 @@ final class AudioOwnershipGate: @unchecked Sendable {
     private let lock = NSLock()
     private var sideGeneration: UInt64?
 
+    /// Packets fed since the session began, and whether any of them ever produced a buffer. Used
+    /// only for the first-buffer / starvation telemetry below; the decode path itself is unchanged.
+    private var mainPacketsDecoded = 0
+    private var mainBuffersProduced = 0
+    private var loggedFirstBuffer = false
+    private var loggedStarvation = false
+
+    /// Reset the per-session audio-production counters. Called on load/seek so the telemetry
+    /// describes THIS title rather than the process lifetime.
+    func beginSession() {
+        lock.lock()
+        mainPacketsDecoded = 0
+        mainBuffersProduced = 0
+        loggedFirstBuffer = false
+        loggedStarvation = false
+        lock.unlock()
+    }
+
     func decodeAndEnqueueMain(
         decoder: AudioDecoder,
         packet: UnsafeMutablePointer<AVPacket>,
@@ -178,6 +196,45 @@ final class AudioOwnershipGate: @unchecked Sendable {
         defer { lock.unlock() }
         guard sideGeneration == nil else { return [] }
         let buffers = decoder.decode(packet: packet)
+        mainPacketsDecoded += 1
+        mainBuffersProduced += buffers.count
+
+        // FLUSH OWNERSHIP: the decoder is the only component that knows whether an EMITTED buffer
+        // actually changed channel count, and it latches exactly that (`consumeDSPFormatDidChange`).
+        // The flush must happen BETWEEN decode and enqueue: flushing after the enqueue would discard
+        // the very first buffer of the new format. Previously this latch was never read by anyone and
+        // the host flushed speculatively on an OutputMode enum compare instead, which fires even when
+        // the resulting width is identical (e.g. a stereo source where every mode yields 2ch).
+        if decoder.consumeDSPFormatDidChange() {
+            output.flush()
+            EngineLog.emit(
+                "[AudioDSP] action=flush owner=decoder-emitted-format-change "
+                + "trigger=channel-count-changed decision=drop-stale-format-queue "
+                + "buffersThisPacket=\(buffers.count)",
+                category: .swPlayback
+            )
+        }
+
+        if !buffers.isEmpty, !loggedFirstBuffer {
+            loggedFirstBuffer = true
+            EngineLog.emit(
+                "[AudioProduction] action=first-buffer packetsToFirstBuffer=\(mainPacketsDecoded) "
+                + "buffers=\(buffers.count) decision=clock-can-arm",
+                category: .swPlayback
+            )
+        }
+        // Starvation tell: the decoder is being fed but has never produced a buffer. This is the
+        // exact state that used to wedge the demux loop silently, so it is release-visible once.
+        if buffers.isEmpty, mainBuffersProduced == 0, mainPacketsDecoded >= 10, !loggedStarvation {
+            loggedStarvation = true
+            EngineLog.emit(
+                "[AudioProduction] action=no-buffers-yet packetsDecoded=\(mainPacketsDecoded) "
+                + "decision=clock-cannot-arm-from-audio "
+                + "note=video-backpressure-guard-will-arm-from-video",
+                category: .swPlayback
+            )
+        }
+
         for buffer in buffers {
             tap?(buffer)
             output.enqueue(sampleBuffer: buffer)

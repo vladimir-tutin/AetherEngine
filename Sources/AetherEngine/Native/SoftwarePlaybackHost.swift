@@ -334,6 +334,7 @@ final class SoftwarePlaybackHost {
     ) async throws {
         self.demuxer = dem
         audioOwnershipGate.resetToMain()
+        audioOwnershipGate.beginSession()
         audioTrackSwitchReader.cancel()
         sideAudioTrackIndex = nil
         self.duration = dem.duration
@@ -840,23 +841,15 @@ final class SoftwarePlaybackHost {
             let previous = decoder.dspSettings
             guard previous != newValue else { return }
             decoder.dspSettings = newValue
-            let widthChanges = previous.outputMode != newValue.outputMode
+            let requestedModeChanged = previous.outputMode != newValue.outputMode
             EngineLog.emit(
                 "[AudioDSP] settings mode=\(newValue.outputMode.rawValue) "
                 + "dialogue=\(newValue.dialogueGainDb)dB master=\(newValue.masterGainDb)dB "
-                + "identity=\(newValue.isIdentity ? 1 : 0) widthChange=\(widthChanges ? 1 : 0)",
+                + "identity=\(newValue.isIdentity ? 1 : 0) "
+                + "requestedModeChanged=\(requestedModeChanged ? 1 : 0) "
+                + "flushDecision=defer-until-decoder-emits-real-format-change",
                 category: .swPlayback
             )
-            if widthChanges {
-                // Flush the already-queued audio so the new width is heard now rather than after the
-                // old format drains. Audio only — the clock keeps running, so A/V stays aligned.
-                audioOutput?.flush()
-                EngineLog.emit(
-                    "[AudioDSP] audio renderer flushed for width change "
-                    + "(video + master clock untouched)",
-                    category: .swPlayback
-                )
-            }
         }
     }
 
@@ -1717,6 +1710,13 @@ final class SoftwarePlaybackHost {
                     return true
                 }
                 // Back-pressure via SampleBufferRenderer.isReadyForMoreMediaData (not the deprecated layer property). Park on condition while paused to avoid 200 Hz CPU spin.
+                // DEADLOCK GUARD (SWClockArmPolicy): this park is the one place where an unarmed
+                // clock becomes self-sustaining — the renderer cannot drain until the clock runs,
+                // and the clock cannot arm because THIS thread is the only reader of audio packets.
+                // Track how long we have been parked so the policy can arm from video instead of
+                // waiting for an audio buffer that no longer has a path to arrive.
+                let backpressureStart = DispatchTime.now()
+                var armedFromBackpressure = false
                 while !renderer.isReadyForMoreMediaData && !stopRequested() && !backgroundAudioOnly() {
                     autoreleasepool {
                         if !isPlaying() {
@@ -1729,6 +1729,38 @@ final class SoftwarePlaybackHost {
                             condition.unlock()
                         } else {
                             Thread.sleep(forTimeInterval: 0.005)
+                        }
+                    }
+                    if !armedFromBackpressure, let aOut = audioOutput {
+                        let parkedSeconds = Double(
+                            DispatchTime.now().uptimeNanoseconds - backpressureStart.uptimeNanoseconds
+                        ) / 1_000_000_000
+                        let decision = SWClockArmPolicy.decide(
+                            clockArmed: clockArmed(),
+                            hasAudioDecoder: audioDecoder != nil,
+                            audioBuffersProduced: audioBuffersProduced,
+                            backpressureSeconds: parkedSeconds
+                        )
+                        if case .armFromVideo(let reason) = decision {
+                            armedFromBackpressure = true
+                            let pktPtsSec = (packet.pointee.pts != Int64.min && videoTimeBaseSeconds > 0)
+                                ? Double(packet.pointee.pts) * videoTimeBaseSeconds : Double.nan
+                            let resolution = SWClockAnchorPolicy.resolve(
+                                initialSeconds: initialClockTime.seconds, firstSampleSeconds: pktPtsSec)
+                            armClock(aOut, resolution: resolution, initialClockTime: initialClockTime,
+                                     rate: currentRate(), onClockAnchored: onClockAnchored)
+                            markClockArmed()
+                            EngineLog.emit(
+                                "[SWClockArm] action=arm-from-video reason=\(reason) "
+                                + "owner=video-backpressure-guard "
+                                + "parkedMs=\(Int(parkedSeconds * 1000)) "
+                                + "audioPacketsSeen=\(audioPacketsSeen) "
+                                + "audioBuffersProduced=\(audioBuffersProduced ? 1 : 0) "
+                                + "hasAudioDecoder=\(audioDecoder != nil ? 1 : 0) "
+                                + "pktPts=\(pktPtsSec.isFinite ? String(format: "%.3f", pktPtsSec) : "nan")s "
+                                + "decision=unblock-renderer-drain",
+                                category: .swPlayback
+                            )
                         }
                     }
                 }

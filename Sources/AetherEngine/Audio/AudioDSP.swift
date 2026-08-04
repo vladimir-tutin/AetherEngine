@@ -25,7 +25,7 @@ public struct AudioDSPSettings: Sendable, Equatable {
     public enum OutputMode: String, Sendable, Equatable, CaseIterable {
         /// Source channel count, untouched.
         case source
-        /// Fold anything wider than 5.1 down to 5.1. 5.1 and narrower pass through unchanged.
+        /// Render 5.1: stereo/mono are matrix-upmixed, wider sources fold down, 5.1 passes through.
         case surround51
         /// Downmix to two channels.
         case stereo
@@ -66,6 +66,7 @@ public struct AudioDSPSettings: Sendable, Equatable {
         case .source:
             return sourceChannels
         case .surround51:
+            if sourceChannels <= 2 { return 6 }
             return sourceChannels > 6 ? 6 : sourceChannels
         case .stereo:
             return sourceChannels > 2 ? 2 : sourceChannels
@@ -122,21 +123,40 @@ final class AudioDSPProcessor {
             : powf(10.0, settings.masterGainDb / 20.0)
 
         // ── 1/2. Centre emphasis + channel mixing, in one pass ──────────────────────────────
-        // Centre is interleaved index 2 for the 5.1/7.1 layouts this decoder declares; for anything
-        // narrower there is no discrete centre to lift, so dialogue gain is inert there by design.
+        // Centre is interleaved index 2 for the 5.1/7.1 layouts this decoder declares. Stereo has
+        // a PHANTOM centre: boost its mid component while preserving the side component, so Dialogue
+        // Boost remains a real control for ordinary AAC stereo instead of being silently inert.
         let centreIndex = inCh >= 6 ? 2 : -1
 
         if outCh == inCh {
-            // Same width: in-place scale. Only the centre needs separate treatment.
-            for frame in 0..<frames {
-                let base = frame * inCh
-                for channel in 0..<inCh {
-                    let value = input[base + channel]
-                    output[base + channel] = (channel == centreIndex) ? value * dialogueGain : value
+            if inCh == 2, dialogueGain != 1.0 {
+                for frame in 0..<frames {
+                    let base = frame * 2
+                    let mid = (input[base] + input[base + 1]) * 0.5 * dialogueGain
+                    let side = (input[base] - input[base + 1]) * 0.5
+                    output[base] = mid + side
+                    output[base + 1] = mid - side
+                }
+            } else {
+                // Same width: in-place scale. Only a discrete centre needs separate treatment.
+                for frame in 0..<frames {
+                    let base = frame * inCh
+                    for channel in 0..<inCh {
+                        let value = input[base + channel]
+                        output[base + channel] = (channel == centreIndex) ? value * dialogueGain : value
+                    }
                 }
             }
         } else if outCh == 2 {
             downmixToStereo(
+                input: input,
+                output: output,
+                frames: frames,
+                sourceChannels: inCh,
+                dialogueGain: dialogueGain
+            )
+        } else if outCh == 6, inCh <= 2 {
+            upmixTo51(
                 input: input,
                 output: output,
                 frames: frames,
@@ -165,7 +185,7 @@ final class AudioDSPProcessor {
         // ── 4. Limiter ──────────────────────────────────────────────────────────────────────
         // Engaged whenever something could push past the ceiling. With no positive gain there is
         // nothing to catch, so the envelope is left alone and the samples are untouched.
-        let canOvershoot = masterGain > 1.0 || dialogueGain > 1.0 || outCh < inCh
+        let canOvershoot = masterGain > 1.0 || dialogueGain > 1.0 || outCh != inCh
         if canOvershoot {
             applyLimiter(
                 output: output,
@@ -180,6 +200,37 @@ final class AudioDSPProcessor {
     }
 
     // MARK: - Mixing
+
+    /// Deterministic stereo/mono -> 5.1 matrix. Front L/R retain the original mid/side image,
+    /// dialogue is anchored in C, LFE remains silent (inventing bass is not safe), and the anti-phase
+    /// side component feeds the surrounds. At unity dialogue gain the front pair is byte-equivalent
+    /// to the input; the additional channels provide the requested spatial presentation.
+    private func upmixTo51(
+        input: UnsafePointer<Float>,
+        output: UnsafeMutablePointer<Float>,
+        frames: Int,
+        sourceChannels inCh: Int,
+        dialogueGain: Float
+    ) {
+        let centreCoefficient: Float = 0.7071068
+        let surroundCoefficient: Float = 0.5
+        for frame in 0..<frames {
+            let inBase = frame * inCh
+            let outBase = frame * 6
+            let left = input[inBase]
+            let right = inCh > 1 ? input[inBase + 1] : left
+            let mid = (left + right) * 0.5
+            let side = (left - right) * 0.5
+            let boostedMid = mid * dialogueGain
+
+            output[outBase] = boostedMid + side       // L
+            output[outBase + 1] = boostedMid - side   // R
+            output[outBase + 2] = boostedMid * centreCoefficient // C
+            output[outBase + 3] = 0                   // LFE
+            output[outBase + 4] = side * surroundCoefficient     // Ls
+            output[outBase + 5] = -side * surroundCoefficient    // Rs
+        }
+    }
 
     /// ATSC A/52 style fold, coefficient-normalised so a full-scale source cannot exceed full scale
     /// on its own. This mirrors what libswresample/`aresample` does with `normalize=true`, which is
