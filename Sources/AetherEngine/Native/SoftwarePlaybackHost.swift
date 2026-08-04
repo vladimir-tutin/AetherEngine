@@ -854,6 +854,11 @@ final class SoftwarePlaybackHost {
     }
 
     /// True when this host is actually rendering decoded PCM, i.e. DSP can take effect at all.
+    /// Channel count of the decoded PCM source, or 0 when no audio decoder is open.
+    var audioDSPSourceChannels: Int32 {
+        audioDecoder?.channels ?? 0
+    }
+
     var audioDSPIsAvailable: Bool {
         audioDecoder != nil && audioOutput != nil
     }

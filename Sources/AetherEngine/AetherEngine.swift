@@ -3709,6 +3709,15 @@ public final class AetherEngine: ObservableObject {
         return false
     }
 
+    /// Channel count of the PCM source currently feeding the DSP, or 0 when no PCM host is open.
+    /// The bridge needs this to report the EFFECTIVE layout: "5.1 requested" means one thing for a
+    /// stereo source and another for a 7.1 source, and the panel must never guess.
+    public var audioDSPSourceChannels: Int32 {
+        if let host = softwareHost, host.audioDSPIsAvailable { return host.audioDSPSourceChannels }
+        if let host = audioHost, host.audioDSPIsAvailable { return host.audioDSPSourceChannels }
+        return 0
+    }
+
     var desiredAudioDSPSettings: AudioDSPSettings?
 
     /// Re-apply remembered settings to a host that just finished loading, so a value chosen before or

@@ -53,6 +53,9 @@ final class AudioDecoder: @unchecked Sendable {
     /// flush the audio renderer exactly once per format change (audio only; the clock is untouched).
     private var _dspFormatDidChange = false
     private var lastEmittedChannels: Int32 = 0
+    /// Last logged (source, requested, effective) layout triple, so the decision line appears on
+    /// change rather than 47 times a second.
+    private var lastLoggedLayoutDecision: AudioDSPLayoutDecision?
 
     var dspSettings: AudioDSPSettings {
         get {
@@ -439,6 +442,34 @@ final class AudioDecoder: @unchecked Sendable {
                     emitChannels = channels
                     emitFormat = sourceFormatDesc
                 }
+            }
+        }
+
+        // Layout decision telemetry: one line whenever the (source, requested, effective) triple
+        // changes. Derived from `layoutDecision`, the same pure rule the UI label uses, so the log
+        // and the panel can never disagree about whether a stereo source really became 5.1.
+        if channels > 0 {
+            let decision = settings.layoutDecision(forSource: channels)
+            if decision != lastLoggedLayoutDecision {
+                lastLoggedLayoutDecision = decision
+                EngineLog.emit(
+                    "[AudioDSP] layout sourceCh=\(decision.sourceChannels) "
+                    + "requestedCh=\(decision.requestedChannels) "
+                    + "effectiveCh=\(decision.effectiveChannels) "
+                    + "mode=\(settings.outputMode.rawValue) "
+                    + "upmixActive=\(decision.upmixActive ? 1 : 0) "
+                    + "upmixEnabled=\(settings.upmix.enabled ? 1 : 0) "
+                    + "matrix=\(decision.upmixActive ? "mid-side-5.1" : "none") "
+                    + "centerExtraction=\(String(format: "%.2f", settings.upmix.sanitized.centerExtraction)) "
+                    + "centerDb=\(String(format: "%.1f", settings.upmix.sanitized.centerLevelDb)) "
+                    + "surroundDb=\(String(format: "%.1f", settings.upmix.sanitized.surroundLevelDb)) "
+                    + "surroundDelayMs=\(String(format: "%.1f", settings.upmix.sanitized.surroundDelayMs)) "
+                    + "lfe=\(settings.upmix.sanitized.lfeEnabled ? 1 : 0) "
+                    + "lfeDb=\(String(format: "%.1f", settings.upmix.sanitized.lfeLevelDb)) "
+                    + "lfeCutoffHz=\(String(format: "%.0f", settings.upmix.sanitized.lfeCutoffHz)) "
+                    + "decision=\(decision.reason)",
+                    category: .swPlayback
+                )
             }
         }
 

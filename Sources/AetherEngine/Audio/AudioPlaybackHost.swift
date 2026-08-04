@@ -263,6 +263,11 @@ final class AudioPlaybackHost {
         audioDecoder != nil && audioOutput != nil
     }
 
+    /// Channel count of the decoded PCM source, or 0 when no audio decoder is open.
+    var audioDSPSourceChannels: Int32 {
+        audioDecoder?.channels ?? 0
+    }
+
     // MARK: - Demux loop
 
     private func startDemuxLoop() {
