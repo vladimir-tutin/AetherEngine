@@ -10,6 +10,7 @@ final class AudioOutput: @unchecked Sendable {
     let synchronizer: AVSampleBufferRenderSynchronizer
 
     private let lock = NSLock()
+    private var lastLoggedFormatChannels: UInt32 = 0
 
     init() {
         renderer = AVSampleBufferAudioRenderer()
@@ -79,6 +80,26 @@ final class AudioOutput: @unchecked Sendable {
     /// isReadyForMoreMediaData dropped early samples before the synchronizer started, giving silence.
     func enqueue(sampleBuffer: CMSampleBuffer) {
         renderer.enqueue(sampleBuffer)
+
+        // Log the actual CoreMedia format crossing the renderer boundary whenever its width
+        // changes. This separates "six nonzero PCM channels were generated" from a downstream
+        // channel-layout/renderer problem.
+        if let description = CMSampleBufferGetFormatDescription(sampleBuffer),
+           let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(description)?.pointee,
+           asbd.mChannelsPerFrame != lastLoggedFormatChannels {
+            lastLoggedFormatChannels = asbd.mChannelsPerFrame
+            var layoutSize = 0
+            let layoutTag = CMAudioFormatDescriptionGetChannelLayout(
+                description,
+                sizeOut: &layoutSize
+            )?.pointee.mChannelLayoutTag
+            EngineLog.emit(
+                "[AudioOutputFormat] point=renderer-enqueue sampleRate=\(asbd.mSampleRate) "
+                + "channels=\(asbd.mChannelsPerFrame) layoutTag=\(layoutTag.map(String.init) ?? "missing") "
+                + "layoutBytes=\(layoutSize) rendererError=\(String(describing: renderer.error))",
+                category: .swPlayback
+            )
+        }
 
         #if DEBUG
         // Once per session: first enqueue + any renderer rejection, to distinguish "nothing enqueued" from
