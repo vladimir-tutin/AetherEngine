@@ -149,6 +149,9 @@ final class AudioDSPDiagnosticsTests: XCTestCase {
         XCTAssertEqual(safe.toneTimeoutSeconds, 600)
         XCTAssertEqual(safe.toneChannelMask, AudioDSPDiagnostics.maskAll)
         XCTAssertEqual(safe.toneLevelDb, -18)
+
+        wild.toneTimeoutSeconds = 0
+        XCTAssertEqual(wild.sanitized.toneTimeoutSeconds, 1, "a live tone must never disable its safety timeout")
     }
 
     func testToneAutoStopsAfterItsTimeout() {
@@ -157,10 +160,10 @@ final class AudioDSPDiagnosticsTests: XCTestCase {
         settings.toneChannelMask = AudioDSPDiagnostics.maskRears
         settings.toneReplacesProgram = true
         settings.toneLevelDb = -6
-        settings.toneTimeoutSeconds = 0.001      // 48 frames at 48 kHz
+        settings.toneTimeoutSeconds = 1          // minimum safe timeout: 48,000 frames at 48 kHz
         let processor = AudioDSPDiagnosticsProcessor()
 
-        let first = run(settings: settings, frames: 48, processor: processor)
+        let first = run(settings: settings, frames: 48_000, processor: processor)
         XCTAssertGreaterThan(peak(first, channel: 4), 0.1, "tone should sound before the timeout")
 
         // Well past the timeout: the tone must have stopped on its own.
@@ -177,10 +180,10 @@ final class AudioDSPDiagnosticsTests: XCTestCase {
         settings.toneChannelMask = AudioDSPDiagnostics.maskRears
         settings.toneReplacesProgram = true
         settings.toneLevelDb = -6
-        settings.toneTimeoutSeconds = 0.001
+        settings.toneTimeoutSeconds = 1
         let processor = AudioDSPDiagnosticsProcessor()
 
-        _ = run(settings: settings, frames: 512, processor: processor)   // expire it
+        _ = run(settings: settings, frames: 48_512, processor: processor)   // expire it
         settings.toneFrequencyHz = 880                                    // retune = new activation
         let after = run(settings: settings, frames: 48, processor: processor)
         XCTAssertGreaterThan(peak(after, channel: 4), 0.1, "a retune must re-arm the tone")
