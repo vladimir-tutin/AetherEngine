@@ -143,9 +143,8 @@ final class AudioDSPStereoPolicyTests: XCTestCase {
         XCTAssertEqual(written, 6)
     }
 
-    /// A pure centre-panned (mono-correlated) signal must land in C, and must NOT leak into the
-    /// surrounds, which carry only the difference component.
-    func testCorrelatedContentGoesToCentreAndNotSurrounds() {
+    /// A pure centre-panned (mono-correlated) signal must land in C.
+    func testCorrelatedContentReachesCentre() {
         var settings = AudioDSPUpmixSettings.defaults
         settings.surroundDelayMs = 0   // remove the delay so one frame is enough to observe
         settings.centerExtraction = 0
@@ -153,9 +152,76 @@ final class AudioDSPStereoPolicyTests: XCTestCase {
         let out = upmix(input: [0.4, 0.4], frames: 1, upmix: settings)
 
         XCTAssertEqual(out[2], 0.4, accuracy: 0.0001, "mid should reach centre at unity")
-        XCTAssertEqual(out[4], 0.0, accuracy: 0.0001, "correlated content must not reach Ls")
-        XCTAssertEqual(out[5], 0.0, accuracy: 0.0001, "correlated content must not reach Rs")
         XCTAssertEqual(out[3], 0.0, accuracy: 0.0001, "LFE disabled by default")
+    }
+
+    /// THE REGRESSION GUARD for the silent-rears defect.
+    ///
+    /// Measured on a Yamaha RX-V683 in Straight mode: real 5.1 played through the rears, but
+    /// FlexUI's stereo upmix produced NOTHING behind the listener. The matrix derived the rears
+    /// purely from `(L - R)`, which is zero for centred content — most TV dialogue — so the rear
+    /// channels were mathematically silent and Surround Level could not amplify them.
+    ///
+    /// A mono input must now produce audible rears at exactly `rearFill * mid`.
+    func testCorrelatedContentStillReachesTheRears() {
+        var settings = AudioDSPUpmixSettings.defaults
+        settings.surroundDelayMs = 0
+        settings.rearLowPassHz = 0        // isolate the matrix from the filter
+        settings.surroundLevelDb = 0
+        settings.rearFill = 0.5
+        let out = upmix(input: [0.4, 0.4], frames: 1, upmix: settings)
+
+        // mono: Ls = (a - b) * mid = rearFill * mid = 0.5 * 0.4
+        XCTAssertEqual(out[4], 0.2, accuracy: 0.0001, "centred content MUST reach Ls")
+        XCTAssertEqual(out[5], 0.2, accuracy: 0.0001, "centred content MUST reach Rs")
+    }
+
+    /// The default tuning must be audible out of the box — a default of zero rear fill would ship
+    /// the exact defect again.
+    func testDefaultTuningProducesAudibleRearsOnMonoContent() {
+        XCTAssertGreaterThan(AudioDSPUpmixSettings.defaults.rearFill, 0)
+        var settings = AudioDSPUpmixSettings.defaults
+        settings.surroundDelayMs = 0
+        settings.rearLowPassHz = 0
+        let out = upmix(input: [0.5, 0.5], frames: 1, upmix: settings)
+        XCTAssertGreaterThan(abs(out[4]), 0.05, "default upmix must put real content in Ls")
+        XCTAssertGreaterThan(abs(out[5]), 0.05, "default upmix must put real content in Rs")
+    }
+
+    /// rearFill == 0 must still reproduce the original pure-ambience behaviour exactly, so the old
+    /// character remains reachable for anyone who prefers it.
+    func testZeroRearFillIsPureAmbienceExtraction() {
+        var settings = AudioDSPUpmixSettings.defaults
+        settings.surroundDelayMs = 0
+        settings.rearLowPassHz = 0
+        settings.surroundLevelDb = 0
+        settings.rearFill = 0
+        let mono = upmix(input: [0.4, 0.4], frames: 1, upmix: settings)
+        XCTAssertEqual(mono[4], 0.0, accuracy: 0.0001)
+        XCTAssertEqual(mono[5], 0.0, accuracy: 0.0001)
+
+        let wide = upmix(input: [0.4, -0.4], frames: 1, upmix: settings)
+        XCTAssertEqual(wide[4], 0.4, accuracy: 0.0001)
+        XCTAssertEqual(wide[5], -0.4, accuracy: 0.0001)
+    }
+
+    func testRearLowPassAttenuatesHighFrequencyContentInTheRears() {
+        var settings = AudioDSPUpmixSettings.defaults
+        settings.surroundDelayMs = 0
+        settings.rearFill = 1.0            // rears carry the fronts outright
+        settings.surroundLevelDb = 0
+        settings.rearLowPassHz = 1000
+
+        // Nyquist-rate alternation is the highest frequency representable; a low-pass must crush it.
+        var input: [Float] = []
+        for frame in 0..<2000 {
+            let value: Float = frame % 2 == 0 ? 0.8 : -0.8
+            input.append(value)
+            input.append(value)
+        }
+        let out = upmix(input: input, frames: 2000, upmix: settings)
+        let tail = (1500..<2000).map { abs(out[$0 * 6 + 4]) }.max() ?? 0
+        XCTAssertLessThan(tail, 0.2, "rear low-pass must attenuate high-frequency content")
     }
 
     /// A pure difference (out-of-phase) signal is entirely "side": it must reach the surrounds and
@@ -163,10 +229,13 @@ final class AudioDSPStereoPolicyTests: XCTestCase {
     func testDecorrelatedContentGoesToSurroundsAndNotCentre() {
         var settings = AudioDSPUpmixSettings.defaults
         settings.surroundDelayMs = 0
+        settings.rearLowPassHz = 0   // isolate the matrix from the rear band-limiting filter
         settings.surroundLevelDb = 0
         let out = upmix(input: [0.4, -0.4], frames: 1, upmix: settings)
 
         XCTAssertEqual(out[2], 0.0, accuracy: 0.0001, "anti-correlated content must not reach centre")
+        // a + b == 1 for every rearFill, so fully anti-correlated input passes through at unity
+        // regardless of the fill setting.
         XCTAssertEqual(out[4], 0.4, accuracy: 0.0001)
         XCTAssertEqual(out[5], -0.4, accuracy: 0.0001, "surround pair is opposite polarity")
     }
@@ -211,6 +280,7 @@ final class AudioDSPStereoPolicyTests: XCTestCase {
     func testSurroundDelayDecorrelatesRatherThanDuplicating() {
         var settings = AudioDSPUpmixSettings.defaults
         settings.surroundDelayMs = 1          // 48 frames at 48 kHz
+        settings.rearLowPassHz = 0            // an impulse must stay an impulse for this assertion
         settings.surroundLevelDb = 0
         // One impulse of pure side content, then silence.
         var input: [Float] = [0.5, -0.5]
