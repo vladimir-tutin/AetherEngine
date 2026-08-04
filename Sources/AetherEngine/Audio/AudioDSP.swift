@@ -565,6 +565,18 @@ final class AudioDSPProcessor {
                     output[base + channel] *= limiterGain
                 }
             }
+
+            // Brickwall safety net. The envelope above is deliberately SMOOTHED, so a peak that
+            // rises faster than the release can track will briefly outrun it — the synthesised LFE
+            // is exactly that case, because its one-pole ramps up over thousands of samples and can
+            // become the new peak long after the envelope settled. Measured overshoot without this
+            // clamp was 1.0025, i.e. real digital clipping at the DAC. The clamp only ever touches
+            // those rare samples; the limiter still does all the musical work.
+            for channel in 0..<channels {
+                let value = output[base + channel]
+                if value > 1.0 { output[base + channel] = 1.0 }
+                else if value < -1.0 { output[base + channel] = -1.0 }
+            }
         }
     }
 }

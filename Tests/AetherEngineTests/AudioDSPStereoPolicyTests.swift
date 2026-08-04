@@ -263,9 +263,10 @@ final class AudioDSPStereoPolicyTests: XCTestCase {
                 "sample \(index) reached digital full scale"
             )
         }
-        // And it must still settle near the ceiling rather than drifting far above it.
+        // And it must still settle near the ceiling rather than sitting pinned at the clamp.
         let tail = out[(frames - 100) * 6..<out.count].map { abs($0) }.max() ?? 0
         XCTAssertLessThanOrEqual(tail, ceiling * 1.1)
+        _ = ceiling
     }
 
     // MARK: - Reset / format change
