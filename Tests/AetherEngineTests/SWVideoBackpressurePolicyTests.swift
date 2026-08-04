@@ -57,6 +57,42 @@ final class SWVideoBackpressurePolicyTests: XCTestCase {
         XCTAssertNotEqual(decide(video: true, audio: true, stashed: 3), .decodeNow)
     }
 
+    func testSatisfiedPipelineWithBacklogParksBeforeReadingANewerPacket() {
+        XCTAssertEqual(
+            SWVideoBackpressurePolicy.backlogReadDecision(
+                videoRendererReady: false,
+                audioRendererReady: false,
+                stashedPackets: 3,
+                stashedBytes: 90_000
+            ),
+            .drainBacklogFirst(reason: "both-renderers-satisfied")
+        )
+    }
+
+    func testHungryAudioMayReadPastBacklogButNewVideoMustJoinItsTail() {
+        XCTAssertEqual(
+            SWVideoBackpressurePolicy.backlogReadDecision(
+                videoRendererReady: false,
+                audioRendererReady: true,
+                stashedPackets: 3,
+                stashedBytes: 90_000
+            ),
+            .keepReadingForAudio
+        )
+    }
+
+    func testRendererRoomRequiresBacklogDrainBeforeAnotherRead() {
+        XCTAssertEqual(
+            SWVideoBackpressurePolicy.backlogReadDecision(
+                videoRendererReady: true,
+                audioRendererReady: true,
+                stashedPackets: 3,
+                stashedBytes: 90_000
+            ),
+            .drainBacklogFirst(reason: "video-renderer-ready")
+        )
+    }
+
     // MARK: - Memory backstops
 
     func testStashIsCappedByPacketCount() {

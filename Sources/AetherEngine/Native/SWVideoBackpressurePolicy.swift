@@ -46,6 +46,37 @@ enum SWVideoBackpressurePolicy {
         case park(reason: String)
     }
 
+    enum BacklogReadDecision: Equatable {
+        /// Audio still needs packets, so reading may continue while older video remains queued.
+        case keepReadingForAudio
+        /// Do not read a newer packet until at least one older held video packet is drained.
+        case drainBacklogFirst(reason: String)
+    }
+
+    /// Decide whether the demuxer may read another packet while older video packets remain held.
+    /// This decision MUST happen before `readPacket()`: parking after a newer video packet has
+    /// already been read lets that newer packet bypass the FIFO when the renderer reopens.
+    static func backlogReadDecision(
+        videoRendererReady: Bool,
+        audioRendererReady: Bool,
+        stashedPackets: Int,
+        stashedBytes: Int
+    ) -> BacklogReadDecision {
+        guard stashedPackets > 0 else { return .keepReadingForAudio }
+        if videoRendererReady {
+            return .drainBacklogFirst(reason: "video-renderer-ready")
+        }
+        if stashedPackets >= maxStashedPackets {
+            return .drainBacklogFirst(reason: "stash-packet-cap")
+        }
+        if stashedBytes >= maxStashedBytes {
+            return .drainBacklogFirst(reason: "stash-byte-cap")
+        }
+        return audioRendererReady
+            ? .keepReadingForAudio
+            : .drainBacklogFirst(reason: "both-renderers-satisfied")
+    }
+
     /// - Parameters:
     ///   - videoRendererReady: `SampleBufferRenderer.isReadyForMoreMediaData`.
     ///   - audioRendererReady: `AudioOutput.isReadyForMoreMediaData`. Pass `false` when there is no

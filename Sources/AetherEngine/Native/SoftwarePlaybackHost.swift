@@ -1674,6 +1674,32 @@ final class SoftwarePlaybackHost {
             drainStashedVideo()
             logAudioLead(force: false)
 
+            // ORDERING BARRIER: decide whether another packet may be read BEFORE asking the
+            // demuxer for it. The first stash implementation parked only after reading a newer
+            // video packet; when the renderer reopened that packet decoded immediately, ahead of
+            // older held H.264 references (MMCO/POC corruption). A nonempty backlog now owns video
+            // decode order until it is drained. Reading continues only while audio is hungry.
+            while !stashedVideo.isEmpty, !stopRequested(), !backgroundAudioOnly() {
+                drainStashedVideo()
+                if stashedVideo.isEmpty { break }
+                let backlogDecision = SWVideoBackpressurePolicy.backlogReadDecision(
+                    videoRendererReady: renderer.isReadyForMoreMediaData,
+                    audioRendererReady: audioOutput?.isReadyForMoreMediaData ?? false,
+                    stashedPackets: stashedVideo.count,
+                    stashedBytes: stashedBytes
+                )
+                if case .keepReadingForAudio = backlogDecision { break }
+                if !isPlaying() {
+                    condition.lock()
+                    while !isPlaying() && !stopRequested() {
+                        _ = condition.wait(until: Date(timeIntervalSinceNow: 0.5))
+                    }
+                    condition.unlock()
+                } else {
+                    Thread.sleep(forTimeInterval: 0.005)
+                }
+            }
+
             if !isPlaying() {
                 condition.lock()
                 while !isPlaying() && !stopRequested() {
@@ -1799,6 +1825,16 @@ final class SoftwarePlaybackHost {
                 if backgroundAudioOnly() {
                     av_packet_unref(packet)
                     av_packet_free_safe(packet)
+                    return true
+                }
+                // A newer video packet can never bypass older held references. The pre-read
+                // ordering barrier only allows us here with a backlog while audio is hungry; append
+                // this packet to the FIFO and let the next iteration either keep reading audio or
+                // drain the backlog before reading again.
+                if !stashedVideo.isEmpty {
+                    stashedVideo.append((packet: packet, generation: genBeforeRead))
+                    stashedBytes += Int(packet.pointee.size)
+                    stashHighWater = max(stashHighWater, stashedVideo.count)
                     return true
                 }
                 // Back-pressure via SampleBufferRenderer.isReadyForMoreMediaData (not the deprecated layer property).
