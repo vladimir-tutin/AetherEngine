@@ -148,7 +148,7 @@ public struct AudioDSPSettings: Sendable, Equatable {
         self.outputMode = outputMode
         self.dialogueGainDb = dialogueGainDb
         self.masterGainDb = masterGainDb
-        self.limiterCeiling = limiterCeiling
+        self.limiterCeiling = min(max(limiterCeiling.isFinite ? limiterCeiling : 0.95, 0.05), 1.0)
         self.upmix = upmix
     }
 

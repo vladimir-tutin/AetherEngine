@@ -53,6 +53,14 @@ final class AudioDSPStereoPolicyTests: XCTestCase {
         XCTAssertFalse(settings.upmixApplies(toSource: 2))
     }
 
+    func testLimiterCeilingIsSanitizedAtEngineBoundary() {
+        XCTAssertEqual(AudioDSPSettings(limiterCeiling: -.infinity).limiterCeiling, 0.95)
+        XCTAssertEqual(AudioDSPSettings(limiterCeiling: .nan).limiterCeiling, 0.95)
+        XCTAssertEqual(AudioDSPSettings(limiterCeiling: 0).limiterCeiling, 0.05)
+        XCTAssertEqual(AudioDSPSettings(limiterCeiling: 2).limiterCeiling, 1.0)
+        XCTAssertEqual(AudioDSPSettings(limiterCeiling: 0.85).limiterCeiling, 0.85)
+    }
+
     func testUpmixNeverAppliesOffSurroundMode() {
         XCTAssertFalse(AudioDSPSettings(outputMode: .stereo, upmix: .defaults).upmixApplies(toSource: 2))
         XCTAssertFalse(AudioDSPSettings(outputMode: .source, upmix: .defaults).upmixApplies(toSource: 2))
