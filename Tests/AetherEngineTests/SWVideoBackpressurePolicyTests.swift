@@ -91,11 +91,18 @@ final class SWVideoBackpressurePolicyTests: XCTestCase {
     /// Drive the policy over a synthetic packet sequence and report how long audio ever goes
     /// without being reachable. Returns the longest run of consecutive video packets during which
     /// the loop was parked (i.e. could not read the audio packets that follow).
+    /// Models the real pipeline: a bounded video renderer queue that presents frames at playback
+    /// rate, the `drainStashedVideo()` step that refills it from the stash, and an audio renderer
+    /// that stops accepting once it has enough. `presentEveryTicks == 1` is a renderer keeping up
+    /// with the stream, which is the steady state the dropout occurred in — video decode was never
+    /// the deficit, the shared read cursor was.
     private func longestBlockedRun(
         packets: [Bool],                 // true = video, false = audio
-        videoReadyEvery: Int,            // renderer opens up once every N decisions
+        rendererCapacity: Int,
+        presentEveryTicks: Int,
         audioStaysHungryFor: Int         // audio renderer accepts data for the first N audio packets
     ) -> Int {
+        var rendererQueue = 0
         var stashed = 0
         var audioFed = 0
         var blockedRun = 0
@@ -104,15 +111,19 @@ final class SWVideoBackpressurePolicyTests: XCTestCase {
 
         for isVideo in packets {
             tick += 1
-            let videoReady = (tick % videoReadyEvery == 0)
+            // The renderer presents frames at playback rate, freeing room.
+            if tick % presentEveryTicks == 0, rendererQueue > 0 { rendererQueue -= 1 }
+            // `drainStashedVideo()`: held packets are fed first, preserving order.
+            while stashed > 0, rendererQueue < rendererCapacity {
+                stashed -= 1
+                rendererQueue += 1
+            }
             if !isVideo {
-                // An audio packet can only be reached if the loop is not parked.
-                if blockedRun == 0 {
-                    audioFed += 1
-                    blockedRun = 0
-                }
+                // An audio packet is only reachable if the loop is not parked on video.
+                if blockedRun == 0 { audioFed += 1 }
                 continue
             }
+            let videoReady = rendererQueue < rendererCapacity
             let audioReady = audioFed < audioStaysHungryFor
             switch SWVideoBackpressurePolicy.decide(
                 videoRendererReady: videoReady,
@@ -122,6 +133,7 @@ final class SWVideoBackpressurePolicyTests: XCTestCase {
                 stashedBytes: stashed * 30_000
             ) {
             case .decodeNow:
+                rendererQueue += 1
                 blockedRun = 0
             case .stashAndKeepReading:
                 stashed += 1
@@ -138,7 +150,8 @@ final class SWVideoBackpressurePolicyTests: XCTestCase {
         // Ordinary MP4 interleave: V A V A V A …
         let packets = (0..<400).map { $0 % 2 == 0 }
         let worst = longestBlockedRun(
-            packets: packets, videoReadyEvery: 25, audioStaysHungryFor: 10_000)
+            packets: packets, rendererCapacity: 8, presentEveryTicks: 2,
+            audioStaysHungryFor: 10_000)
         XCTAssertEqual(worst, 0, "audio must stay reachable through normal video back-pressure")
     }
 
@@ -151,7 +164,8 @@ final class SWVideoBackpressurePolicyTests: XCTestCase {
             packets.append(contentsOf: Array(repeating: false, count: 5))   // then 5 audio
         }
         let worst = longestBlockedRun(
-            packets: packets, videoReadyEvery: 25, audioStaysHungryFor: 10_000)
+            packets: packets, rendererCapacity: 8, presentEveryTicks: 1,
+            audioStaysHungryFor: 10_000)
         XCTAssertEqual(worst, 0, "clustered video must not strand the audio packets behind it")
     }
 
@@ -160,7 +174,8 @@ final class SWVideoBackpressurePolicyTests: XCTestCase {
         // into memory.
         let packets = (0..<400).map { $0 % 2 == 0 }
         let worst = longestBlockedRun(
-            packets: packets, videoReadyEvery: 1_000_000, audioStaysHungryFor: 0)
+            packets: packets, rendererCapacity: 4, presentEveryTicks: 1_000_000,
+            audioStaysHungryFor: 0)
         XCTAssertGreaterThan(worst, 0, "a satisfied pipeline must be allowed to park")
     }
 }
