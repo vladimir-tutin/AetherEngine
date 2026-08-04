@@ -1117,6 +1117,18 @@ final class SoftwarePlaybackHost {
         )
     }
 
+    /// On-device PCM diagnostics (test tone / solo / mute). Forwarded straight to the decoder; a
+    /// host without a decoder yet simply drops it, because diagnostics are session-scoped by design
+    /// and must never be replayed onto a later session the way DSP settings are.
+    var audioDSPDiagnostics: AudioDSPDiagnostics {
+        get { audioDecoder?.audioDSPDiagnostics ?? .off }
+        set { audioDecoder?.audioDSPDiagnostics = newValue }
+    }
+
+    func resetAudioDSPDiagnostics(reason: String) {
+        audioDecoder?.resetAudioDSPDiagnostics(reason: reason)
+    }
+
     var audioDSPSettings: AudioDSPSettings {
         get { liveDSPSettings.value }
         set {

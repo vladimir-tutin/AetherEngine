@@ -60,6 +60,55 @@ final class AudioDecoder: @unchecked Sendable {
     /// copied into CoreMedia: immediately on an upmix decision, then at most every two seconds.
     private var lastDSPLevelLogAt = Date.distantPast
 
+    /// On-device PCM diagnostics (test tone / solo / mute). Deliberately NOT part of
+    /// `AudioDSPSettings`: this is a temporary troubleshooting state that must never be persisted
+    /// and must not survive a session, whereas DSP settings are both.
+    private var _audioDSPDiagnostics = AudioDSPDiagnostics.off
+    private let diagnosticsProcessor = AudioDSPDiagnosticsProcessor()
+
+    var audioDSPDiagnostics: AudioDSPDiagnostics {
+        get {
+            dspLock.lock()
+            defer { dspLock.unlock() }
+            return _audioDSPDiagnostics
+        }
+        set {
+            dspLock.lock()
+            let previous = _audioDSPDiagnostics
+            _audioDSPDiagnostics = newValue
+            dspLock.unlock()
+            guard previous != newValue else { return }
+            EngineLog.emit(
+                "[AudioDSPDiag] action=apply tone=\(newValue.toneEnabled ? 1 : 0) "
+                + "toneCh=\(AudioDSPDiagnostics.describe(mask: newValue.sanitized.toneChannelMask)) "
+                + "toneHz=\(String(format: "%.0f", newValue.sanitized.toneFrequencyHz)) "
+                + "toneDb=\(String(format: "%.1f", newValue.sanitized.toneLevelDb)) "
+                + "replace=\(newValue.toneReplacesProgram ? 1 : 0) "
+                + "timeoutS=\(String(format: "%.0f", newValue.sanitized.toneTimeoutSeconds)) "
+                + "solo=\(AudioDSPDiagnostics.describe(mask: newValue.sanitized.soloChannelMask)) "
+                + "mute=\(AudioDSPDiagnostics.describe(mask: newValue.sanitized.muteChannelMask)) "
+                + "active=\(newValue.isActive ? 1 : 0)",
+                category: .swPlayback
+            )
+        }
+    }
+
+    /// Clear every diagnostic and its generator state. Called on flush/seek and on session load so a
+    /// tone can never outlive the thing it was diagnosing.
+    func resetAudioDSPDiagnostics(reason: String) {
+        dspLock.lock()
+        let wasActive = _audioDSPDiagnostics.isActive
+        _audioDSPDiagnostics = .off
+        dspLock.unlock()
+        diagnosticsProcessor.reset()
+        if wasActive {
+            EngineLog.emit(
+                "[AudioDSPDiag] action=reset reason=\(reason) decision=diagnostics-never-outlive-session",
+                category: .swPlayback
+            )
+        }
+    }
+
     var dspSettings: AudioDSPSettings {
         get {
             dspLock.lock()
@@ -398,6 +447,9 @@ final class AudioDecoder: @unchecked Sendable {
         var emitBytes = pendingBytes
         var emitFormat = sourceFormatDesc
         var emitChannels = channels
+        // Hoisted so the diagnostics/level logging below runs even when DSP is in its identity
+        // short-circuit, because a test tone must work with processing off.
+        var upmixActiveForLevels = false
 
         if !settings.isIdentity, channels > 0, totalSamples > 0 {
             let sourceChannels = Int(channels)
@@ -454,6 +506,7 @@ final class AudioDecoder: @unchecked Sendable {
         var layoutChanged = false
         if channels > 0 {
             let decision = settings.layoutDecision(forSource: channels)
+            upmixActiveForLevels = decision.upmixActive
             if decision != lastLoggedLayoutDecision {
                 layoutChanged = true
                 lastLoggedLayoutDecision = decision
@@ -480,11 +533,44 @@ final class AudioDecoder: @unchecked Sendable {
                 )
             }
 
-            if decision.upmixActive, emitChannels == 6 {
-                let now = Date()
-                if layoutChanged || now.timeIntervalSince(lastDSPLevelLogAt) >= 2.0 {
-                    lastDSPLevelLogAt = now
-                    emitDSPLevels(bytes: emitBytes, frames: totalSamples, channels: 6, settings: settings)
+        }
+
+        // ── Diagnostics: test tone / solo / mute ────────────────────────────────────────────
+        // Applied AFTER the DSP and the limiter, at exactly the point program audio reaches
+        // CoreMedia, so "tone audible" and "program audible" exercise an identical path. Anything
+        // that swallows one swallows the other, which is what makes this decisive about routing.
+        // Runs outside the `isIdentity` short-circuit above: a tone must work even with DSP off.
+        let diagnostics = audioDSPDiagnostics
+        var diagnosticsSummary: String?
+        if diagnostics.isActive, totalSamples > 0, emitChannels > 0 {
+            var mutable = emitBytes
+            mutable.withUnsafeMutableBytes { raw in
+                guard let samples = raw.baseAddress?.assumingMemoryBound(to: Float.self) else { return }
+                diagnosticsSummary = diagnosticsProcessor.apply(
+                    buffer: samples,
+                    frames: totalSamples,
+                    channels: Int(emitChannels),
+                    settings: diagnostics,
+                    sampleRate: sampleRate
+                )
+            }
+            emitBytes = mutable
+        }
+
+        // Level telemetry measures what ACTUALLY leaves, including any injected tone. Logged
+        // whenever the upmix is running OR diagnostics are active, so a tone can be verified even
+        // with DSP otherwise off.
+        if emitChannels == 6, upmixActiveForLevels || diagnostics.isActive {
+            let now = Date()
+            if layoutChanged || now.timeIntervalSince(lastDSPLevelLogAt) >= 2.0 {
+                lastDSPLevelLogAt = now
+                emitDSPLevels(bytes: emitBytes, frames: totalSamples, channels: 6, settings: settings)
+                if let diagnosticsSummary {
+                    EngineLog.emit(
+                        "[AudioDSPDiag] point=post-dsp-pre-render channels=\(emitChannels) "
+                        + diagnosticsSummary,
+                        category: .swPlayback
+                    )
                 }
             }
         }

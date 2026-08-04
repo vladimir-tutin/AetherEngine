@@ -4875,6 +4875,36 @@ public final class AetherEngine: ObservableObject {
         return false
     }
 
+    /// On-device PCM diagnostics: per-channel test tone, solo and mute.
+    ///
+    /// Deliberately separate from `audioDSPSettings` and deliberately NOT stashed for a later host.
+    /// DSP settings are a user preference that should survive a session change; a diagnostic tone is
+    /// a temporary probe that must not. `load()` clears it for the same reason.
+    public var audioDSPDiagnostics: AudioDSPDiagnostics {
+        get {
+            if let host = softwareHost, host.audioDSPIsAvailable { return host.audioDSPDiagnostics }
+            if let host = audioHost, host.audioDSPIsAvailable { return host.audioDSPDiagnostics }
+            return .off
+        }
+        set {
+            softwareHost?.audioDSPDiagnostics = newValue
+            audioHost?.audioDSPDiagnostics = newValue
+            EngineLog.emit(
+                "[AudioDSPDiag] engine set active=\(newValue.isActive ? 1 : 0) "
+                + "host=\(softwareHost != nil ? "software" : (audioHost != nil ? "audio" : "native-avplayer")) "
+                + "applied=\(audioDSPIsEffective ? 1 : 0)",
+                category: .engine
+            )
+        }
+    }
+
+    /// Clear diagnostics everywhere. Called on load so a tone cannot outlive the session it was
+    /// probing, and available to the bridge for player teardown and the DSP kill switch.
+    public func resetAudioDSPDiagnostics(reason: String) {
+        softwareHost?.resetAudioDSPDiagnostics(reason: reason)
+        audioHost?.resetAudioDSPDiagnostics(reason: reason)
+    }
+
     /// Channel count of the PCM source currently feeding the DSP, or 0 when no PCM host is open.
     /// The bridge needs this to report the EFFECTIVE layout: "5.1 requested" means one thing for a
     /// stereo source and another for a 7.1 source, and the panel must never guess.

@@ -293,6 +293,17 @@ final class AudioPlaybackHost {
         audioDSPSettings = pending
     }
 
+    /// On-device PCM diagnostics (test tone / solo / mute). Session-scoped by design, so unlike DSP
+    /// settings there is no stash-and-replay for a host that has no decoder yet.
+    var audioDSPDiagnostics: AudioDSPDiagnostics {
+        get { audioDecoder?.audioDSPDiagnostics ?? .off }
+        set { audioDecoder?.audioDSPDiagnostics = newValue }
+    }
+
+    func resetAudioDSPDiagnostics(reason: String) {
+        audioDecoder?.resetAudioDSPDiagnostics(reason: reason)
+    }
+
     var audioDSPSettings: AudioDSPSettings {
         get { audioDecoder?.dspSettings ?? pendingDSPSettings ?? .identity }
         set {
