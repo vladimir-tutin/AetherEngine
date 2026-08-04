@@ -40,9 +40,37 @@ public struct AudioDSPUpmixSettings: Sendable, Equatable {
     /// Level trim for the derived centre channel, dB.
     public var centerLevelDb: Float
 
-    /// Level trim for the derived surround channels, dB. The surrounds carry the DEcorrelated side
-    /// component; -inf-ish values effectively make this a 3.1 upmix.
+    /// Level trim for the derived surround channels, dB.
     public var surroundLevelDb: Float
+
+    /// How much DIRECT front content is blended into the rears, 0...1.
+    ///
+    /// WHY THIS EXISTS (measured on Patrick's Yamaha RX-V683 in Straight mode): the first version
+    /// derived the rears purely from the side component, `Ls = +（L-R)/2`, `Rs = -(L-R)/2`. Real
+    /// matrix decoders instead use a CROSS-MIX, `Ls = aL - bR` and `Rs = aR - bL`; taking `a == b`
+    /// collapses that to the pure difference. For centred, correlated material — which is most TV
+    /// dialogue — `L - R` approaches zero, so the rear channels were mathematically silent and no
+    /// amount of Surround Level could amplify them. Real 5.1 played fine because it carries discrete
+    /// surround content already.
+    ///
+    /// The deeper point: ordinary stereo is NOT matrix-encoded, so there is no surround signal to
+    /// recover. Dolby Surround encodes its surround into Lt/Rt with a ±90° phase shift, which is what
+    /// makes passive extraction work for *encoded* material. Upmixers for unencoded stereo therefore
+    /// SYNTHESISE rear content instead of extracting it.
+    ///
+    /// This control interpolates the cross-mix coefficients:
+    ///   `a = 0.5 * (1 + rearFill)`, `b = 0.5 * (1 - rearFill)`
+    ///   0   -> a == b: pure ambience extraction (the previous behaviour, silent on mono)
+    ///   1   -> a = 1, b = 0: rears carry the front channels outright, loudest but least separated
+    /// For a mono-correlated input the rear level is exactly `rearFill * mid`, so any value above 0
+    /// guarantees audible rears.
+    public var rearFill: Float
+
+    /// Low-pass corner for the derived rears, Hz. 0 disables it.
+    /// Direct front content routed to the rears reads as a duplicated front image when full-band;
+    /// band-limiting it (as real surround stems usually are) keeps it as ambience. Tunable because
+    /// how much high end belongs behind the listener is a taste judgement, not a correct answer.
+    public var rearLowPassHz: Float
     /// Decorrelation delay applied to the surround pair, milliseconds. A few ms of delay is what
     /// stops the surrounds from collapsing back into the front image (precedence effect).
     /// Clamped to `AudioDSPUpmixSettings.maxSurroundDelayMs`.
@@ -66,6 +94,11 @@ public struct AudioDSPUpmixSettings: Sendable, Equatable {
         centerLevelDb: Float = 0,
         surroundLevelDb: Float = -3,
         surroundDelayMs: Float = 12,
+        // Non-zero by default: this is what makes the rears audible at all on centred content.
+        rearFill: Float = 0.45,
+        // Band-limited by default so the synthesised rears read as ambience, not as a second
+        // copy of the front image.
+        rearLowPassHz: Float = 7000,
         lfeEnabled: Bool = false,
         lfeLevelDb: Float = 0,
         lfeCutoffHz: Float = 120
@@ -75,6 +108,8 @@ public struct AudioDSPUpmixSettings: Sendable, Equatable {
         self.centerLevelDb = centerLevelDb
         self.surroundLevelDb = surroundLevelDb
         self.surroundDelayMs = surroundDelayMs
+        self.rearFill = rearFill
+        self.rearLowPassHz = rearLowPassHz
         self.lfeEnabled = lfeEnabled
         self.lfeLevelDb = lfeLevelDb
         self.lfeCutoffHz = lfeCutoffHz
@@ -96,6 +131,13 @@ public struct AudioDSPUpmixSettings: Sendable, Equatable {
         copy.surroundLevelDb = min(max(surroundLevelDb.isFinite ? surroundLevelDb : 0, -24), 12)
         copy.surroundDelayMs = min(
             max(surroundDelayMs.isFinite ? surroundDelayMs : 0, 0), Self.maxSurroundDelayMs)
+        copy.rearFill = min(max(rearFill.isFinite ? rearFill : 0, 0), 1)
+        // 0 is a legal value meaning "no rear low-pass"; anything else is clamped to an audible band.
+        if !rearLowPassHz.isFinite || rearLowPassHz <= 0 {
+            copy.rearLowPassHz = 0
+        } else {
+            copy.rearLowPassHz = min(max(rearLowPassHz, 500), 20_000)
+        }
         copy.lfeLevelDb = min(max(lfeLevelDb.isFinite ? lfeLevelDb : 0, -24), 12)
         copy.lfeCutoffHz = min(max(lfeCutoffHz.isFinite ? lfeCutoffHz : 120, 40), 250)
         return copy
@@ -240,6 +282,11 @@ final class AudioDSPProcessor {
     /// One-pole low-pass state for the synthesised LFE, also carried across buffers.
     private var lfeLowpassState: Float = 0
 
+    /// One-pole low-pass state for the derived rears, per channel. Carried across buffers for the
+    /// same reason as the LFE filter: restarting it every buffer would click at ~47 Hz.
+    private var rearLowpassStateL: Float = 0
+    private var rearLowpassStateR: Float = 0
+
     /// Reset envelope state. Called on flush/seek so a limiter that was ducking a loud passage does
     /// not carry that reduction into the post-seek audio. The upmix delay line and LFE filter are
     /// reset for the same reason: pre-seek audio must not bleed across the discontinuity.
@@ -248,6 +295,8 @@ final class AudioDSPProcessor {
         for index in surroundDelayLine.indices { surroundDelayLine[index] = 0 }
         surroundDelayWrite = 0
         lfeLowpassState = 0
+        rearLowpassStateL = 0
+        rearLowpassStateR = 0
     }
 
     /// Process one interleaved Float32 buffer.
@@ -388,15 +437,26 @@ final class AudioDSPProcessor {
         let lfeGain = settings.lfeEnabled ? powf(10.0, settings.lfeLevelDb / 20.0) : 0
         let extraction = settings.centerExtraction
 
+        // Matrix-decoder cross-mix coefficients. `a == b` (rearFill 0) is the pure difference signal;
+        // a > b keeps a direct front component in the rear so correlated content stays audible.
+        let coefficientA = 0.5 * (1.0 + settings.rearFill)
+        let coefficientB = 0.5 * (1.0 - settings.rearFill)
+
         let rate = max(sampleRate, 8000)
         // (Re)size the delay line when the rate changes; capacity covers the maximum delay so a live
         // delay change is just a read-offset move, never a reallocation on the render thread.
+        // Two Floats per frame: the line is interleaved stereo (see the cross-mix below).
         let capacity = max(1, Int((AudioDSPUpmixSettings.maxSurroundDelayMs / 1000.0) * Float(rate)) + 1)
-        if surroundDelayRate != rate || surroundDelayLine.count != capacity {
-            surroundDelayLine = [Float](repeating: 0, count: capacity)
+        if surroundDelayRate != rate || surroundDelayLine.count != capacity * 2 {
+            surroundDelayLine = [Float](repeating: 0, count: capacity * 2)
             surroundDelayWrite = 0
             surroundDelayRate = rate
         }
+
+        // One-pole low-pass for the rears. 0 disables it.
+        let rearLowPassCoefficient: Float = settings.rearLowPassHz > 0
+            ? 1.0 - expf(-2.0 * Float.pi * settings.rearLowPassHz / Float(rate))
+            : 0
         let delayFrames = min(
             capacity - 1,
             max(0, Int((settings.surroundDelayMs / 1000.0) * Float(rate)))
@@ -431,17 +491,38 @@ final class AudioDSPProcessor {
                 output[outBase + 3] = 0
             }
 
-            // Surrounds: delayed side component, opposite polarity across the pair for width.
+            // Surrounds: the matrix-decoder cross-mix `Ls = aL - bR`, `Rs = aR - bL`.
+            // `rearFill` interpolates a and b. At rearFill = 0 this is a == b, which reduces to
+            // ±side — pure ambience extraction, and silent whenever L ≈ R. Above 0 the rears retain
+            // a direct front component, so centred content is still audible behind the listener.
+            // For a mono input the rear level is exactly `rearFill * mid`.
+            let rearLeftRaw = coefficientA * left - coefficientB * right
+            let rearRightRaw = coefficientA * right - coefficientB * left
+            _ = side   // retained for readability of the derivation above
+
             // WRITE BEFORE READ: reading first made `surroundDelayMs = 0` still delay by one frame,
             // which silenced the surrounds entirely for a single-frame buffer. Writing first means
             // delayFrames == 0 reads back the sample just stored, i.e. genuinely no delay.
-            surroundDelayLine[surroundDelayWrite] = side
+            // The line is INTERLEAVED stereo: with a != b the two rears are different signals, not
+            // ± the same one, so a mono delay line would collapse them back together.
+            surroundDelayLine[surroundDelayWrite * 2] = rearLeftRaw
+            surroundDelayLine[surroundDelayWrite * 2 + 1] = rearRightRaw
             let readIndex = (surroundDelayWrite + capacity - delayFrames) % capacity
-            let delayedSide = surroundDelayLine[readIndex]
+            var delayedLeft = surroundDelayLine[readIndex * 2]
+            var delayedRight = surroundDelayLine[readIndex * 2 + 1]
             surroundDelayWrite = (surroundDelayWrite + 1) % capacity
 
-            output[outBase + 4] = delayedSide * surroundGain
-            output[outBase + 5] = -delayedSide * surroundGain
+            // Band-limit the rears so direct front content reads as ambience rather than as a
+            // second copy of the front image. Skipped entirely when the corner is 0.
+            if rearLowPassCoefficient > 0 {
+                rearLowpassStateL += (delayedLeft - rearLowpassStateL) * rearLowPassCoefficient
+                rearLowpassStateR += (delayedRight - rearLowpassStateR) * rearLowPassCoefficient
+                delayedLeft = rearLowpassStateL
+                delayedRight = rearLowpassStateR
+            }
+
+            output[outBase + 4] = delayedLeft * surroundGain
+            output[outBase + 5] = delayedRight * surroundGain
         }
     }
 
