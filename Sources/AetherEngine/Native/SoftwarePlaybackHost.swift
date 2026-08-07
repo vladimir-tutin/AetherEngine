@@ -2481,6 +2481,7 @@ final class SoftwarePlaybackHost {
                 if self.isLive, let edge = self.liveEdgeSessionTime {
                     self.onLiveEdge?(edge)
                 }
+                self.runRateWedgeWatchdog(aOut)
             }
     }
 
@@ -2546,6 +2547,45 @@ final class SoftwarePlaybackHost {
                 category: .swPlayback
             )
         }
+    }
+
+    // MARK: - Deferred-rate-change wedge watchdog
+
+    /// Consecutive timer ticks the synchronizer has spent at effective rate 0 while the host wants
+    /// it running. Reset whenever the condition clears.
+    private var rateWedgeTicks = 0
+    private var lastRateWedgeRecoveryAt: DispatchTime?
+
+    /// The synchronizer defers setRate until every attached renderer reports sufficient media
+    /// data; a video renderer that accepts frames but stops decoding them (post-suspend
+    /// requires-flush state) blocks that signal forever, so the master clock sits frozen at its
+    /// anchor while the host publishes "playing". Re-issuing setRate alone re-enters the same
+    /// deferred wait and stays wedged — the seek path's decoder/renderer flush + seekClock
+    /// re-anchor is the only sequence observed to recover. Detect the wedge (requested rate > 0
+    /// but effective rate 0 for 3 s of ticks) and run that seek at the current position.
+    /// Live sessions are excluded: their rebuffer hold legitimately parks the clock mid-play.
+    private func runRateWedgeWatchdog(_ aOut: AudioOutput) {
+        guard isPlaying, clockArmed, !isLive, lastRate > 0, aOut.effectiveRate == 0 else {
+            rateWedgeTicks = 0
+            return
+        }
+        rateWedgeTicks += 1
+        guard rateWedgeTicks >= 12 else { return }
+        if let last = lastRateWedgeRecoveryAt {
+            let sinceLast = Double(DispatchTime.now().uptimeNanoseconds - last.uptimeNanoseconds) / 1_000_000_000
+            guard sinceLast >= 10 else { return }
+        }
+        lastRateWedgeRecoveryAt = DispatchTime.now()
+        rateWedgeTicks = 0
+        let target = currentTime
+        EngineLog.emit(
+            "[RateWedge] action=recover requestedRate=\(lastRate) effectiveRate=0 "
+            + "clockS=\(String(format: "%.3f", aOut.currentTimeSeconds)) "
+            + "target=\(String(format: "%.3f", target)) "
+            + "decision=flush-and-reanchor-via-seek",
+            category: .swPlayback
+        )
+        Task { await self.seek(to: target) }
     }
 
     // MARK: - Errors
