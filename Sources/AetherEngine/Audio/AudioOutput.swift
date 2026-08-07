@@ -129,6 +129,14 @@ final class AudioOutput: @unchecked Sendable {
         synchronizer.currentTime()
     }
 
+    /// The synchronizer's EFFECTIVE rate. Differs from the requested rate while a deferred rate
+    /// change is pending (delaysRateChangeUntilHasSufficientMediaData): setRate stores the request
+    /// but the timebase keeps running at 0 until every attached renderer reports sufficient media.
+    /// The host's wedge watchdog compares this against its requested rate.
+    var effectiveRate: Float {
+        synchronizer.rate
+    }
+
     var currentTimeSeconds: Double {
         let t = CMTimeGetSeconds(currentTime)
         return t.isFinite ? t : 0
