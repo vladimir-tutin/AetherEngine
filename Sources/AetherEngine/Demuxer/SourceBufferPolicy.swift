@@ -149,6 +149,15 @@ public struct AetherSourceBufferPolicy: Sendable, Equatable {
     public var throughputMinBurstKB: Int
     /// How many recent samples the published median is taken over. 1 publishes the raw last sample.
     public var throughputSampleWindow: Int
+    /// Host publication cadence. Carried here rather than in the host so there is ONE process-global
+    /// channel for everything about this measurement, already lock-protected and already reported
+    /// back by the policy readback.
+    public var throughputEmitIntervalMs: Int
+    /// A sample older than this must not be published. A parked or idle reader keeps its last value
+    /// forever, and a stale rate presented as current is worse for a bitrate decision than no rate.
+    public var throughputMaxAgeMs: Int
+    /// Publish the median of the recent samples rather than the newest one.
+    public var throughputUseMedian: Bool
 
     public init(
         enabled: Bool = false,
@@ -171,7 +180,10 @@ public struct AetherSourceBufferPolicy: Sendable, Equatable {
         throughputMaxGapMs: Int = 500,
         throughputMinBurstMs: Int = 300,
         throughputMinBurstKB: Int = 512,
-        throughputSampleWindow: Int = 8
+        throughputSampleWindow: Int = 8,
+        throughputEmitIntervalMs: Int = 1000,
+        throughputMaxAgeMs: Int = 5000,
+        throughputUseMedian: Bool = true
     ) {
         self.enabled = enabled
         self.lowWaterSeconds = lowWaterSeconds
@@ -194,6 +206,9 @@ public struct AetherSourceBufferPolicy: Sendable, Equatable {
         self.throughputMinBurstMs = throughputMinBurstMs
         self.throughputMinBurstKB = throughputMinBurstKB
         self.throughputSampleWindow = throughputSampleWindow
+        self.throughputEmitIntervalMs = throughputEmitIntervalMs
+        self.throughputMaxAgeMs = throughputMaxAgeMs
+        self.throughputUseMedian = throughputUseMedian
     }
 
     /// The meter configuration this policy implies. Clamped so a hostile or fat-fingered host
