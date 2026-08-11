@@ -128,6 +128,28 @@ public struct AetherSourceBufferPolicy: Sendable, Equatable {
     public var breakerHardCapEvents: Int
     public var breakerWindowSeconds: Double
 
+    // MARK: - Active-transfer throughput measurement
+    //
+    // Read-only instrumentation: it changes no fetch decision, it only publishes what the link
+    // actually delivered while we were asking for bytes. The host's adaptive-bitrate loop needs a
+    // real client<-origin rate, and the ONLY place that number exists is this reader — the
+    // AVPlayer that ultimately consumes our repackaged output reads from 127.0.0.1, so its access
+    // log measures loopback, and an HLS manifest's advertised bitrate is a declaration, not a
+    // measurement. See `SourceThroughputMeter` for why wall-clock division is wrong here.
+
+    /// Kill switch. `false` stops all measurement and publishes nothing.
+    public var throughputEnabled: Bool
+    /// Discarded after each burst opens (post-park congestion-window restart).
+    public var throughputWarmupMs: Int
+    /// A quiet interval longer than this ends a burst instead of counting as transfer time.
+    public var throughputMaxGapMs: Int
+    /// Minimum active time before a burst is allowed to become a sample.
+    public var throughputMinBurstMs: Int
+    /// Minimum counted bytes before a burst is allowed to become a sample.
+    public var throughputMinBurstKB: Int
+    /// How many recent samples the published median is taken over. 1 publishes the raw last sample.
+    public var throughputSampleWindow: Int
+
     public init(
         enabled: Bool = false,
         lowWaterSeconds: Double = 15,
@@ -143,7 +165,13 @@ public struct AetherSourceBufferPolicy: Sendable, Equatable {
         lookbackBytes: Int = 2 * 1024 * 1024,
         seekKeepForwardBytes: Int = 0,
         breakerHardCapEvents: Int = 3,
-        breakerWindowSeconds: Double = 60
+        breakerWindowSeconds: Double = 60,
+        throughputEnabled: Bool = true,
+        throughputWarmupMs: Int = 250,
+        throughputMaxGapMs: Int = 500,
+        throughputMinBurstMs: Int = 300,
+        throughputMinBurstKB: Int = 512,
+        throughputSampleWindow: Int = 8
     ) {
         self.enabled = enabled
         self.lowWaterSeconds = lowWaterSeconds
@@ -160,6 +188,24 @@ public struct AetherSourceBufferPolicy: Sendable, Equatable {
         self.seekKeepForwardBytes = seekKeepForwardBytes
         self.breakerHardCapEvents = breakerHardCapEvents
         self.breakerWindowSeconds = breakerWindowSeconds
+        self.throughputEnabled = throughputEnabled
+        self.throughputWarmupMs = throughputWarmupMs
+        self.throughputMaxGapMs = throughputMaxGapMs
+        self.throughputMinBurstMs = throughputMinBurstMs
+        self.throughputMinBurstKB = throughputMinBurstKB
+        self.throughputSampleWindow = throughputSampleWindow
+    }
+
+    /// The meter configuration this policy implies. Clamped so a hostile or fat-fingered host
+    /// value cannot make the meter emit nonsense (a 0 ms minimum burst would publish the rate of
+    /// a single 4 KB delivery) or spin.
+    var throughputMeterConfig: SourceThroughputMeter.Config {
+        SourceThroughputMeter.Config(
+            enabled: throughputEnabled,
+            warmupNs: UInt64(max(0, min(10_000, throughputWarmupMs))) * 1_000_000,
+            maxGapNs: UInt64(max(10, min(30_000, throughputMaxGapMs))) * 1_000_000,
+            minActiveNs: UInt64(max(50, min(30_000, throughputMinBurstMs))) * 1_000_000,
+            minBytes: Int64(max(16, min(64 * 1024, throughputMinBurstKB))) * 1024)
     }
 
     /// Shipped default: stock BYTE WATERMARKS and the stock contiguous window, but with the two
@@ -175,7 +221,8 @@ public struct AetherSourceBufferPolicy: Sendable, Equatable {
         enabled: false,
         keepWarmSeconds: 0,
         replaceOnConnectionLoss: false,
-        useBlockRing: false
+        useBlockRing: false,
+        throughputEnabled: false
     )
 
     /// The recommended time-aware policy. Not the default; the host opts in.
@@ -436,6 +483,14 @@ public enum AetherSourceBuffer {
         _proactiveSuppressions = 0
         _proactiveLastRecoveryMs = 0
         _proactivePreservedBytes = 0
+        // A new source is a new link measurement. Carrying the previous title's samples across
+        // would let a fast direct-play file's estimate authorize a step UP on the next one.
+        _throughputRing.removeAll()
+        _throughputSamples = 0
+        _throughputRejected = 0
+        _throughputSaturated = false
+        _throughputLastAt = nil
+        _throughputLastBps = 0
         lock.unlock()
     }
 
@@ -445,6 +500,67 @@ public enum AetherSourceBuffer {
     static func noteProactiveReplace() { lock.lock(); _proactiveReplaces += 1; lock.unlock() }
     static func noteProactiveFailure() { lock.lock(); _proactiveFailures += 1; lock.unlock() }
     static func noteProactiveSuppressed() { lock.lock(); _proactiveSuppressions += 1; lock.unlock() }
+
+    // MARK: Throughput
+
+    nonisolated(unsafe) private static var _throughputRing: [Int] = []
+    nonisolated(unsafe) private static var _throughputSamples = 0
+    nonisolated(unsafe) private static var _throughputRejected = 0
+    nonisolated(unsafe) private static var _throughputSaturated = false
+    nonisolated(unsafe) private static var _throughputLastAt: DispatchTime?
+    nonisolated(unsafe) private static var _throughputLastBps = 0
+
+    /// Publish one completed active-transfer measurement. Only the PRIMARY playback reader calls
+    /// this: subtitle side readers, size probes, chunk fetches and scrub-thumbnail reads run on
+    /// their own connections and would otherwise mix short unrelated transfers into the estimate.
+    static func noteThroughput(_ sample: AetherThroughputSample, window: Int) {
+        lock.lock()
+        _throughputSamples += 1
+        _throughputLastBps = sample.bitsPerSecond
+        _throughputSaturated = sample.saturated
+        _throughputLastAt = DispatchTime.now()
+        _throughputRing.append(sample.bitsPerSecond)
+        let cap = max(1, min(64, window))
+        if _throughputRing.count > cap { _throughputRing.removeFirst(_throughputRing.count - cap) }
+        lock.unlock()
+    }
+
+    /// A burst that never qualified (too short, too few bytes). Counted so a device trace can tell
+    /// "the link is quiet" apart from "the filters are rejecting everything", which look identical
+    /// from JS: both publish no samples.
+    static func noteThroughputRejected() {
+        lock.lock(); _throughputRejected += 1; lock.unlock()
+    }
+
+    /// Median of the recent samples, plus how stale the newest one is.
+    ///
+    /// `ageMs` is what makes this safe for an ABR consumer: a parked or idle reader keeps the last
+    /// value forever, and a stale rate presented as current is worse than no rate at all. The host
+    /// must not forward a sample older than its own freshness bound.
+    ///
+    /// `saturated` reports the newest sample only — see `AetherThroughputSample.saturated`.
+    public static var throughput: (
+        bps: Int, medianBps: Int, samples: Int, rejected: Int, saturated: Bool, ageMs: Int
+    ) {
+        lock.lock(); defer { lock.unlock() }
+        let ring = _throughputRing.sorted()
+        let median: Int
+        if ring.isEmpty {
+            median = 0
+        } else if ring.count % 2 == 1 {
+            median = ring[ring.count / 2]
+        } else {
+            median = (ring[ring.count / 2 - 1] + ring[ring.count / 2]) / 2
+        }
+        let ageMs: Int
+        if let last = _throughputLastAt {
+            ageMs = Int((DispatchTime.now().uptimeNanoseconds &- last.uptimeNanoseconds) / 1_000_000)
+        } else {
+            ageMs = -1
+        }
+        return (_throughputLastBps, median, _throughputSamples, _throughputRejected,
+                _throughputSaturated, ageMs)
+    }
 
     static func noteProactiveRecovered(ms: Double, preservedBytes: Int64) {
         lock.lock()
@@ -497,6 +613,12 @@ public enum AetherSourceBuffer {
                 + "bufRepl=\(t.proactiveReplaces) bufReplOK=\(t.proactiveRecovered) "
                 + "bufReplFail=\(t.proactiveFailures) bufReplOff=\(t.proactiveSuppressions) "
                 + "bufReplMs=\(t.lastRecoveryMs) bufReplKeptKB=\(t.preservedBytes / 1024) "
+        }
+        if p.throughputEnabled {
+            let bw = throughput
+            out += "bwKbps=\(bw.bps / 1000) bwMedKbps=\(bw.medianBps / 1000) "
+                + "bwN=\(bw.samples) bwRej=\(bw.rejected) "
+                + "bwSat=\(bw.saturated ? 1 : 0) bwAgeMs=\(bw.ageMs) "
         }
         return out
     }

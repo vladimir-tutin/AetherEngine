@@ -122,6 +122,27 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         counterLock.unlock()
     }
 
+    /// Active-transfer throughput accounting for the PRIMARY playback connection. Guarded by
+    /// `winCond`, which every persistent-delivery and suspend/close path already holds, so it
+    /// needs no lock of its own. See `SourceThroughputMeter` for why this cannot be
+    /// bytes / wall-clock.
+    private var throughputMeter = SourceThroughputMeter()
+
+    /// Publish a completed measurement plus any rejected bursts. MUST be called with `winCond`
+    /// released: it takes `AetherSourceBuffer`'s lock.
+    private func publishThroughput(_ sample: AetherThroughputSample?, rejected: Int) {
+        guard isPrimaryPlaybackReader else { return }
+        for _ in 0..<max(0, rejected) { AetherSourceBuffer.noteThroughputRejected() }
+        guard let sample else { return }
+        AetherSourceBuffer.noteThroughput(
+            sample, window: AetherSourceBuffer.policy.throughputSampleWindow)
+        EngineLog.emit(
+            "[SourceThroughput] bps=\(sample.bitsPerSecond) kbps=\(sample.bitsPerSecond / 1000) "
+            + "bytes=\(sample.bytes) activeMs=\(sample.activeMs) "
+            + "saturated=\(sample.saturated ? 1 : 0)",
+            category: .demux)
+    }
+
     private var isStreaming: Bool { fileSize <= 0 }
 
     /// #126: a VOD source that resolved no size runs the forward-only streaming reader
@@ -697,6 +718,9 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         defer { winCond.unlock() }
         if fileSize > 0 { return (true, nil, nil, false) }
         connGeneration &+= 1
+        // Connection discontinuity (open, seek, replace, close): drop any in-flight throughput
+        // burst rather than let it span two sockets.
+        throughputMeter.reset()
         let session = activeSession
         let task = activeTask
         let suspended = persistentTaskSuspended
@@ -787,6 +811,9 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         sTask?.cancel()
         winCond.lock()
         connGeneration &+= 1
+        // Connection discontinuity (open, seek, replace, close): drop any in-flight throughput
+        // burst rather than let it span two sockets.
+        throughputMeter.reset()
         // #93/#96 residual: cancel the persistent Range GET here, not only in close(). markClosed is
         // the abort used by the #79 reopen path (dem.markClosed() to unblock a wedged read); leaving
         // its long-lived open-ended connection alive lets it keep draining the origin for the whole
@@ -851,6 +878,9 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
 
         winCond.lock()
         connGeneration &+= 1
+        // Connection discontinuity (open, seek, replace, close): drop any in-flight throughput
+        // burst rather than let it span two sockets.
+        throughputMeter.reset()
         connEnded = true
         let session = activeSession
         let task = activeTask
@@ -1561,6 +1591,9 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                                            preserveWindow: Bool = false) {
         winCond.lock()
         connGeneration &+= 1
+        // Connection discontinuity (open, seek, replace, close): drop any in-flight throughput
+        // burst rather than let it span two sockets.
+        throughputMeter.reset()
         let generation = connGeneration
         // Frontier = the first byte we do NOT have. `trimWindowLocked` only drops from the front
         // and advances `winStart` by the same amount, so `winStart + window.count` is invariant
@@ -1690,6 +1723,16 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         // #220: delivery that lands with the suspend flag already set. Counted before the
         // append so it is attributable to the transport, not to our own bookkeeping.
         if persistentTaskSuspended { suspendedDeliveryBytes += Int64(count) }
+        // Active-transfer throughput. Deliveries that land AFTER the suspend flag is set are
+        // CFNetwork draining a socket we already stopped asking (suspend is advisory), so they
+        // carry no information about how fast the link is when we DO ask — excluded, exactly like
+        // `suspendedDeliveryBytes` treats them for the window accounting above.
+        var pendingSample: AetherThroughputSample? = nil
+        if isPrimaryPlaybackReader, !persistentTaskSuspended {
+            throughputMeter.config = currentPolicy().throughputMeterConfig
+            pendingSample = throughputMeter.noteDelivery(
+                bytes: count, nowNs: DispatchTime.now().uptimeNanoseconds)
+        }
         window.append(data)
         addBytesFetched(count)
         winCond.broadcast()
@@ -1706,6 +1749,14 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             persistentTaskSuspended = true
             suspendCount += 1
             if isPrimaryPlaybackReader { AetherSourceBuffer.noteSuspend() }
+            // The burst ends because WE stopped asking, not because the link ran out: the sample
+            // is a lower bound on capacity and is flagged so a step-up decision can say so.
+            // A burst the gap rule just closed above left the meter holding only the delivery that
+            // reopened it, which has no active time yet, so this can only ever return the burst
+            // the high-water park actually ended.
+            if isPrimaryPlaybackReader {
+                pendingSample = throughputMeter.end(saturated: true) ?? pendingSample
+            }
             toSuspend = activeTask
             // Keep-warm: bound how long the socket may sit fully idle. The measured failure is a
             // COLD restart — the origin pipeline (here Node -> SMB) and TCP's congestion window
@@ -1758,7 +1809,9 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             winCond.broadcast()
         }
         let breakerShrinkNow = breakerShrink
+        let throughputRejected = isPrimaryPlaybackReader ? throughputMeter.drainRejected() : 0
         winCond.unlock()
+        publishThroughput(pendingSample, rejected: throughputRejected)
         if breakerTripped {
             EngineLog.emit(
                 "[AVIOReader] buffer policy MEMORY BREAKER: repeated hard-cap ends; "
@@ -1888,6 +1941,13 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         winCond.lock()
         let isCurrentGen = (generation == connGeneration)
         var continuationDied = false
+        // The transfer ended on the ORIGIN's terms (completed range, loss, cancel), not because we
+        // parked it, so whatever it delivered is a genuine measurement of the link — but it is not
+        // saturated: nothing here proves we were still asking for more.
+        var endedSample: AetherThroughputSample? = nil
+        if isCurrentGen, isPrimaryPlaybackReader {
+            endedSample = throughputMeter.end(saturated: false)
+        }
         if isCurrentGen {
             connEnded = true
             // Whatever attempt was outstanding has now concluded.
@@ -1910,8 +1970,10 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             proactiveReplaceCount += 1
             proactivePreservedBytes = Int64(window.count)
         }
+        let endedRejected = isPrimaryPlaybackReader ? throughputMeter.drainRejected() : 0
         winCond.broadcast()
         winCond.unlock()
+        publishThroughput(endedSample, rejected: endedRejected)
 
         if let error {
             EngineLog.emit("[AVIOReader] Persistent conn gen=\(generation) ended with error: \(error.localizedDescription)", category: .demux)
