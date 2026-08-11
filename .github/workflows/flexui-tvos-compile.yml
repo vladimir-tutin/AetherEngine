@@ -80,5 +80,16 @@ jobs:
       - name: Show toolchain
         run: swift --version
 
+      # The full suite has been dying on `error: Exited with unexpected signal code 13` partway
+      # through since before these changes (same crash at 1f3cea2 and 111c8a6), which makes it
+      # impossible to tell whether a NEW suite passed or was simply killed on the way past. Run the
+      # source-IO suites on their own first so their result is unambiguous, then still run
+      # everything so the pre-existing breakage stays visible rather than being papered over.
+      - name: swift test (source IO suites)
+        run: |
+          swift test --filter SourceThroughputMeterTests
+          swift test --filter SourceBufferPolicyTests
+          swift test --filter SourceThrottleTests
+
       - name: swift test
         run: swift test
