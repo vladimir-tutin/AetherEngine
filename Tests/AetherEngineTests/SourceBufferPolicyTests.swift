@@ -272,3 +272,61 @@ struct SourceWindowStorageTests {
         #expect(huge.residentBytes <= 16 * 1024 * 1024)
     }
 }
+
+/// Low-water refill of a hard-cap-ended connection (2026-08-14 field capture).
+///
+/// The defect: a #220 hard-cap end leaves no task for the low-water hysteresis to `resume()`,
+/// so recovery deferred to the drain path — which fires only at `available == 0`. Every capped
+/// window therefore drained through a zero-cushion re-request, and the origin's header latency
+/// converted 1:1 into a freeze (6412 ms observed; the usual 21 ms made the same moment invisible).
+struct CapRefillDecisionTests {
+
+    private let stock = AetherSourceBufferPolicy.stock
+    private let lowWater = AetherSourceBufferStock.lowWaterBytes
+
+    @Test("at or below the low water, a capped connection is re-requested with cushion in hand")
+    func refillsAtLowWater() {
+        #expect(stock.shouldCapRefill(remainingBytes: lowWater, lowWaterBytes: lowWater,
+                                      frontier: 500_000_000, fileSize: 1_000_000_000,
+                                      isLive: false))
+        #expect(stock.shouldCapRefill(remainingBytes: 0, lowWaterBytes: lowWater,
+                                      frontier: 500_000_000, fileSize: 1_000_000_000,
+                                      isLive: false))
+    }
+
+    @Test("above the low water the window keeps draining; no early re-request")
+    func waitsAboveLowWater() {
+        #expect(!stock.shouldCapRefill(remainingBytes: lowWater + 1, lowWaterBytes: lowWater,
+                                       frontier: 500_000_000, fileSize: 1_000_000_000,
+                                       isLive: false))
+    }
+
+    @Test("a frontier at or past a known file size is never re-requested (would 416)")
+    func eofNeverRefills() {
+        #expect(!stock.shouldCapRefill(remainingBytes: 0, lowWaterBytes: lowWater,
+                                       frontier: 1_000_000_000, fileSize: 1_000_000_000,
+                                       isLive: false))
+        // Unknown size and live sources have no EOF to respect.
+        #expect(stock.shouldCapRefill(remainingBytes: 0, lowWaterBytes: lowWater,
+                                      frontier: 1_000_000_000, fileSize: 0, isLive: false))
+        #expect(stock.shouldCapRefill(remainingBytes: 0, lowWaterBytes: lowWater,
+                                      frontier: 1_000_000_000, fileSize: 1_000_000_000,
+                                      isLive: true))
+    }
+
+    @Test("the kill switch and the pre-change policy restore the drain-path-only behavior")
+    func killSwitchDefers() {
+        var off = AetherSourceBufferPolicy.stock
+        off.capResumeAtLowWater = false
+        #expect(!off.shouldCapRefill(remainingBytes: 0, lowWaterBytes: lowWater,
+                                     frontier: 500_000_000, fileSize: 1_000_000_000,
+                                     isLive: false))
+        #expect(!AetherSourceBufferPolicy.preChange
+            .shouldCapRefill(remainingBytes: 0, lowWaterBytes: lowWater,
+                             frontier: 500_000_000, fileSize: 1_000_000_000, isLive: false))
+        // Defect fixes default ON, like replaceOnConnectionLoss.
+        #expect(AetherSourceBufferPolicy.stock.capResumeAtLowWater)
+        #expect(AetherSourceBufferPolicy.stock.starvationHoldEnabled)
+        #expect(!AetherSourceBufferPolicy.preChange.starvationHoldEnabled)
+    }
+}

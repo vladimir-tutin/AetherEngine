@@ -350,6 +350,10 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     private var connRequestedOffset: Int64 = 0
     /// True while the current generation is a frontier continuation (window preserved).
     private var connIsContinuation = false
+    /// True while the current generation is a LOW-WATER refill of a hard-cap-ended connection
+    /// (a continuation issued with cushion still in hand rather than at the drain point), so the
+    /// first-data path logs and counts it as a cap refill, not a proactive loss replacement.
+    private var connIsCapRefill = false
     /// Guards against two replacements racing for the same death.
     private var proactiveReplaceInFlight = false
     /// Consecutive proactive replacements that died before delivering a byte. Past the policy
@@ -1226,9 +1230,40 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                     keepWarmToken &+= 1     // this resume wins; cancel any pending keep-warm
                     toResume = activeTask
                 }
+                // 2026-08-14 field capture: a #220 hard-cap-ended connection has no task for the
+                // hysteresis above to resume, so recovery used to wait for `available == 0` — a
+                // zero-cushion re-request whose header latency converts 1:1 into a freeze
+                // (6412 ms observed). Issue the same frontier continuation at the LOW water
+                // instead, with the cushion still resident. Fires once per capped connection:
+                // starting the continuation makes `activeTask` non-nil and clears
+                // `connEndedByBackpressure`, and this thread is the only reader.
+                var capRefill: (frontier: Int64, remaining: Int, lowWater: Int)? = nil
+                if activeTask == nil, connEndedByBackpressure, !isClosed {
+                    let remaining = window.count - max(0, Int(position - winStart))
+                    let frontier = winStart + Int64(window.count)
+                    if currentPolicy().shouldCapRefill(remainingBytes: remaining,
+                                                       lowWaterBytes: applied.lowWaterBytes,
+                                                       frontier: frontier,
+                                                       fileSize: fileSize,
+                                                       isLive: isLive) {
+                        capRefill = (frontier, remaining, applied.lowWaterBytes)
+                    }
+                }
                 winCond.broadcast()
                 winCond.unlock()
                 toResume?.resume()
+                if let capRefill {
+                    EngineLog.emit(
+                        "[AVIOReader] hard-cap window low (\(capRefill.remaining / 1024)KB left, "
+                        + "lowWater=\(capRefill.lowWater / 1024)KB): re-requesting at "
+                        + "\(capRefill.frontier) before drain",
+                        category: .demux)
+                    diag.recordReconnect()
+                    let connectStart = DispatchTime.now()
+                    startPersistentConnection(at: capRefill.frontier, preserveWindow: true,
+                                              capRefill: true)
+                    diag.recordConnect(ms: msSince(connectStart))
+                }
                 continue
             }
 
@@ -1588,7 +1623,8 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// and playback never rewinds. `offset` is ignored in that mode and recomputed under the lock,
     /// because the demux thread can trim and consume between the caller's read and this one.
     private func startPersistentConnection(at offset: Int64, boundedTo: Int64? = nil,
-                                           preserveWindow: Bool = false) {
+                                           preserveWindow: Bool = false,
+                                           capRefill: Bool = false) {
         winCond.lock()
         connGeneration &+= 1
         // Connection discontinuity (open, seek, replace, close): drop any in-flight throughput
@@ -1630,6 +1666,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         connFirstDataSeen = false
         connRequestedOffset = requestOffset
         connIsContinuation = preserveWindow
+        connIsCapRefill = capRefill
         let oldSession = activeSession
         let oldTask = activeTask
         let oldSuspended = persistentTaskSuspended
@@ -1706,9 +1743,11 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         var firstDataMs: Double? = nil
         var continuationRecoveredMs: Double? = nil
         var continuationPreservedBytes: Int64 = 0
+        var continuationIsCapRefill = false
         if !connFirstDataSeen {
             connFirstDataSeen = true
             firstDataMs = Double(DispatchTime.now().uptimeNanoseconds - connStartedAt.uptimeNanoseconds) / 1_000_000
+            continuationIsCapRefill = connIsCapRefill
             if connIsContinuation {
                 // The replacement is alive: the source was healthy all along, so clear the failure
                 // streak and let the next loss be replaced immediately too.
@@ -1835,17 +1874,30 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             cancelSession?.invalidateAndCancel()
         }
         if let continuationRecoveredMs {
-            // Release-visible on purpose: this line is the direct answer to the 24.416 s deferred
-            // recovery. `recoveredMs` is how long the replacement took to produce its first byte
-            // (28 ms and 22 ms in the field capture), and `preservedKB` proves the buffer was
-            // carried across the replacement rather than refetched.
-            EngineLog.emit(
-                "[AVIOReader] proactive replace gen=\(generation) RECOVERED in "
-                + "\(Int(continuationRecoveredMs))ms preservedKB=\(continuationPreservedBytes / 1024)",
-                category: .demux)
-            if isPrimaryPlaybackReader {
-                AetherSourceBuffer.noteProactiveRecovered(ms: continuationRecoveredMs,
-                                                          preservedBytes: continuationPreservedBytes)
+            if continuationIsCapRefill {
+                // Release-visible: the direct answer to the 2026-08-14 zero-cushion freeze. A
+                // first-data latency here is absorbed by the resident cushion instead of being
+                // worn on screen; `residentKB` is what was still in hand when the refill landed.
+                EngineLog.emit(
+                    "[AVIOReader] hard-cap refill gen=\(generation) first data in "
+                    + "\(Int(continuationRecoveredMs))ms residentKB=\(continuationPreservedBytes / 1024)",
+                    category: .demux)
+                if isPrimaryPlaybackReader {
+                    AetherSourceBuffer.noteCapRefill(ms: continuationRecoveredMs)
+                }
+            } else {
+                // Release-visible on purpose: this line is the direct answer to the 24.416 s deferred
+                // recovery. `recoveredMs` is how long the replacement took to produce its first byte
+                // (28 ms and 22 ms in the field capture), and `preservedKB` proves the buffer was
+                // carried across the replacement rather than refetched.
+                EngineLog.emit(
+                    "[AVIOReader] proactive replace gen=\(generation) RECOVERED in "
+                    + "\(Int(continuationRecoveredMs))ms preservedKB=\(continuationPreservedBytes / 1024)",
+                    category: .demux)
+                if isPrimaryPlaybackReader {
+                    AetherSourceBuffer.noteProactiveRecovered(ms: continuationRecoveredMs,
+                                                              preservedBytes: continuationPreservedBytes)
+                }
             }
         }
         if let firstDataMs {

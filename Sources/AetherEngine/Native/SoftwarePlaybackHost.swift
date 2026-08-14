@@ -246,6 +246,30 @@ final class SoftwarePlaybackHost {
         set { flagsLock.lock(); _lastRate = newValue; flagsLock.unlock() }
     }
 
+    /// Newest audio PTS the VOD demux loop fed to the renderer, published for the starvation-hold
+    /// watchdog — the demux thread is blocked inside the stalled read exactly when the watchdog
+    /// needs this number, so it cannot be asked directly. NaN until the first feed and after
+    /// every seek (a stale pre-seek PTS against a re-anchored clock would fake a starved lead).
+    nonisolated(unsafe) private var _lastFedAudioPTSForHold: Double = .nan
+    nonisolated private var lastFedAudioPTSForHold: Double {
+        get { flagsLock.lock(); defer { flagsLock.unlock() }; return _lastFedAudioPTSForHold }
+        set { flagsLock.lock(); _lastFedAudioPTSForHold = newValue; flagsLock.unlock() }
+    }
+
+    /// Set by the demux loop the moment readPacket returns nil (EOF), BEFORE the tail drain: the
+    /// starvation hold must never engage on the natural end-of-file lead collapse, and a hold
+    /// active when EOF lands must resume so the queued tail drains (SWStarvationHoldPolicy).
+    nonisolated(unsafe) private var _sourceEOFSeen = false
+    nonisolated private var sourceEOFSeen: Bool {
+        get { flagsLock.lock(); defer { flagsLock.unlock() }; return _sourceEOFSeen }
+        set { flagsLock.lock(); _sourceEOFSeen = newValue; flagsLock.unlock() }
+    }
+
+    /// True while the starvation watchdog holds the master clock at rate 0 (main-actor: the
+    /// timer tick is the only writer; pause()/seek() clear it when they take clock ownership).
+    private var starvationHoldActive = false
+    private var starvationHoldCount = 0
+
     /// Start position captured so the demux loop aligns the synchronizer clock to the first sample's PTS; non-zero resume without this would cause "frozen frame, no audio".
     private var initialClockTime: CMTime = .zero
 
@@ -602,6 +626,8 @@ final class SoftwarePlaybackHost {
         if clockArmed {
             audioOutput?.pause()
         }
+        // The user now owns the rate-0 clock; a starvation hold in progress must not resume it.
+        starvationHoldActive = false
         pausedByHost = true
         rate = 0
         isPlaying = false
@@ -639,6 +665,10 @@ final class SoftwarePlaybackHost {
         guard let dem = demuxer else { return }
         // Stop loop + bump generation to invalidate in-flight packets.
         bumpSeekGeneration()
+        // The seekClock below re-anchors and owns the rate; a starvation hold in progress ends
+        // here, and the fed-PTS marker resets so the post-seek refill can't read a stale lead.
+        starvationHoldActive = false
+        lastFedAudioPTSForHold = .nan
         let wasPlaying = isPlaying
         isPlaying = false
 
@@ -1005,6 +1035,17 @@ final class SoftwarePlaybackHost {
                 self?.isPlaying = false
             }
         }
+        // Starvation-hold feed markers (SWStarvationHoldPolicy): the demux thread publishes the
+        // newest fed audio PTS and the EOF transition so the main-actor watchdog can tell a
+        // starved feed from a drained file while this thread is blocked inside a stalled read.
+        let noteAudioFed: @Sendable (Double) -> Void = { [weak self] pts in
+            self?.lastFedAudioPTSForHold = pts
+        }
+        let noteSourceEOF: @Sendable () -> Void = { [weak self] in
+            self?.sourceEOFSeen = true
+        }
+        lastFedAudioPTSForHold = .nan
+        sourceEOFSeen = false
 
         // Live + DVR ring: reader/feeder split; live-only and VOD use the combined loop below.
         let getClockArmed: @Sendable () -> Bool = { [weak self] in
@@ -1116,6 +1157,8 @@ final class SoftwarePlaybackHost {
                 backgroundAudioOnly: getBackgroundAudioOnly,
                 onError: onError,
                 onEnd: onEnd,
+                noteAudioFed: noteAudioFed,
+                noteSourceEOF: noteSourceEOF,
                 audioTapSink: getAudioTapSink,
                 audioOwnershipGate: ownershipGate,
                 subtitleStreamIndices: subIndices,
@@ -1588,6 +1631,8 @@ final class SoftwarePlaybackHost {
         backgroundAudioOnly: @Sendable () -> Bool,
         onError: @Sendable (String) -> Void,
         onEnd: @Sendable () -> Void,
+        noteAudioFed: @Sendable (Double) -> Void,
+        noteSourceEOF: @Sendable () -> Void,
         audioTapSink: @Sendable () -> ((@Sendable (CMSampleBuffer) -> Void)?),
         audioOwnershipGate: AudioOwnershipGate,
         subtitleStreamIndices: Set<Int32> = [],
@@ -1734,6 +1779,10 @@ final class SoftwarePlaybackHost {
             }
 
             guard let packet else {
+                // Before anything else: tell the starvation-hold watchdog this is a DRAINED file,
+                // not a starved source — the tail's natural lead collapse must not hold the clock
+                // (and a hold already active must resume so the queued tail can drain).
+                noteSourceEOF()
                 // End of stream: held video packets are real content, so they must be decoded
                 // before the flush rather than discarded — dropping them would truncate the tail.
                 // Bounded wait: the renderer drains in real time, and the stash is capped.
@@ -2028,7 +2077,10 @@ final class SoftwarePlaybackHost {
                 // ahead of the clock. This number collapsing toward zero IS the dropout.
                 if let newest = buffers.last {
                     let pts = CMSampleBufferGetPresentationTimeStamp(newest)
-                    if pts.isValid, pts.seconds.isFinite { lastFedAudioPTS = pts.seconds }
+                    if pts.isValid, pts.seconds.isFinite {
+                        lastFedAudioPTS = pts.seconds
+                        noteAudioFed(pts.seconds)
+                    }
                 }
                 // Arm clock on first decoded audio buffer; latch so subsequent packets don't snap clock back.
                 if !clockArmed(), !buffers.isEmpty {
@@ -2095,8 +2147,65 @@ final class SoftwarePlaybackHost {
                 if self.isLive, let edge = self.liveEdgeSessionTime {
                     self.onLiveEdge?(edge)
                 }
+                self.runStarvationHold(aOut)
                 self.runRateWedgeWatchdog(aOut)
             }
+    }
+
+    // MARK: - VOD starvation clock hold
+
+    /// One tick of `SWStarvationHoldPolicy` (see that file for the defect). Runs on the time
+    /// tick because the demux thread — the only other place that knows the feed stalled — is
+    /// blocked inside the stalled read while the hold is needed.
+    private func runStarvationHold(_ aOut: AudioOutput) {
+        let policy = AetherSourceBuffer.policy
+        let lastFed = lastFedAudioPTSForHold
+        let clockSeconds = aOut.currentTimeSeconds
+        let action = SWStarvationHoldPolicy.decide(
+            holdActive: starvationHoldActive,
+            enabled: policy.starvationHoldEnabled,
+            isLive: isLive,
+            clockArmed: clockArmed,
+            isPlaying: isPlaying,
+            requestedRate: lastRate,
+            effectiveRate: aOut.effectiveRate,
+            lastFedAudioPTS: lastFed,
+            clockSeconds: clockSeconds,
+            sourceEOFSeen: sourceEOFSeen,
+            holdLeadSeconds: policy.starvationHoldLeadSeconds,
+            resumeLeadSeconds: policy.starvationResumeLeadSeconds
+        )
+        switch action {
+        case .none:
+            return
+        case .hold:
+            starvationHoldActive = true
+            starvationHoldCount += 1
+            AetherSourceBuffer.noteStarvationHold()
+            EngineLog.emit(
+                "[SWHost] source underrun: pausing clock to rebuffer (hold #\(starvationHoldCount) "
+                + "lead=\(String(format: "%.2f", lastFed - clockSeconds))s "
+                + "clockS=\(String(format: "%.2f", clockSeconds)) "
+                + "lastFedPts=\(String(format: "%.2f", lastFed)))",
+                category: .swPlayback
+            )
+            aOut.pause()
+        case .resume:
+            starvationHoldActive = false
+            EngineLog.emit(
+                "[SWHost] rebuffered: resuming clock in place "
+                + "(lead=\(lastFed.isFinite ? String(format: "%.2f", lastFed - clockSeconds) : "nan")s "
+                + "clockS=\(String(format: "%.2f", clockSeconds)) rate=\(lastRate))",
+                category: .swPlayback
+            )
+            aOut.setRate(lastRate)
+        case .release:
+            starvationHoldActive = false
+            EngineLog.emit(
+                "[SWHost] starvation hold released without resume (clock ownership changed)",
+                category: .swPlayback
+            )
+        }
     }
 
     // MARK: - Deferred-rate-change wedge watchdog
@@ -2115,7 +2224,10 @@ final class SoftwarePlaybackHost {
     /// but effective rate 0 for 3 s of ticks) and run that seek at the current position.
     /// Live sessions are excluded: their rebuffer hold legitimately parks the clock mid-play.
     private func runRateWedgeWatchdog(_ aOut: AudioOutput) {
-        guard isPlaying, clockArmed, !isLive, lastRate > 0, aOut.effectiveRate == 0 else {
+        // A starvation hold parks the clock at rate 0 on purpose; the wedge recovery's
+        // flush-and-seek would destroy the held position mid-rebuffer.
+        guard isPlaying, clockArmed, !isLive, lastRate > 0, aOut.effectiveRate == 0,
+              !starvationHoldActive else {
             rateWedgeTicks = 0
             return
         }

@@ -106,6 +106,40 @@ public struct AetherSourceBufferPolicy: Sendable, Equatable {
     /// a reconnect storm.
     public var proactiveMinIntervalMs: Int
 
+    /// Re-request a hard-cap-ended connection once the forward buffer drains to the LOW water,
+    /// instead of waiting for it to drain to zero.
+    ///
+    /// MEASURED (Apple TV, 2026-08-14 16:41 capture): a #220 hard-cap end leaves no task for the
+    /// low-water hysteresis to `resume()`, so recovery deferred to the drain path — which only
+    /// fires when `available == 0` at the read cursor. Every drain therefore passes through a
+    /// zero-cushion moment (`bufUnder=118` that session, one per ~90 s of playback), and the
+    /// origin's header latency converts 1:1 into a freeze: gen=13 answered in 21 ms (invisible),
+    /// gen=14 took 6412 ms (a 6.4 s on-screen freeze, then a fast catch-up).
+    ///
+    /// This restores the hysteresis for the taskless case: when the undrained remainder crosses
+    /// `lowWaterBytes`, issue exactly the frontier continuation the drain path would have issued
+    /// (`bytes=<frontier>-`, window preserved) — only with the low-water cushion still in hand.
+    /// INDEPENDENT of `enabled` and DEFAULT ON, same rationale as `replaceOnConnectionLoss`:
+    /// this is a defect fix with no memory cost (the window is already bounded by the hard cap),
+    /// not a sizing experiment. Its own kill switch.
+    public var capResumeAtLowWater: Bool
+
+    /// Pause the VOD master clock while the source has genuinely starved the audio feed, and
+    /// resume IN PLACE once refilled — instead of letting the free-running synchronizer outrun
+    /// the stall and forcing a visible fast-forward catch-up.
+    ///
+    /// Same 2026-08-14 capture: during the 6.4 s read stall `clockS` ran 2033.73 → 2040.27 while
+    /// `lastFedPts` sat at 2035.20 (`leadS=-5.07 decision=STARVED`); on refill the pipeline raced
+    /// through ~8.4 s of media in 2 s to rejoin the runaway clock. Live sessions already pause
+    /// the clock to rebuffer (`AudioLookaheadPolicy.clockAction`); this extends the same behavior
+    /// to VOD, driven from the host's timer tick because the demux thread is blocked inside the
+    /// stalled read. See `SWStarvationHoldPolicy`.
+    public var starvationHoldEnabled: Bool
+    /// Engage the hold when the fed-audio lead over the clock falls to this many seconds.
+    public var starvationHoldLeadSeconds: Double
+    /// Release the hold once the lead has rebuilt to this many seconds.
+    public var starvationResumeLeadSeconds: Double
+
     /// Allocation granularity of the block-ring window.
     public var blockSizeBytes: Int
 
@@ -169,6 +203,10 @@ public struct AetherSourceBufferPolicy: Sendable, Equatable {
         replaceOnConnectionLoss: Bool = true,
         proactiveDeadStreakLimit: Int = 2,
         proactiveMinIntervalMs: Int = 250,
+        capResumeAtLowWater: Bool = true,
+        starvationHoldEnabled: Bool = true,
+        starvationHoldLeadSeconds: Double = 0.15,
+        starvationResumeLeadSeconds: Double = 2.0,
         blockSizeBytes: Int = 1024 * 1024,
         useBlockRing: Bool = true,
         lookbackBytes: Int = 2 * 1024 * 1024,
@@ -194,6 +232,10 @@ public struct AetherSourceBufferPolicy: Sendable, Equatable {
         self.replaceOnConnectionLoss = replaceOnConnectionLoss
         self.proactiveDeadStreakLimit = proactiveDeadStreakLimit
         self.proactiveMinIntervalMs = proactiveMinIntervalMs
+        self.capResumeAtLowWater = capResumeAtLowWater
+        self.starvationHoldEnabled = starvationHoldEnabled
+        self.starvationHoldLeadSeconds = starvationHoldLeadSeconds
+        self.starvationResumeLeadSeconds = starvationResumeLeadSeconds
         self.blockSizeBytes = blockSizeBytes
         self.useBlockRing = useBlockRing
         self.lookbackBytes = lookbackBytes
@@ -236,6 +278,8 @@ public struct AetherSourceBufferPolicy: Sendable, Equatable {
         enabled: false,
         keepWarmSeconds: 0,
         replaceOnConnectionLoss: false,
+        capResumeAtLowWater: false,
+        starvationHoldEnabled: false,
         useBlockRing: false,
         throughputEnabled: false
     )
@@ -305,6 +349,21 @@ public extension AetherSourceBufferPolicy {
             return .skip("min-interval-\(Int(since))ms")
         }
         return .replace
+    }
+
+    /// Pure: should a hard-cap-ended (taskless) connection be re-requested NOW, with cushion
+    /// still in hand, instead of at the zero-cushion drain point?
+    ///
+    /// `remainingBytes` is the undrained forward extent at the read cursor; the caller has
+    /// already established that the connection was ended by backpressure and that no task is
+    /// active or in flight. The EOF guard mirrors the proactive path's: re-requesting at or past
+    /// a known file size would only earn a 416.
+    func shouldCapRefill(remainingBytes: Int, lowWaterBytes: Int,
+                         frontier: Int64, fileSize: Int64, isLive: Bool) -> Bool {
+        guard capResumeAtLowWater else { return false }
+        guard remainingBytes <= lowWaterBytes else { return false }
+        if !isLive, fileSize > 0, frontier >= fileSize { return false }
+        return true
     }
 }
 
@@ -485,6 +544,9 @@ public enum AetherSourceBuffer {
     nonisolated(unsafe) private static var _proactiveSuppressions = 0
     nonisolated(unsafe) private static var _proactiveLastRecoveryMs = 0
     nonisolated(unsafe) private static var _proactivePreservedBytes: Int64 = 0
+    nonisolated(unsafe) private static var _capRefills = 0
+    nonisolated(unsafe) private static var _capRefillLastMs = 0
+    nonisolated(unsafe) private static var _starvationHolds = 0
 
     /// Zero the counters for a new playback source. Called when the primary reader opens.
     public static func beginSession() {
@@ -498,6 +560,9 @@ public enum AetherSourceBuffer {
         _proactiveSuppressions = 0
         _proactiveLastRecoveryMs = 0
         _proactivePreservedBytes = 0
+        _capRefills = 0
+        _capRefillLastMs = 0
+        _starvationHolds = 0
         // A new source is a new link measurement. Carrying the previous title's samples across
         // would let a fast direct-play file's estimate authorize a step UP on the next one.
         _throughputRing.removeAll()
@@ -515,6 +580,12 @@ public enum AetherSourceBuffer {
     static func noteProactiveReplace() { lock.lock(); _proactiveReplaces += 1; lock.unlock() }
     static func noteProactiveFailure() { lock.lock(); _proactiveFailures += 1; lock.unlock() }
     static func noteProactiveSuppressed() { lock.lock(); _proactiveSuppressions += 1; lock.unlock() }
+    /// A hard-cap-ended connection was re-requested at the low water; `ms` is time to first byte.
+    static func noteCapRefill(ms: Double) {
+        lock.lock(); _capRefills += 1; _capRefillLastMs = Int(ms.rounded()); lock.unlock()
+    }
+    /// The VOD host paused the master clock because the source starved the audio feed.
+    public static func noteStarvationHold() { lock.lock(); _starvationHolds += 1; lock.unlock() }
 
     // MARK: Throughput
 
@@ -598,12 +669,14 @@ public enum AetherSourceBuffer {
     public static var telemetry: (
         suspends: Int, keepWarmResumes: Int, underruns: Int,
         proactiveReplaces: Int, proactiveRecovered: Int, proactiveFailures: Int,
-        proactiveSuppressions: Int, lastRecoveryMs: Int, preservedBytes: Int64
+        proactiveSuppressions: Int, lastRecoveryMs: Int, preservedBytes: Int64,
+        capRefills: Int, capRefillLastMs: Int, starvationHolds: Int
     ) {
         lock.lock(); defer { lock.unlock() }
         return (_suspends, _keepWarmResumes, _underruns,
                 _proactiveReplaces, _proactiveRecovered, _proactiveFailures,
-                _proactiveSuppressions, _proactiveLastRecoveryMs, _proactivePreservedBytes)
+                _proactiveSuppressions, _proactiveLastRecoveryMs, _proactivePreservedBytes,
+                _capRefills, _capRefillLastMs, _starvationHolds)
     }
 
     /// Compact memprobe fragment.
@@ -628,6 +701,8 @@ public enum AetherSourceBuffer {
                 + "bufRepl=\(t.proactiveReplaces) bufReplOK=\(t.proactiveRecovered) "
                 + "bufReplFail=\(t.proactiveFailures) bufReplOff=\(t.proactiveSuppressions) "
                 + "bufReplMs=\(t.lastRecoveryMs) bufReplKeptKB=\(t.preservedBytes / 1024) "
+                + "bufCapRefill=\(t.capRefills) bufCapRefillMs=\(t.capRefillLastMs) "
+                + "bufHold=\(t.starvationHolds) "
         }
         if p.throughputEnabled {
             let bw = throughput
