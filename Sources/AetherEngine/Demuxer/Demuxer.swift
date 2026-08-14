@@ -504,6 +504,28 @@ public final class Demuxer: @unchecked Sendable {
 
         try probeStreams(ctxPtr!)
         onOpenProgress?(.streamsProbed)     // #361
+        // FlexUI: upstream's bounded-range lifecycle is correct, but its fixed 8/16 MiB
+        // thresholds are not a stable amount of playback time. Once probing has resolved the
+        // container rate/duration, install seconds-derived thresholds on the primary VOD reader.
+        // File size affects this only through bytes/second; an 88 GB title is not cached whole.
+        if let reader = provider as? AVIOReader {
+            let probedDuration = openProfile.declaredDurationSeconds
+                ?? (ctxPtr!.pointee.duration > 0
+                    ? Double(ctxPtr!.pointee.duration) / Double(AV_TIME_BASE)
+                    : 0)
+            if let rate = AetherMediaRateResolver.bytesPerSecond(
+                declaredBitsPerSecond: ctxPtr!.pointee.bit_rate,
+                fileSize: reader.knownFileSize,
+                durationSeconds: probedDuration) {
+                reader.configurePlaybackWatermarks(bytesPerSecond: rate.value, source: rate.source)
+            } else {
+                AetherSourceBuffer.recordApplied(.stock)
+                EngineLog.emit(
+                    "[SourceBuffer] applied source=unresolved appliedMB=8/16 reason=stock-fallback "
+                    + "mechanism=upstream-bounded-range",
+                    category: .demux)
+            }
+        }
         // #281: every parse seek this open performs has happened by now, so the provider can drop
         // the cold-start state that only exists to serve them. Deliberately after probeStreams:
         // find_stream_info is where the trailing-index ping-pong lives, not avformat_open_input.

@@ -180,6 +180,10 @@ extension AetherEngine {
                     + "pktAlive=\(pktAlive) pktTotal=\(pktTotal) "
                     + "subCues=\(cueCount) "
                     + readerStr
+                    // FlexUI: installed seconds-derived watermarks, starvation holds and active
+                    // source-throughput counters. This was accidentally left out during the
+                    // 6.25.4 rebase, making live controls look inert even while they were armed.
+                    + AetherSourceBuffer.probeFragment()
                     // #220: the lead is the live tell. It is visible minutes before a kill and
                     // separates "reads fast while building its lead" from "the lead never settles".
                     + SubtitlePrefetchTelemetry.probeFragment(playhead: self.sourceTime)

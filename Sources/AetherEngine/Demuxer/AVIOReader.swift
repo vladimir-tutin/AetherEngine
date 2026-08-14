@@ -271,7 +271,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     // that cannot bound by range request.
     private static let winHighWaterDefault = 16 * 1024 * 1024
     private static let liveWinHighWaterDefault = 64 * 1024 * 1024
-    private static let winLowWater = 8 * 1024 * 1024
+    private static let winLowWaterDefault = 8 * 1024 * 1024
     // #220: how much the persistent reader asks for at a time. Bounds a single request's
     // exposure by construction (an origin cannot serve more than it was asked for, whatever
     // it thinks of flow control) and keeps the request cadence modest on a healthy link:
@@ -580,7 +580,10 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// an init parameter for the same reason `connStallTimeout` is one: a process-wide
     /// hook would leak into whatever suite runs concurrently. The shipped values are the
     /// two statics above.
-    private let winHighWater: Int
+    private var winHighWater: Int
+    private var winLowWater: Int
+    private var resolvedMediaBytesPerSecond: Double = 0
+    private var headerLatencyHistorySeconds: [Double] = []
     private var throttleVClockNs: UInt64 = 0
     private let throttleLock = NSLock()
 
@@ -604,6 +607,66 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         self.connStallTimeout = max(0.05, connStallTimeout)
         self.winHighWater = max(1, windowHighWater
             ?? (isLive ? Self.liveWinHighWaterDefault : Self.winHighWaterDefault))
+        self.winLowWater = min(Self.winLowWaterDefault, self.winHighWater - 1)
+    }
+
+    /// Install time-based thresholds onto upstream's bounded-range reader after FFmpeg has probed
+    /// the source bitrate. The connection lifecycle remains upstream #220/#310: end at high water,
+    /// re-request at the frontier at low water. Only the byte thresholds change.
+    func configurePlaybackWatermarks(bytesPerSecond: Double, source: String) {
+        guard isPrimaryPlaybackReader, !isLive, bytesPerSecond > 0 else { return }
+        let policy = AetherSourceBuffer.policy
+        winCond.lock()
+        resolvedMediaBytesPerSecond = bytesPerSecond
+        let observed = percentileHeaderLatencyLocked()
+        let resolved = policy.resolve(
+            bytesPerSecond: bytesPerSecond,
+            observedHeaderLatencySeconds: observed)
+        let changed = winLowWater != resolved.lowWaterBytes || winHighWater != resolved.highWaterBytes
+        winLowWater = resolved.lowWaterBytes
+        winHighWater = resolved.highWaterBytes
+        let ahead = max(0, window.count - max(0, Int(position - winStart)))
+        winCond.broadcast()
+        winCond.unlock()
+        AetherSourceBuffer.recordApplied(resolved)
+        if changed {
+            EngineLog.emit(
+                "[SourceBuffer] applied source=\(source) bitrateKbps="
+                + "\(Int((bytesPerSecond * 8 / 1000).rounded())) "
+                + "target=\(policy.lowWaterSeconds)s/\(policy.highWaterSeconds)s "
+                + "headerP90=\(String(format: "%.2f", observed))s "
+                + "latencyTarget=\(String(format: "%.2f", resolved.latencyTargetSeconds))s "
+                + "appliedMB=\(resolved.lowWaterBytes / 1024 / 1024)/"
+                + "\(resolved.highWaterBytes / 1024 / 1024) "
+                + "appliedS=\(String(format: "%.1f", resolved.lowWaterSeconds))/"
+                + "\(String(format: "%.1f", resolved.highWaterSeconds)) "
+                + "aheadMB=\(ahead / 1024 / 1024) ceilingMB=\(policy.maxWindowBytes / 1024 / 1024) "
+                + "reason=\(resolved.reason) mechanism=upstream-bounded-range",
+                category: .demux)
+        }
+    }
+
+    private func percentileHeaderLatencyLocked() -> Double {
+        guard !headerLatencyHistorySeconds.isEmpty else { return 0 }
+        let sorted = headerLatencyHistorySeconds.sorted()
+        let index = min(sorted.count - 1, Int(ceil(Double(sorted.count) * 0.90)) - 1)
+        return sorted[max(0, index)]
+    }
+
+    private func observeHeaderLatency(milliseconds: Double) {
+        guard isPrimaryPlaybackReader, !isLive, milliseconds >= 0 else { return }
+        let policy = AetherSourceBuffer.policy
+        winCond.lock()
+        headerLatencyHistorySeconds.append(milliseconds / 1000)
+        let limit = max(1, min(64, policy.latencyHistoryLimit))
+        if headerLatencyHistorySeconds.count > limit {
+            headerLatencyHistorySeconds.removeFirst(headerLatencyHistorySeconds.count - limit)
+        }
+        let bytesPerSecond = resolvedMediaBytesPerSecond
+        winCond.unlock()
+        if policy.latencyAdaptiveEnabled, bytesPerSecond > 0 {
+            configurePlaybackWatermarks(bytesPerSecond: bytesPerSecond, source: "header-history")
+        }
     }
 
     /// Slow-CDN simulation: hold delivered bytes to `throttleKbps` by sleeping the demux thread before the
@@ -1457,7 +1520,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 var refillRetryAfter: TimeInterval = 0
                 let undrained = window.count - max(0, Int(position - winStart))
                 let frontier = winStart + Int64(window.count)
-                if activeTask == nil, undrained <= Self.winLowWater,
+                if activeTask == nil, undrained <= winLowWater,
                    isLive || fileSize <= 0 || frontier < fileSize {
                     if connEndedAtRangeEnd || connEndedByBackpressure {
                         refillFrom = frontier
@@ -2417,6 +2480,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         }
 
         if isOK {
+            if let headerMs { observeHeaderLatency(milliseconds: headerMs) }
             if let resolvedURL { recordResolvedURL(resolvedURL) }
             return true
         }

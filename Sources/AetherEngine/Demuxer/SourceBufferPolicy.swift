@@ -8,6 +8,10 @@ import Foundation
 // upstream's implementation and this file is reduced to the host tuning + telemetry channel.
 //
 // LIVE (still drive real behaviour on this build):
+//   • enabled / lowWaterSeconds / highWaterSeconds / maxWindowBytes
+//     -> AVIOReader's upstream end-at-high-water / frontier-refill mechanism. The mechanism stays
+//        upstream; only its byte thresholds are resolved from media time after stream probing.
+//   • latencyAdaptive* -> grows the requested time cushion from observed response-header latency.
 //   • starvationHoldEnabled / starvationHoldLeadSeconds / starvationResumeLeadSeconds
 //     -> SWStarvationHoldPolicy, the one source-starvation case upstream still cannot see
 //        (its guard runs at the top of the demux loop, which is blocked inside the stalled read).
@@ -16,10 +20,8 @@ import Foundation
 //     and FlexUI's Auto-quality ABR ladder has no other measured client rate on this lane.
 //
 // INERT (accepted and reported for bridge compatibility; upstream owns the behaviour now):
-//   • enabled / lowWaterSeconds / highWaterSeconds / maxWindowMB / hardCapMultiplier /
-//     keepWarmSeconds / blockSizeKB / useBlockRing / lookbackMB / seekKeepForwardMB / breaker*
-//     -> upstream bounds the window at winHighWater (16 MiB) and refills at winLowWater (8 MiB)
-//        by ENDING and re-requesting at the frontier; nothing parks a dormant socket any more.
+//   • hardCapMultiplier / keepWarmSeconds / blockSizeKB / useBlockRing / lookbackMB /
+//     seekKeepForwardMB / breaker* (the upstream bounded-range reader does not park or hard-cap).
 //   • replaceOnConnectionLoss / proactive* / capResumeAtLowWater
 //     -> upstream 4c6fa01e + 464ffe6e refill backpressure-ended AND faulted connections early,
 //        with their own failure accounting and backoff.
@@ -96,6 +98,13 @@ public struct AetherSourceBufferPolicy: Sendable, Equatable {
 
     /// Absolute ceiling on the resident forward window, whatever the duration targets ask for.
     public var maxWindowBytes: Int
+
+    /// Grow the low-water target when observed response-header latency plus the safety margin is
+    /// larger than `lowWaterSeconds`. The configured low water remains the floor.
+    public var latencyAdaptiveEnabled: Bool
+    public var latencySafetySeconds: Double
+    public var latencyHistoryLimit: Int
+    public var latencyMaxSeconds: Double
 
     /// `hardCap = highWater * this`. The hard cap is #220's bound for a transport that ignores
     /// `suspend()`; past it the connection is ended and re-requested at the frontier.
@@ -222,9 +231,13 @@ public struct AetherSourceBufferPolicy: Sendable, Equatable {
 
     public init(
         enabled: Bool = false,
-        lowWaterSeconds: Double = 15,
-        highWaterSeconds: Double = 30,
-        maxWindowBytes: Int = 128 * 1024 * 1024,
+        lowWaterSeconds: Double = 30,
+        highWaterSeconds: Double = 40,
+        maxWindowBytes: Int = 256 * 1024 * 1024,
+        latencyAdaptiveEnabled: Bool = true,
+        latencySafetySeconds: Double = 5,
+        latencyHistoryLimit: Int = 8,
+        latencyMaxSeconds: Double = 30,
         hardCapMultiplier: Double = 1.5,
         keepWarmSeconds: Double = 4,
         replaceOnConnectionLoss: Bool = true,
@@ -254,6 +267,10 @@ public struct AetherSourceBufferPolicy: Sendable, Equatable {
         self.lowWaterSeconds = lowWaterSeconds
         self.highWaterSeconds = highWaterSeconds
         self.maxWindowBytes = maxWindowBytes
+        self.latencyAdaptiveEnabled = latencyAdaptiveEnabled
+        self.latencySafetySeconds = latencySafetySeconds
+        self.latencyHistoryLimit = latencyHistoryLimit
+        self.latencyMaxSeconds = latencyMaxSeconds
         self.hardCapMultiplier = hardCapMultiplier
         self.keepWarmSeconds = keepWarmSeconds
         self.replaceOnConnectionLoss = replaceOnConnectionLoss
@@ -404,6 +421,28 @@ public enum AetherSourceBufferStock {
     public static let seekKeepForwardBytes = 8 * 1024 * 1024
 }
 
+/// Resolve the playback byte rate from the probed container and the actual file. The larger valid
+/// estimate wins: container `bit_rate` can omit overhead or tracks, while file/duration can be
+/// unavailable on forward-only sources. File SIZE alone never changes the cushion; an 88 GB movie
+/// only needs more RAM when that size also means more bytes per playback second.
+public enum AetherMediaRateResolver {
+    public static func bytesPerSecond(
+        declaredBitsPerSecond: Int64,
+        fileSize: Int64?,
+        durationSeconds: Double
+    ) -> (value: Double, source: String)? {
+        let declared = declaredBitsPerSecond > 0 ? Double(declaredBitsPerSecond) / 8 : 0
+        let resolvedSize = fileSize ?? 0
+        let average = resolvedSize > 0 && durationSeconds > 0
+            ? Double(resolvedSize) / durationSeconds
+            : 0
+        let value = max(declared, average)
+        guard value > 0, value.isFinite else { return nil }
+        if average >= declared, average > 0 { return (average, "file-size/duration") }
+        return (declared, "container-bit-rate")
+    }
+}
+
 /// The watermarks a reader actually installed, plus why. `reason` is what the diagnostics print,
 /// so the log always reports the APPLIED value rather than the requested one.
 public struct AetherResolvedWatermarks: Sendable, Equatable {
@@ -414,6 +453,8 @@ public struct AetherResolvedWatermarks: Sendable, Equatable {
     public let seekKeepForwardBytes: Int
     /// Media rate the durations were resolved against, bytes/sec. 0 when unknown (stock applied).
     public let bytesPerSecond: Double
+    public let observedHeaderLatencySeconds: Double
+    public let latencyTargetSeconds: Double
     /// `stock` | `time` | `time-clamped-memory` | `time-clamped-floor` | `breaker`
     public let reason: String
 
@@ -427,6 +468,8 @@ public struct AetherResolvedWatermarks: Sendable, Equatable {
         lookbackBytes: AetherSourceBufferStock.lookbackBytes,
         seekKeepForwardBytes: AetherSourceBufferStock.seekKeepForwardBytes,
         bytesPerSecond: 0,
+        observedHeaderLatencySeconds: 0,
+        latencyTargetSeconds: 0,
         reason: "stock"
     )
 }
@@ -442,7 +485,11 @@ public extension AetherSourceBufferPolicy {
     ///   - `high <= maxWindowBytes`, and `hardCap > high` so the cap cannot fire during normal fill.
     ///
     /// `shrinkFactor` is the memory circuit breaker (1 = untripped, 0.5 = halved, ...).
-    func resolve(bytesPerSecond: Double, shrinkFactor: Double = 1) -> AetherResolvedWatermarks {
+    func resolve(
+        bytesPerSecond: Double,
+        shrinkFactor: Double = 1,
+        observedHeaderLatencySeconds: Double = 0
+    ) -> AetherResolvedWatermarks {
         guard enabled, bytesPerSecond > 0,
               lowWaterSeconds > 0, highWaterSeconds > lowWaterSeconds else {
             return .stock
@@ -451,11 +498,18 @@ public extension AetherSourceBufferPolicy {
         let shrink = max(0.25, min(1, shrinkFactor))
         let ceiling = max(AetherSourceBufferStock.highWaterBytes, maxWindowBytes)
 
-        var reason = shrink < 1 ? "breaker" : "time"
+        let observedLatency = max(0, observedHeaderLatencySeconds)
+        let latencyTarget = latencyAdaptiveEnabled
+            ? min(max(0, latencyMaxSeconds), observedLatency + max(0, latencySafetySeconds))
+            : 0
+        let configuredGap = max(1, highWaterSeconds - lowWaterSeconds)
+        let targetLowSeconds = max(lowWaterSeconds, latencyTarget)
+        let targetHighSeconds = max(highWaterSeconds, targetLowSeconds + configuredGap)
+        var reason = shrink < 1 ? "breaker" : (targetLowSeconds > lowWaterSeconds ? "time-latency" : "time")
 
         // Duration targets -> bytes.
-        var high = Int((bytesPerSecond * highWaterSeconds * shrink).rounded())
-        var low = Int((bytesPerSecond * lowWaterSeconds * shrink).rounded())
+        var high = Int((bytesPerSecond * targetHighSeconds * shrink).rounded())
+        var low = Int((bytesPerSecond * targetLowSeconds * shrink).rounded())
 
         // Memory ceiling wins over the duration target. Preserve the low:high ratio so the
         // clamped policy still resumes with a proportionate cushion instead of collapsing onto
@@ -505,6 +559,8 @@ public extension AetherSourceBufferPolicy {
             lookbackBytes: lookback,
             seekKeepForwardBytes: seekKeep,
             bytesPerSecond: bytesPerSecond,
+            observedHeaderLatencySeconds: observedLatency,
+            latencyTargetSeconds: latencyTarget,
             reason: reason
         )
     }
@@ -536,6 +592,8 @@ public enum AetherSourceBuffer {
                 EngineLog.emit(
                     "[SourceBuffer] policy set enabled=\(newValue.enabled) "
                     + "low=\(newValue.lowWaterSeconds)s high=\(newValue.highWaterSeconds)s "
+                    + "latencyAdaptive=\(newValue.latencyAdaptiveEnabled) "
+                    + "latencySafety=\(newValue.latencySafetySeconds)s "
                     + "keepWarm=\(newValue.keepWarmSeconds)s "
                     + "maxWindowMB=\(newValue.maxWindowBytes / 1024 / 1024) "
                     + "ring=\(newValue.useBlockRing) blockKB=\(newValue.blockSizeBytes / 1024)",
@@ -721,6 +779,8 @@ public enum AetherSourceBuffer {
             out += "bufLowMB=\(a.lowWaterBytes / 1024 / 1024) "
                 + "bufHighMB=\(a.highWaterBytes / 1024 / 1024) "
                 + String(format: "bufLowS=%.1f bufHighS=%.1f ", a.lowWaterSeconds, a.highWaterSeconds)
+                + String(format: "bufHeaderS=%.1f bufLatencyTargetS=%.1f ",
+                         a.observedHeaderLatencySeconds, a.latencyTargetSeconds)
                 + "bufReason=\(a.reason) "
         }
         if p.enabled || p.keepWarmSeconds > 0 || p.replaceOnConnectionLoss {
@@ -749,6 +809,8 @@ public enum AetherSourceBuffer {
             + "lowMB=\(a.lowWaterBytes / 1024 / 1024) highMB=\(a.highWaterBytes / 1024 / 1024) "
             + "hardCapMB=\(a.hardCapBytes / 1024 / 1024) "
             + String(format: "lowS=%.1f highS=%.1f ", a.lowWaterSeconds, a.highWaterSeconds)
+            + String(format: "headerS=%.1f latencyTargetS=%.1f ",
+                     a.observedHeaderLatencySeconds, a.latencyTargetSeconds)
             + "srcKbps=\(kbps) keepWarmS=\(p.keepWarmSeconds) ring=\(p.useBlockRing)"
     }
 }
