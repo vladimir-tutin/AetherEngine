@@ -50,12 +50,12 @@ struct SWStarvationHoldPolicyTests {
     @Test("EOF is a drained file, not a starved source")
     func eofNeverHoldsAndAlwaysDrains() {
         // The tail's natural lead collapse must not freeze the last moments of the file.
-        #expect(decide(sourceEOFSeen: true, lastFedAudioPTS: 2035.20,
-                       clockSeconds: 2035.05) == .none)
+        #expect(decide(lastFedAudioPTS: 2035.20, clockSeconds: 2035.05,
+                       sourceEOFSeen: true) == .none)
         // A hold active when EOF lands resumes so the queued tail drains (mirrors the live
         // policy's sourceEnded arm).
-        #expect(decide(holdActive: true, effectiveRate: 0, sourceEOFSeen: true,
-                       lastFedAudioPTS: 2035.20, clockSeconds: 2035.1) == .resume)
+        #expect(decide(holdActive: true, effectiveRate: 0, lastFedAudioPTS: 2035.20,
+                       clockSeconds: 2035.1, sourceEOFSeen: true) == .resume)
     }
 
     @Test("the hold never fights another clock owner")
