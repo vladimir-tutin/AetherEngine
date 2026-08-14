@@ -515,7 +515,7 @@ public final class Demuxer: @unchecked Sendable {
                     : 0)
             if let rate = AetherMediaRateResolver.bytesPerSecond(
                 declaredBitsPerSecond: ctxPtr!.pointee.bit_rate,
-                fileSize: reader.knownFileSize,
+                fileSize: reader.resolvedByteSize,
                 durationSeconds: probedDuration) {
                 reader.configurePlaybackWatermarks(bytesPerSecond: rate.value, source: rate.source)
             } else {
