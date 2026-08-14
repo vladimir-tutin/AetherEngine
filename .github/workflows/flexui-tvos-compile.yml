@@ -89,7 +89,9 @@ jobs:
         run: |
           swift test --filter SourceThroughputMeterTests
           swift test --filter SourceBufferPolicyTests
-          swift test --filter SourceThrottleTests
+          swift test --filter CapRefillDecisionTests
+          swift test --filter SWStarvationHoldPolicyTests
+          swift test --filter SWClockArmPolicyTests
 
       - name: swift test
         run: swift test

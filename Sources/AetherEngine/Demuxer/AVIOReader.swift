@@ -140,6 +140,34 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         counterLock.unlock()
     }
 
+    /// FlexUI: true for the reader that serves the playing item, false for subtitle/probe
+    /// readers. Only the primary reader's link speed is a client bitrate; publishing a
+    /// subtitle fetch as "throughput" would drive FlexUI's Auto-quality ladder off a 40 KB file.
+    var isPrimaryPlaybackReader = false
+
+    /// FlexUI: active-transfer throughput accounting for the primary playback connection.
+    /// Guarded by `winCond`, which every persistent-delivery and connection-end path already
+    /// holds, so it needs no lock of its own. Upstream's own throughput figure
+    /// (`LiveTelemetrySampler`) measures the LIVE feeder, not this VOD source reader, and
+    /// FlexUI's ABR loop has no other source of a measured client rate on this lane.
+    /// See `SourceThroughputMeter` for why this cannot be bytes / wall-clock.
+    private var throughputMeter = SourceThroughputMeter()
+
+    /// Publish a completed measurement plus any rejected bursts. MUST be called with `winCond`
+    /// released: it takes `AetherSourceBuffer`'s lock.
+    private func publishThroughput(_ sample: AetherThroughputSample?, rejected: Int) {
+        guard isPrimaryPlaybackReader else { return }
+        for _ in 0..<max(0, rejected) { AetherSourceBuffer.noteThroughputRejected() }
+        guard let sample else { return }
+        AetherSourceBuffer.noteThroughput(
+            sample, window: AetherSourceBuffer.policy.throughputSampleWindow)
+        EngineLog.emit(
+            "[SourceThroughput] bps=\(sample.bitsPerSecond) kbps=\(sample.bitsPerSecond / 1000) "
+            + "bytes=\(sample.bytes) activeMs=\(sample.activeMs) "
+            + "saturated=\(sample.saturated ? 1 : 0)",
+            category: .demux)
+    }
+
     private var isStreaming: Bool { fileSize <= 0 }
 
     /// #126: a VOD source that resolved no size runs the forward-only streaming reader
@@ -2046,6 +2074,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         connEnded = false
         connEndedByBackpressure = false
         connEndedAtRangeEnd = false
+        throughputMeter.reset()   // FlexUI: a new connection is a new burst; never span the gap
         postEndDeliveryBytes = 0
         postEndOvershootLogged = false
         connRangeEnd = resolvedBound.map { offset + $0 - 1 }
@@ -2214,6 +2243,16 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 overshootToLog = postEndDeliveryBytes
             }
         }
+        // FlexUI: active-transfer throughput. Deliveries that land AFTER the backpressure end
+        // are CFNetwork draining a transport we already cancelled, so they carry no information
+        // about how fast the link is while we ARE asking — excluded, exactly as
+        // `postEndDeliveryBytes` treats them for the window accounting above.
+        var pendingSample: AetherThroughputSample? = nil
+        if isPrimaryPlaybackReader, !connEndedByBackpressure {
+            throughputMeter.config = AetherSourceBuffer.policy.throughputMeterConfig
+            pendingSample = throughputMeter.noteDelivery(
+                bytes: count, nowNs: DispatchTime.now().uptimeNanoseconds)
+        }
         let base = window.count
         window.count = base + count
         window.withUnsafeMutableBytes { dst in
@@ -2258,9 +2297,19 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             connEnded = true
             toCancel = activeTask
             activeTask = nil
+            // FlexUI: the burst ends because WE stopped asking, not because the link ran out,
+            // so the sample is a LOWER BOUND on capacity and is flagged as such for the ABR
+            // ladder. A burst the gap rule just closed leaves the meter holding only the
+            // delivery that reopened it (no active time yet), so this can only ever return the
+            // burst the high-water end actually terminated.
+            if isPrimaryPlaybackReader {
+                pendingSample = throughputMeter.end(saturated: true) ?? pendingSample
+            }
             winCond.broadcast()
         }
+        let throughputRejected = isPrimaryPlaybackReader ? throughputMeter.drainRejected() : 0
         winCond.unlock()
+        publishThroughput(pendingSample, rejected: throughputRejected)
         if let toCancel {
             EngineLog.emit(
                 "[AVIOReader] \(label) window high water: \(ahead / 1024 / 1024)MB ahead; ending the "

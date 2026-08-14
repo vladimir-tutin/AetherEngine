@@ -850,6 +850,8 @@ final class SoftwarePlaybackHost {
         if clockArmed {
             audioOutput?.pause()
         }
+        // The user now owns the rate-0 clock; a starvation hold in progress must not resume it.
+        starvationHoldActive = false
         pausedByHost = true
         rate = 0
         isPlaying = false
@@ -893,6 +895,10 @@ final class SoftwarePlaybackHost {
         guard let dem = demuxer else { return .stalled }
         // Stop loop + bump generation to invalidate in-flight packets. Captured right after, so the
         // reposition can tell on `seekQueue` whether a newer seek has already taken over.
+        // The seek re-anchors and owns the rate from here; a hold in progress ends without
+        // resuming, and the pre-seek fed PTS must not be compared against the new playhead.
+        starvationHoldActive = false
+        demuxDiag.reset()
         bumpSeekGeneration()
         let generation = seekGeneration
         // #292: inside another seek's window `isPlaying` is that seek's parked flag, not the transport's
@@ -1378,6 +1384,7 @@ final class SoftwarePlaybackHost {
         }
 
         let diag = demuxDiag
+        diag.reset()   // FlexUI: no fed PTS or EOF latch may survive into a new session
         demuxQueue.async {
             Self.runDemuxLoop(
                 demuxer: dem,
@@ -2157,6 +2164,7 @@ final class SoftwarePlaybackHost {
                 // Play the parked tail out before the flush: nothing more will arrive, the queues
                 // must drain to end-of-media. The wait lifts a rebuffer hold on its own - held,
                 // the clock would never take the tail and end-of-media would never be reached.
+                diag?.noteSourceEOF()   // FlexUI: before the drain, so the hold cannot re-engage
                 releaseRebufferHold("end of media, nothing left to rebuffer from")
                 waitForRenderer(.drainAll)
                 freeParkedVideo()
@@ -2481,6 +2489,7 @@ final class SoftwarePlaybackHost {
                 if self.isLive, let edge = self.liveEdgeSessionTime {
                     self.onLiveEdge?(edge)
                 }
+                self.runStarvationHold(aOut)
                 self.runRateWedgeWatchdog(aOut)
             }
     }
@@ -2549,6 +2558,74 @@ final class SoftwarePlaybackHost {
         }
     }
 
+    // MARK: - VOD starvation clock hold
+
+    /// True while the starvation watchdog holds the master clock at rate 0.
+    private var starvationHoldActive = false
+    private var starvationHoldCount = 0
+
+    /// One tick of `SWStarvationHoldPolicy` (see that file for the field capture).
+    ///
+    /// Upstream's `applyAudioClockAction` inside `runDemuxLoop` is the primary VOD underrun
+    /// guard and covers DECODE-lag starvation. It cannot cover SOURCE starvation: it runs at the
+    /// top of the loop, immediately before `demuxer.readPacket()`, so when the origin stalls
+    /// INSIDE that read (measured: a 6.4 s range response from a server that normally answers in
+    /// 21 ms) the loop is blocked and evaluates nothing while the free-running synchronizer clock
+    /// runs away - freeze, then fast-forward on recovery. This 0.25 s time tick is the only
+    /// thread still alive during that stall, so it carries the same policy as a backstop.
+    /// Resume is in place: no seek, no re-anchor.
+    private func runStarvationHold(_ aOut: AudioOutput) {
+        let policy = AetherSourceBuffer.policy
+        let d = demuxDiag.snapshot
+        let lastFed = d.lastAudioPts
+        let clockSeconds = aOut.currentTimeSeconds
+        let action = SWStarvationHoldPolicy.decide(
+            holdActive: starvationHoldActive,
+            enabled: policy.starvationHoldEnabled,
+            isLive: isLive,
+            clockArmed: clockArmed,
+            isPlaying: isPlaying,
+            requestedRate: lastRate,
+            effectiveRate: aOut.effectiveRate,
+            lastFedAudioPTS: lastFed,
+            clockSeconds: clockSeconds,
+            sourceEOFSeen: d.sourceEOF,
+            holdLeadSeconds: policy.starvationHoldLeadSeconds,
+            resumeLeadSeconds: policy.starvationResumeLeadSeconds
+        )
+        switch action {
+        case .none:
+            return
+        case .hold:
+            starvationHoldActive = true
+            starvationHoldCount += 1
+            AetherSourceBuffer.noteStarvationHold()
+            EngineLog.emit(
+                "[SWHost] source underrun: pausing clock to rebuffer (hold #\(starvationHoldCount) "
+                + "lead=\(String(format: "%.2f", lastFed - clockSeconds))s "
+                + "clockS=\(String(format: "%.2f", clockSeconds)) "
+                + "lastFedPts=\(String(format: "%.2f", lastFed)))",
+                category: .swPlayback
+            )
+            aOut.pause()
+        case .resume:
+            starvationHoldActive = false
+            EngineLog.emit(
+                "[SWHost] rebuffered: resuming clock in place "
+                + "(lead=\(lastFed.isFinite ? String(format: "%.2f", lastFed - clockSeconds) : "nan")s "
+                + "clockS=\(String(format: "%.2f", clockSeconds)) rate=\(lastRate))",
+                category: .swPlayback
+            )
+            aOut.setRate(lastRate)
+        case .release:
+            starvationHoldActive = false
+            EngineLog.emit(
+                "[SWHost] starvation hold released without resume (clock ownership changed)",
+                category: .swPlayback
+            )
+        }
+    }
+
     // MARK: - Deferred-rate-change wedge watchdog
 
     /// Consecutive timer ticks the synchronizer has spent at effective rate 0 while the host wants
@@ -2565,7 +2642,11 @@ final class SoftwarePlaybackHost {
     /// but effective rate 0 for 3 s of ticks) and run that seek at the current position.
     /// Live sessions are excluded: their rebuffer hold legitimately parks the clock mid-play.
     private func runRateWedgeWatchdog(_ aOut: AudioOutput) {
-        guard isPlaying, clockArmed, !isLive, lastRate > 0, aOut.effectiveRate == 0 else {
+        // A starvation hold - and upstream's own decoupled rebuffer hold, which reports through
+        // the same diag state - parks the clock at rate 0 on purpose. The wedge recovery's
+        // flush-and-seek would destroy the held position mid-rebuffer.
+        guard isPlaying, clockArmed, !isLive, lastRate > 0, aOut.effectiveRate == 0,
+              !starvationHoldActive, !demuxDiag.snapshot.rebuffering else {
             rateWedgeTicks = 0
             return
         }
@@ -2618,6 +2699,10 @@ final class SWPlaybackDiagState: @unchecked Sendable {
     private var _lastAudioPts = Double.nan
     private var _parked = 0
     private var _rebuffering = false
+    /// FlexUI: set once the demux loop has read past the last packet. The starvation hold must
+    /// never engage on the natural end-of-file lead collapse, and a hold that is active when EOF
+    /// lands must resume so the queued tail drains (`SWStarvationHoldPolicy`).
+    private var _sourceEOF = false
 
     func update(lastAudioPts: Double, parked: Int, rebuffering: Bool) {
         lock.lock()
@@ -2627,9 +2712,26 @@ final class SWPlaybackDiagState: @unchecked Sendable {
         lock.unlock()
     }
 
-    var snapshot: (lastAudioPts: Double, parked: Int, rebuffering: Bool) {
+    func noteSourceEOF() {
+        lock.lock()
+        _sourceEOF = true
+        lock.unlock()
+    }
+
+    /// Called when a session or a seek restarts the loop: a stale fed PTS or EOF latch would
+    /// make the hold decide against the previous playhead.
+    func reset() {
+        lock.lock()
+        _lastAudioPts = .nan
+        _parked = 0
+        _rebuffering = false
+        _sourceEOF = false
+        lock.unlock()
+    }
+
+    var snapshot: (lastAudioPts: Double, parked: Int, rebuffering: Bool, sourceEOF: Bool) {
         lock.lock()
         defer { lock.unlock() }
-        return (_lastAudioPts, _parked, _rebuffering)
+        return (_lastAudioPts, _parked, _rebuffering, _sourceEOF)
     }
 }

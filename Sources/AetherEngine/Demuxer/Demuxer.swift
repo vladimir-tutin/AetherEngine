@@ -458,6 +458,9 @@ public final class Demuxer: @unchecked Sendable {
             boundedInitialFetch: openProfile.boundedInitialFetch,
             sequentialOnly: openProfile.avioSequentialOnly
         )
+        // FlexUI: only this reader's link speed is a client bitrate. Subtitle/probe readers
+        // fetch tens of KB and would poison the measured rate the ABR ladder reads.
+        reader.isPrimaryPlaybackReader = true
         reader.onNetworkPhaseChanged = onNetworkPhaseChanged
         try openWithProvider(reader, isLive: isLive)
     }
