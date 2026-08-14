@@ -18,8 +18,11 @@ struct SWStarvationHoldPolicyTests {
         isPlaying: Bool = true,
         requestedRate: Float = 1,
         effectiveRate: Float = 1,
+        // Default lead ≈ 0.10 s: decisively INSIDE the 0.15 s hold threshold, so every guard
+        // tested against these defaults is the actual reason a hold does not engage. (An exact
+        // 0.15 gap is unusable: 2035.20 - 2035.05 rounds just above 0.15 in binary Double.)
         lastFedAudioPTS: Double = 2035.20,
-        clockSeconds: Double = 2035.05,
+        clockSeconds: Double = 2035.10,
         sourceEOFSeen: Bool = false,
         holdLeadSeconds: Double = 0.15,
         resumeLeadSeconds: Double = 2.0
@@ -34,7 +37,7 @@ struct SWStarvationHoldPolicyTests {
 
     @Test("the lead collapsing to the threshold engages the hold")
     func holdsAtThreshold() {
-        #expect(decide(lastFedAudioPTS: 2035.20, clockSeconds: 2035.05) == .hold)
+        #expect(decide() == .hold)
         // A healthy 1.38 s lead (the capture's steady state) never holds.
         #expect(decide(lastFedAudioPTS: 2035.10, clockSeconds: 2033.73) == .none)
     }
@@ -49,9 +52,9 @@ struct SWStarvationHoldPolicyTests {
 
     @Test("EOF is a drained file, not a starved source")
     func eofNeverHoldsAndAlwaysDrains() {
-        // The tail's natural lead collapse must not freeze the last moments of the file.
-        #expect(decide(lastFedAudioPTS: 2035.20, clockSeconds: 2035.05,
-                       sourceEOFSeen: true) == .none)
+        // The tail's natural lead collapse must not freeze the last moments of the file: the
+        // defaults are hold-eligible, so EOF is the only thing standing between this and .hold.
+        #expect(decide(sourceEOFSeen: true) == .none)
         // A hold active when EOF lands resumes so the queued tail drains (mirrors the live
         // policy's sourceEnded arm).
         #expect(decide(holdActive: true, effectiveRate: 0, lastFedAudioPTS: 2035.20,
