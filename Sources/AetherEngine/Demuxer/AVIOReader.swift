@@ -2340,14 +2340,6 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         if let end = connRangeEnd, winStart + Int64(window.count) > end {
             connEndedAtRangeEnd = true
             connEnded = true
-            // A bounded range ending is a completed active transfer, not a meter reset boundary.
-            // Previously only the high-water cancellation closed the burst; ordinary 32 MiB
-            // ranges reached this branch, then startConnectionLocked() silently reset the meter.
-            // On device that produced one sample across 52 ranges while playback repeatedly
-            // exhausted its source buffer, leaving Auto blind to the actual sustained rate.
-            if isPrimaryPlaybackReader {
-                pendingSample = throughputMeter.end(saturated: false) ?? pendingSample
-            }
         }
         winCond.broadcast()
         // #310: past high water the connection is ENDED, not suspended. suspend() is

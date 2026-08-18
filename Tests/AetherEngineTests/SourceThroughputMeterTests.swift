@@ -42,21 +42,6 @@ struct SourceThroughputMeterTests {
         #expect(sample?.saturated == true)
     }
 
-    @Test("A bounded range end publishes an unsaturated completed-transfer sample")
-    func boundedRangeEndPublishesSample() {
-        var meter = SourceThroughputMeter(config: fastConfig())
-        var now: UInt64 = 0
-        _ = meter.noteDelivery(bytes: Self.tickBytes, nowNs: now)
-        for _ in 0..<5 {
-            now &+= Self.tickNs
-            _ = meter.noteDelivery(bytes: Self.tickBytes, nowNs: now)
-        }
-        // AVIOReader invokes this exact boundary when its finite byte range is delivered in full.
-        let sample = meter.end(saturated: false)
-        #expect(sample?.bitsPerSecond == 10_000_000)
-        #expect(sample?.saturated == false)
-    }
-
     /// The defect this whole meter exists for: a parked reader delivers a burst, sits idle for
     /// seconds, delivers another. Wall-clock division over that span reports the media rate.
     @Test("Park time between bursts is excluded, so the estimate is not the media bitrate")
