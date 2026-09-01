@@ -918,8 +918,8 @@ final class SoftwarePlaybackHost {
                 aOut.seekClock(to: targetTime, rate: 0)
                 EngineLog.emit(
                     "[SWSeekClock] action=pin-at-entry mechanism=rate-zero-before-flush "
-                    + "from=\(String(format: \"%.3f\", previousClock))s "
-                    + "target=\(String(format: \"%.3f\", seconds))s "
+                    + "from=\(String(format: "%.3f", previousClock))s "
+                    + "target=\(String(format: "%.3f", seconds))s "
                     + "resumeIntent=\(wasPlaying ? 1 : 0) decision=hold-until-reposition-landed",
                     category: .swPlayback
                 )
@@ -927,7 +927,7 @@ final class SoftwarePlaybackHost {
                 EngineLog.emit(
                     "[SWSeekClock] action=bypass-at-entry enabled="
                     + "\(AetherSourceBuffer.policy.seekClockPinningEnabled ? 1 : 0) "
-                    + "target=\(String(format: \"%.3f\", seconds))s mechanism=legacy-running-clock",
+                    + "target=\(String(format: "%.3f", seconds))s mechanism=legacy-running-clock",
                     category: .swPlayback
                 )
             }
@@ -2178,7 +2178,7 @@ final class SoftwarePlaybackHost {
                         let clock = audioOutput?.currentTimeSeconds ?? .nan
                         EngineLog.emit(
                             "[SWStartupPacing] action=hold-read mechanism=pre-arm-audio-lead "
-                            + "lead=\(String(format: \"%.2f\", lastEnqueuedAudioPtsSec - clock))s "
+                            + "lead=\(String(format: "%.2f", lastEnqueuedAudioPtsSec - clock))s "
                             + "parked=\(parkedVideo.count)/\(parkedVideoCap) decision=protect-fifo-headroom",
                             category: .swPlayback
                         )
@@ -2677,7 +2677,7 @@ final class SoftwarePlaybackHost {
                 "[SWStarvationRecovery] action=release-hold "
                 + "mechanism=full-parked-fifo+healthy-source "
                 + "parked=\(d.parked)/256 sourceAheadBytes=\(sourceAheadBytes) "
-                + "lead=\(String(format: \"%.2f\", lastFed - clockSeconds))s "
+                + "lead=\(String(format: "%.2f", lastFed - clockSeconds))s "
                 + "decision=resume-clock-to-drain-backpressure",
                 category: .swPlayback
             )
@@ -2689,7 +2689,7 @@ final class SoftwarePlaybackHost {
                     "[SWStarvationRecovery] action=suppress-hold "
                     + "mechanism=full-parked-fifo+healthy-source "
                     + "parked=\(d.parked)/256 sourceAheadBytes=\(sourceAheadBytes) "
-                    + "lead=\(String(format: \"%.2f\", lastFed - clockSeconds))s "
+                    + "lead=\(String(format: "%.2f", lastFed - clockSeconds))s "
                     + "decision=keep-clock-running-to-drain-backpressure",
                     category: .swPlayback
                 )
