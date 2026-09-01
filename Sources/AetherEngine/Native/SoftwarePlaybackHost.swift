@@ -2620,6 +2620,18 @@ final class SoftwarePlaybackHost {
         let clockSeconds = aOut.currentTimeSeconds
         let sourceWindow = demuxer?.ioWindowDiagnostics
         let sourceAheadBytes = sourceWindow?.aheadBytes ?? 0
+        let selfInflictedBackpressure = policy.backpressureHoldRecoveryEnabled
+            && d.parked >= 256
+            && sourceAheadBytes >= policy.backpressureHoldMinAheadBytes
+        if backpressureHoldRecoveryActive, !selfInflictedBackpressure {
+            backpressureHoldRecoveryActive = false
+            EngineLog.emit(
+                "[SWStarvationRecovery] action=clear mechanism=backpressure-condition-ended "
+                + "parked=\(d.parked)/256 sourceAheadBytes=\(sourceAheadBytes) "
+                + "decision=restore-normal-starvation-policy",
+                category: .swPlayback
+            )
+        }
         let action = SWStarvationHoldPolicy.decide(
             holdActive: starvationHoldActive,
             enabled: policy.starvationHoldEnabled,
