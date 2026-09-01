@@ -34,6 +34,11 @@ enum SWStarvationHoldPolicy {
         /// Someone else took clock ownership while held (user pause, seek, teardown): clear the
         /// hold state and do not touch the clock.
         case release
+        /// The hold itself created the starvation by freezing a full parked-video FIFO while
+        /// source bytes remain available. Resume the clock so video can drain and reads continue.
+        case recoverBackpressure
+        /// Do not engage a new hold under that same self-inflicted backpressure condition.
+        case suppressBackpressure
     }
 
     // swiftlint:disable:next function_parameter_count
@@ -49,7 +54,12 @@ enum SWStarvationHoldPolicy {
         clockSeconds: Double,
         sourceEOFSeen: Bool,
         holdLeadSeconds: Double,
-        resumeLeadSeconds: Double
+        resumeLeadSeconds: Double,
+        backpressureRecoveryEnabled: Bool,
+        parkedVideoCount: Int,
+        parkedVideoCap: Int,
+        sourceAheadBytes: Int,
+        minSourceAheadBytes: Int
     ) -> Action {
         // Live sessions own their rebuffer hold in the feeder pump; never double-manage.
         guard !isLive else { return holdActive ? .release : .none }
@@ -66,6 +76,11 @@ enum SWStarvationHoldPolicy {
             // policy's `sourceEnded` arm).
             if sourceEOFSeen { return .resume }
             if lead.isFinite, lead >= resumeLeadSeconds { return .resume }
+            if backpressureRecoveryEnabled,
+               parkedVideoCount >= parkedVideoCap,
+               sourceAheadBytes >= minSourceAheadBytes {
+                return .recoverBackpressure
+            }
             return .none
         }
 
@@ -78,6 +93,11 @@ enum SWStarvationHoldPolicy {
         guard !sourceEOFSeen else { return .none }
         // NaN lead = no audio fed yet this session/seek (or an audio-less file): no basis to hold.
         guard lead.isFinite, lead <= holdLeadSeconds else { return .none }
+        if backpressureRecoveryEnabled,
+           parkedVideoCount >= parkedVideoCap,
+           sourceAheadBytes >= minSourceAheadBytes {
+            return .suppressBackpressure
+        }
         return .hold
     }
 }

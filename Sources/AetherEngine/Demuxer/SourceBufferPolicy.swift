@@ -176,6 +176,24 @@ public struct AetherSourceBufferPolicy: Sendable, Equatable {
     /// Release the hold once the lead has rebuilt to this many seconds.
     public var starvationResumeLeadSeconds: Double
 
+    /// Pace the combined software-decoder read loop by decoded-audio lead even before the
+    /// synchronizer has completed its first clock arm. Without this, startup can fill the
+    /// 256-packet parked-video FIFO while audio holds only a few seconds, turning the memory
+    /// backstop into the pacing owner before playback has begun.
+    public var preArmLeadPacingEnabled: Bool
+
+    /// If the starvation hold is active while the parked-video FIFO is full and the source
+    /// reader still has a healthy byte cushion, the starvation is self-inflicted backpressure:
+    /// the held clock prevents video drain, which prevents reads, which prevents audio refill.
+    /// This kill switch allows the host to resume/suppress the hold so the FIFO can drain.
+    public var backpressureHoldRecoveryEnabled: Bool
+    /// Minimum source bytes ahead required to classify a full-FIFO hold as self-inflicted.
+    public var backpressureHoldMinAheadBytes: Int
+
+    /// Pin the software-path master clock at the seek target with rate 0 before any decoder or
+    /// renderer flush. The landing re-applies the requested rate only after reposition completes.
+    public var seekClockPinningEnabled: Bool
+
     /// Allocation granularity of the block-ring window.
     public var blockSizeBytes: Int
 
@@ -247,6 +265,10 @@ public struct AetherSourceBufferPolicy: Sendable, Equatable {
         starvationHoldEnabled: Bool = true,
         starvationHoldLeadSeconds: Double = 0.15,
         starvationResumeLeadSeconds: Double = 2.0,
+        preArmLeadPacingEnabled: Bool = true,
+        backpressureHoldRecoveryEnabled: Bool = true,
+        backpressureHoldMinAheadBytes: Int = 1024 * 1024,
+        seekClockPinningEnabled: Bool = true,
         blockSizeBytes: Int = 1024 * 1024,
         useBlockRing: Bool = true,
         lookbackBytes: Int = 2 * 1024 * 1024,
@@ -280,6 +302,10 @@ public struct AetherSourceBufferPolicy: Sendable, Equatable {
         self.starvationHoldEnabled = starvationHoldEnabled
         self.starvationHoldLeadSeconds = starvationHoldLeadSeconds
         self.starvationResumeLeadSeconds = starvationResumeLeadSeconds
+        self.preArmLeadPacingEnabled = preArmLeadPacingEnabled
+        self.backpressureHoldRecoveryEnabled = backpressureHoldRecoveryEnabled
+        self.backpressureHoldMinAheadBytes = backpressureHoldMinAheadBytes
+        self.seekClockPinningEnabled = seekClockPinningEnabled
         self.blockSizeBytes = blockSizeBytes
         self.useBlockRing = useBlockRing
         self.lookbackBytes = lookbackBytes
@@ -324,6 +350,9 @@ public struct AetherSourceBufferPolicy: Sendable, Equatable {
         replaceOnConnectionLoss: false,
         capResumeAtLowWater: false,
         starvationHoldEnabled: false,
+        preArmLeadPacingEnabled: false,
+        backpressureHoldRecoveryEnabled: false,
+        seekClockPinningEnabled: false,
         useBlockRing: false,
         throughputEnabled: false
     )

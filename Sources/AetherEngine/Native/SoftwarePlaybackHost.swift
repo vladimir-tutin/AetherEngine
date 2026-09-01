@@ -543,12 +543,14 @@ final class SoftwarePlaybackHost {
         parkedCap: Int,
         clockArmed: Bool,
         lastAudioPts: Double,
-        clockSeconds: Double
+        clockSeconds: Double,
+        preArmLeadPacingEnabled: Bool = true
     ) -> Bool {
         if parkedCount >= parkedCap { return true }
-        guard clockArmed, clockSeconds.isFinite else { return false }
+        guard (clockArmed || preArmLeadPacingEnabled), clockSeconds.isFinite else { return false }
+        if !clockArmed, !lastAudioPts.isFinite { return false }
         return AudioLookaheadPolicy.decide(
-            clockArmed: true,
+            clockArmed: true, // the finite initial anchor makes lead meaningful for this gate
             preArmPacketsFed: 0,
             lastFedAudioPTS: lastAudioPts,
             clockSeconds: clockSeconds
@@ -907,6 +909,29 @@ final class SoftwarePlaybackHost {
                                                   seekInFlight: seekInFlight,
                                                   inFlightIntent: inFlightSeekResumeIntent)
         inFlightSeekResumeIntent = wasPlaying
+        let targetTime = CMTime(seconds: seconds, preferredTimescale: 90000)
+        if !isLive {
+            currentTime = seconds
+            seekInFlight = true
+            if AetherSourceBuffer.policy.seekClockPinningEnabled, let aOut = audioOutput {
+                let previousClock = aOut.currentTimeSeconds
+                aOut.seekClock(to: targetTime, rate: 0)
+                EngineLog.emit(
+                    "[SWSeekClock] action=pin-at-entry mechanism=rate-zero-before-flush "
+                    + "from=\(String(format: \"%.3f\", previousClock))s "
+                    + "target=\(String(format: \"%.3f\", seconds))s "
+                    + "resumeIntent=\(wasPlaying ? 1 : 0) decision=hold-until-reposition-landed",
+                    category: .swPlayback
+                )
+            } else {
+                EngineLog.emit(
+                    "[SWSeekClock] action=bypass-at-entry enabled="
+                    + "\(AetherSourceBuffer.policy.seekClockPinningEnabled ? 1 : 0) "
+                    + "target=\(String(format: \"%.3f\", seconds))s mechanism=legacy-running-clock",
+                    category: .swPlayback
+                )
+            }
+        }
         isPlaying = false
 
         videoDecoder.flush()
@@ -925,8 +950,6 @@ final class SoftwarePlaybackHost {
 
         // Publish the target and hold it across the await, so the scrub clock snaps the way the native
         // path's optimistic publish does instead of drifting on the stale synchronizer anchor.
-        currentTime = seconds
-        seekInFlight = true
         let outcome = await dem.seekBounded(
             to: seconds, timeout: Self.seekBudgetSeconds, on: seekQueue,
             isSuperseded: { [weak self] in self?.seekGeneration != generation })
@@ -947,7 +970,6 @@ final class SoftwarePlaybackHost {
             startSideAudioTrack(index: sideIndex, at: seconds, completion: nil)
         }
 
-        let targetTime = CMTime(seconds: seconds, preferredTimescale: 90000)
         videoDecoder.skipUntilPTS = targetTime
         renderer.setSkipThreshold(targetTime)
 
@@ -1950,6 +1972,7 @@ final class SoftwarePlaybackHost {
         // pump get it from the DVR feeder arm on its own thread.
         var parkedVideo: [UnsafeMutablePointer<AVPacket>] = []
         let parkedVideoCap = 256
+        var loggedStartupLeadPacing = false
         var lastEnqueuedAudioPtsSec = Double.nan
         var rebuffering = false
         // The pause/rebuffer arm stays off until the source has proven it can deliver a real
@@ -2028,7 +2051,8 @@ final class SoftwarePlaybackHost {
                     return Self.shouldHoldDemuxRead(
                         parkedCount: parkedVideo.count, parkedCap: parkedVideoCap,
                         clockArmed: clockArmed(), lastAudioPts: lastEnqueuedAudioPtsSec,
-                        clockSeconds: audioOutput?.currentTimeSeconds ?? .nan)
+                        clockSeconds: audioOutput?.currentTimeSeconds ?? .nan,
+                        preArmLeadPacingEnabled: AetherSourceBuffer.policy.preArmLeadPacingEnabled)
                 case .drainAll:
                     return !parkedVideo.isEmpty
                 }
@@ -2141,10 +2165,24 @@ final class SoftwarePlaybackHost {
                 // is the memory backstop, not the pacing rule - what bounds the lead has to be
                 // the lead itself, or the effective ceiling becomes "however many seconds of
                 // video fit in 256 packets" and moves with frame rate.
-                if Self.shouldHoldDemuxRead(
+                let readHeld = Self.shouldHoldDemuxRead(
                     parkedCount: parkedVideo.count, parkedCap: parkedVideoCap,
                     clockArmed: clockArmed(), lastAudioPts: lastEnqueuedAudioPtsSec,
-                    clockSeconds: audioOutput?.currentTimeSeconds ?? .nan) {
+                    clockSeconds: audioOutput?.currentTimeSeconds ?? .nan,
+                    preArmLeadPacingEnabled: AetherSourceBuffer.policy.preArmLeadPacingEnabled)
+                if readHeld {
+                    if !clockArmed(), !loggedStartupLeadPacing,
+                       parkedVideo.count < parkedVideoCap,
+                       AetherSourceBuffer.policy.preArmLeadPacingEnabled {
+                        loggedStartupLeadPacing = true
+                        let clock = audioOutput?.currentTimeSeconds ?? .nan
+                        EngineLog.emit(
+                            "[SWStartupPacing] action=hold-read mechanism=pre-arm-audio-lead "
+                            + "lead=\(String(format: \"%.2f\", lastEnqueuedAudioPtsSec - clock))s "
+                            + "parked=\(parkedVideo.count)/\(parkedVideoCap) decision=protect-fifo-headroom",
+                            category: .swPlayback
+                        )
+                    }
                     waitForRenderer(.readGate)
                     return true
                 }
@@ -2563,6 +2601,7 @@ final class SoftwarePlaybackHost {
     /// True while the starvation watchdog holds the master clock at rate 0.
     private var starvationHoldActive = false
     private var starvationHoldCount = 0
+    private var backpressureHoldRecoveryActive = false
 
     /// One tick of `SWStarvationHoldPolicy` (see that file for the field capture).
     ///
@@ -2579,6 +2618,8 @@ final class SoftwarePlaybackHost {
         let d = demuxDiag.snapshot
         let lastFed = d.lastAudioPts
         let clockSeconds = aOut.currentTimeSeconds
+        let sourceWindow = demuxer?.ioWindowDiagnostics
+        let sourceAheadBytes = sourceWindow?.aheadBytes ?? 0
         let action = SWStarvationHoldPolicy.decide(
             holdActive: starvationHoldActive,
             enabled: policy.starvationHoldEnabled,
@@ -2591,7 +2632,12 @@ final class SoftwarePlaybackHost {
             clockSeconds: clockSeconds,
             sourceEOFSeen: d.sourceEOF,
             holdLeadSeconds: policy.starvationHoldLeadSeconds,
-            resumeLeadSeconds: policy.starvationResumeLeadSeconds
+            resumeLeadSeconds: policy.starvationResumeLeadSeconds,
+            backpressureRecoveryEnabled: policy.backpressureHoldRecoveryEnabled,
+            parkedVideoCount: d.parked,
+            parkedVideoCap: 256,
+            sourceAheadBytes: sourceAheadBytes,
+            minSourceAheadBytes: policy.backpressureHoldMinAheadBytes
         )
         switch action {
         case .none:
@@ -2619,10 +2665,35 @@ final class SoftwarePlaybackHost {
             aOut.setRate(lastRate)
         case .release:
             starvationHoldActive = false
+            backpressureHoldRecoveryActive = false
             EngineLog.emit(
                 "[SWHost] starvation hold released without resume (clock ownership changed)",
                 category: .swPlayback
             )
+        case .recoverBackpressure:
+            starvationHoldActive = false
+            backpressureHoldRecoveryActive = true
+            EngineLog.emit(
+                "[SWStarvationRecovery] action=release-hold "
+                + "mechanism=full-parked-fifo+healthy-source "
+                + "parked=\(d.parked)/256 sourceAheadBytes=\(sourceAheadBytes) "
+                + "lead=\(String(format: \"%.2f\", lastFed - clockSeconds))s "
+                + "decision=resume-clock-to-drain-backpressure",
+                category: .swPlayback
+            )
+            aOut.setRate(lastRate)
+        case .suppressBackpressure:
+            if !backpressureHoldRecoveryActive {
+                backpressureHoldRecoveryActive = true
+                EngineLog.emit(
+                    "[SWStarvationRecovery] action=suppress-hold "
+                    + "mechanism=full-parked-fifo+healthy-source "
+                    + "parked=\(d.parked)/256 sourceAheadBytes=\(sourceAheadBytes) "
+                    + "lead=\(String(format: \"%.2f\", lastFed - clockSeconds))s "
+                    + "decision=keep-clock-running-to-drain-backpressure",
+                    category: .swPlayback
+                )
+            }
         }
     }
 

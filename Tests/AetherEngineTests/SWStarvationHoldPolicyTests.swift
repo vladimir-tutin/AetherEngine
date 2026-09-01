@@ -32,7 +32,9 @@ struct SWStarvationHoldPolicyTests {
             isPlaying: isPlaying, requestedRate: requestedRate, effectiveRate: effectiveRate,
             lastFedAudioPTS: lastFedAudioPTS, clockSeconds: clockSeconds,
             sourceEOFSeen: sourceEOFSeen, holdLeadSeconds: holdLeadSeconds,
-            resumeLeadSeconds: resumeLeadSeconds)
+            resumeLeadSeconds: resumeLeadSeconds,
+            backpressureRecoveryEnabled: true, parkedVideoCount: 0,
+            parkedVideoCap: 256, sourceAheadBytes: 0, minSourceAheadBytes: 1024 * 1024)
     }
 
     @Test("the lead collapsing to the threshold engages the hold")
@@ -91,5 +93,30 @@ struct SWStarvationHoldPolicyTests {
     func killSwitchResumesMidHold() {
         #expect(decide(enabled: false) == .none)
         #expect(decide(holdActive: true, enabled: false, effectiveRate: 0) == .resume)
+    }
+
+    @Test("full video backpressure with buffered source cannot hold the clock")
+    func selfInflictedBackpressureRecovery() {
+        let common = (
+            enabled: true, isLive: false, clockArmed: true, isPlaying: true,
+            requestedRate: Float(1), lastFed: 2035.20, clock: 2035.10)
+        #expect(SWStarvationHoldPolicy.decide(
+            holdActive: true, enabled: common.enabled, isLive: common.isLive,
+            clockArmed: common.clockArmed, isPlaying: common.isPlaying,
+            requestedRate: common.requestedRate, effectiveRate: 0,
+            lastFedAudioPTS: common.lastFed, clockSeconds: common.clock,
+            sourceEOFSeen: false, holdLeadSeconds: 0.15, resumeLeadSeconds: 2,
+            backpressureRecoveryEnabled: true, parkedVideoCount: 256,
+            parkedVideoCap: 256, sourceAheadBytes: 40 * 1024 * 1024,
+            minSourceAheadBytes: 1024 * 1024) == .recoverBackpressure)
+        #expect(SWStarvationHoldPolicy.decide(
+            holdActive: false, enabled: common.enabled, isLive: common.isLive,
+            clockArmed: common.clockArmed, isPlaying: common.isPlaying,
+            requestedRate: common.requestedRate, effectiveRate: 1,
+            lastFedAudioPTS: common.lastFed, clockSeconds: common.clock,
+            sourceEOFSeen: false, holdLeadSeconds: 0.15, resumeLeadSeconds: 2,
+            backpressureRecoveryEnabled: true, parkedVideoCount: 256,
+            parkedVideoCap: 256, sourceAheadBytes: 40 * 1024 * 1024,
+            minSourceAheadBytes: 1024 * 1024) == .suppressBackpressure)
     }
 }

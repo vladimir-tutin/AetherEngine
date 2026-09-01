@@ -35,14 +35,15 @@ struct SWDemuxReadGateTests {
             lastAudioPts: clock + 0.1, clockSeconds: clock) == true)
     }
 
-    /// #337: before the clock is armed the lead is meaningless and the loop is the only reader.
-    /// Holding here parks forever - the clock waits for an audio buffer that only a further read
-    /// can produce. Only the cap may hold, and the parked-video arming exit runs at that point.
-    @Test("an unarmed clock never holds on the lead, only on the cap")
-    func unarmedClockKeepsReading() {
+    @Test("a finite pre-arm lead protects FIFO headroom")
+    func preArmLeadPacesReads() {
         #expect(SoftwarePlaybackHost.shouldHoldDemuxRead(
             parkedCount: 10, parkedCap: cap, clockArmed: false,
-            lastAudioPts: 1_000, clockSeconds: 0) == false)
+            lastAudioPts: AudioLookaheadPolicy.targetLeadSeconds, clockSeconds: 0) == true)
+        #expect(SoftwarePlaybackHost.shouldHoldDemuxRead(
+            parkedCount: 10, parkedCap: cap, clockArmed: false,
+            lastAudioPts: AudioLookaheadPolicy.targetLeadSeconds, clockSeconds: 0,
+            preArmLeadPacingEnabled: false) == false)
         #expect(SoftwarePlaybackHost.shouldHoldDemuxRead(
             parkedCount: cap, parkedCap: cap, clockArmed: false,
             lastAudioPts: 1_000, clockSeconds: 0) == true)
