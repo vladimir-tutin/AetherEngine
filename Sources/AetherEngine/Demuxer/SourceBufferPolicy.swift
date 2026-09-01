@@ -194,6 +194,22 @@ public struct AetherSourceBufferPolicy: Sendable, Equatable {
     /// renderer flush. The landing re-applies the requested rate only after reposition completes.
     public var seekClockPinningEnabled: Bool
 
+    /// Read the audio lead from the renderer-ownership gate (side reader OR main demux, whichever
+    /// enqueued last) instead of the main demux loop's private counter. An in-place audio track
+    /// switch freezes that counter at the switch point — the gate drops main-demux audio while a
+    /// side reader owns the renderer — and every clock governor then acts on a frozen lead:
+    /// reads free-run to the parked cap, the clock is paused/released ~25x a second, video crawls
+    /// and audio dies. OFF restores the frozen-counter accounting.
+    public var sideAudioLeadTrackingEnabled: Bool
+
+    /// Recovery of last resort for a runaway clock: when the master clock has run
+    /// `negativeLeadReseekSeconds` AHEAD of the last audio actually fed for 2 s sustained, every
+    /// queued sample is in the clock's past and silence is permanent — a sample-buffer renderer
+    /// never rewinds its timebase for late audio. Run the proven flush-and-reanchor seek at the
+    /// CURRENT clock position (playback continues forward; only the already-silent gap is lost).
+    public var negativeLeadReseekEnabled: Bool
+    public var negativeLeadReseekSeconds: Double
+
     /// Allocation granularity of the block-ring window.
     public var blockSizeBytes: Int
 
@@ -269,6 +285,9 @@ public struct AetherSourceBufferPolicy: Sendable, Equatable {
         backpressureHoldRecoveryEnabled: Bool = true,
         backpressureHoldMinAheadBytes: Int = 1024 * 1024,
         seekClockPinningEnabled: Bool = true,
+        sideAudioLeadTrackingEnabled: Bool = true,
+        negativeLeadReseekEnabled: Bool = true,
+        negativeLeadReseekSeconds: Double = 1.5,
         blockSizeBytes: Int = 1024 * 1024,
         useBlockRing: Bool = true,
         lookbackBytes: Int = 2 * 1024 * 1024,
@@ -306,6 +325,9 @@ public struct AetherSourceBufferPolicy: Sendable, Equatable {
         self.backpressureHoldRecoveryEnabled = backpressureHoldRecoveryEnabled
         self.backpressureHoldMinAheadBytes = backpressureHoldMinAheadBytes
         self.seekClockPinningEnabled = seekClockPinningEnabled
+        self.sideAudioLeadTrackingEnabled = sideAudioLeadTrackingEnabled
+        self.negativeLeadReseekEnabled = negativeLeadReseekEnabled
+        self.negativeLeadReseekSeconds = negativeLeadReseekSeconds
         self.blockSizeBytes = blockSizeBytes
         self.useBlockRing = useBlockRing
         self.lookbackBytes = lookbackBytes
@@ -353,6 +375,8 @@ public struct AetherSourceBufferPolicy: Sendable, Equatable {
         preArmLeadPacingEnabled: false,
         backpressureHoldRecoveryEnabled: false,
         seekClockPinningEnabled: false,
+        sideAudioLeadTrackingEnabled: false,
+        negativeLeadReseekEnabled: false,
         useBlockRing: false,
         throughputEnabled: false
     )

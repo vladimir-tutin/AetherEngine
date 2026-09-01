@@ -544,8 +544,14 @@ final class SoftwarePlaybackHost {
         clockArmed: Bool,
         lastAudioPts: Double,
         clockSeconds: Double,
-        preArmLeadPacingEnabled: Bool = true
+        preArmLeadPacingEnabled: Bool = true,
+        audioOwnedBySideReader: Bool = false
     ) -> Bool {
+        // A side reader supplies audio on its own connection; the main loop then carries only
+        // video (+subtitles). Pacing MAIN reads by the audio lead would either starve video
+        // (side lead at target stops reads) or free-run them against a frozen counter — pace on
+        // the FIFO alone, which the video renderer drains at display rate.
+        if audioOwnedBySideReader { return parkedCount >= parkedCap }
         if parkedCount >= parkedCap { return true }
         guard (clockArmed || preArmLeadPacingEnabled), clockSeconds.isFinite else { return false }
         if !clockArmed, !lastAudioPts.isFinite { return false }
@@ -901,6 +907,9 @@ final class SoftwarePlaybackHost {
         // resuming, and the pre-seek fed PTS must not be compared against the new playhead.
         starvationHoldActive = false
         demuxDiag.reset()
+        // Pre-seek audio frontier must not feed the post-seek lead (the demux loop also resets
+        // this when it notices the generation bump; seek() resets it first, on the actor).
+        audioOwnershipGate.resetFrontier()
         bumpSeekGeneration()
         let generation = seekGeneration
         // #292: inside another seek's window `isPlaying` is that seek's parked flag, not the transport's
@@ -1974,6 +1983,10 @@ final class SoftwarePlaybackHost {
         let parkedVideoCap = 256
         var loggedStartupLeadPacing = false
         var lastEnqueuedAudioPtsSec = Double.nan
+        // Whether a side track reader currently owns the audio renderer (mirrors the ownership
+        // gate; refreshed with the frontier below so both governors see one consistent state).
+        var audioOwnedBySide = false
+        var loggedAudioLeadOwnerIsSide = false
         var rebuffering = false
         // The pause/rebuffer arm stays off until the source has proven it can deliver a real
         // lead once: an exactly-realtime origin whose lead never leaves the start offset must
@@ -2010,6 +2023,32 @@ final class SoftwarePlaybackHost {
             rebuffering = false
             EngineLog.emit("[SWHost] releasing rebuffer hold: \(why)", category: .swPlayback)
             audioOutput?.setRate(currentRate())
+        }
+
+        // The ownership gate is the single source of truth for "what audio was last made
+        // audible". While a side reader owns the renderer, this loop's own counter freezes at
+        // the switch point (the gate drops main-demux audio), so every governor below —
+        // applyAudioClockAction, the read gate, the diag state feeding the starvation hold —
+        // reads the gate's frontier instead. Kill switch: sideAudioLeadTrackingEnabled.
+        func refreshAudioLeadFromGate() {
+            guard AetherSourceBuffer.policy.sideAudioLeadTrackingEnabled else {
+                audioOwnedBySide = false
+                return
+            }
+            let frontier = audioOwnershipGate.audioFrontier
+            audioOwnedBySide = frontier.sideOwned
+            if frontier.sideOwned != loggedAudioLeadOwnerIsSide {
+                loggedAudioLeadOwnerIsSide = frontier.sideOwned
+                EngineLog.emit(
+                    "[AudioLeadSource] action=owner-flip "
+                    + "owner=\(frontier.sideOwned ? "side-reader" : "main-demux") "
+                    + "frontier=\(frontier.pts.isFinite ? String(format: "%.2f", frontier.pts) : "nan")s "
+                    + "mainCounter=\(lastEnqueuedAudioPtsSec.isFinite ? String(format: "%.2f", lastEnqueuedAudioPtsSec) : "nan")s "
+                    + "decision=lead-follows-owning-feeder",
+                    category: .swPlayback
+                )
+            }
+            if frontier.pts.isFinite { lastEnqueuedAudioPtsSec = frontier.pts }
         }
 
         // #337 on the decoupled path. The lockstep gate arms the clock off the packet it is
@@ -2052,7 +2091,8 @@ final class SoftwarePlaybackHost {
                         parkedCount: parkedVideo.count, parkedCap: parkedVideoCap,
                         clockArmed: clockArmed(), lastAudioPts: lastEnqueuedAudioPtsSec,
                         clockSeconds: audioOutput?.currentTimeSeconds ?? .nan,
-                        preArmLeadPacingEnabled: AetherSourceBuffer.policy.preArmLeadPacingEnabled)
+                        preArmLeadPacingEnabled: AetherSourceBuffer.policy.preArmLeadPacingEnabled,
+                        audioOwnedBySideReader: audioOwnedBySide)
                 case .drainAll:
                     return !parkedVideo.isEmpty
                 }
@@ -2072,6 +2112,7 @@ final class SoftwarePlaybackHost {
                 releaseRebufferHold("the renderer needs a running clock to take parked video")
                 armFromParkedVideoIfStuck()
                 drainParkedVideoNonblocking()
+                refreshAudioLeadFromGate()
                 diag?.update(lastAudioPts: lastEnqueuedAudioPtsSec,
                              parked: parkedVideo.count, rebuffering: rebuffering)
                 if stillWaiting() { Thread.sleep(forTimeInterval: 0.005) }
@@ -2154,12 +2195,16 @@ final class SoftwarePlaybackHost {
                     parkedSeekGeneration = gen
                     freeParkedVideo()
                     lastEnqueuedAudioPtsSec = .nan
+                    // The gate's frontier is pre-seek stale too (seek() also resets it; this
+                    // covers a generation bump that reaches the loop first).
+                    audioOwnershipGate.resetFrontier()
                     rebuffering = false
                     // The lead is zero again after a seek, so the latch has to earn itself back:
                     // keeping it set pauses the clock for a rebuffer on the first post-seek check.
                     everHadLead = false
                 }
                 drainParkedVideoNonblocking()
+                refreshAudioLeadFromGate()
                 applyAudioClockAction()
                 // Read gate: stop pulling once decoded audio holds its target lead. The FIFO cap
                 // is the memory backstop, not the pacing rule - what bounds the lead has to be
@@ -2169,7 +2214,8 @@ final class SoftwarePlaybackHost {
                     parkedCount: parkedVideo.count, parkedCap: parkedVideoCap,
                     clockArmed: clockArmed(), lastAudioPts: lastEnqueuedAudioPtsSec,
                     clockSeconds: audioOutput?.currentTimeSeconds ?? .nan,
-                    preArmLeadPacingEnabled: AetherSourceBuffer.policy.preArmLeadPacingEnabled)
+                    preArmLeadPacingEnabled: AetherSourceBuffer.policy.preArmLeadPacingEnabled,
+                    audioOwnedBySideReader: audioOwnedBySide)
                 if readHeld {
                     if !clockArmed(), !loggedStartupLeadPacing,
                        parkedVideo.count < parkedVideoCap,
@@ -2529,6 +2575,7 @@ final class SoftwarePlaybackHost {
                 }
                 self.runStarvationHold(aOut)
                 self.runRateWedgeWatchdog(aOut)
+                self.runNegativeLeadReseek(aOut)
             }
     }
 
@@ -2585,6 +2632,7 @@ final class SoftwarePlaybackHost {
                 + "dclk=\(dclk.isFinite ? String(format: "%.2f", dclk) : "-") "
                 + "aLead=\(lead.isFinite ? String(format: "%.2f", lead) : "-") "
                 + "parked=\(d.parked) rebuf=\(d.rebuffering ? "y" : "n") "
+                + "aOwner=\(self.audioOwnershipGate.audioFrontier.sideOwned ? "side" : "main") "
                 + "enq=+\(dEnq) layerDrop=\(dropped)(\(dDrop >= 0 ? "+" : "")\(dDrop)) "
                 + "delay=\(delay >= 0 ? String(format: "%.2f", delay) : "-")"
                 + "(\(dDelay >= 0 ? "+" : "")\(String(format: "%.2f", dDelay))) "
@@ -2616,7 +2664,12 @@ final class SoftwarePlaybackHost {
     private func runStarvationHold(_ aOut: AudioOutput) {
         let policy = AetherSourceBuffer.policy
         let d = demuxDiag.snapshot
-        let lastFed = d.lastAudioPts
+        // The gate frontier supersedes the loop's diag copy: it covers side-reader enqueues
+        // (which the loop's counter never sees) and stays live while the loop is blocked
+        // inside a read. It is a superset of the main counter, so max() is not needed.
+        let gateFrontier = policy.sideAudioLeadTrackingEnabled
+            ? audioOwnershipGate.audioFrontier.pts : Double.nan
+        let lastFed = gateFrontier.isFinite ? gateFrontier : d.lastAudioPts
         let clockSeconds = aOut.currentTimeSeconds
         let sourceWindow = demuxer?.ioWindowDiagnostics
         let sourceAheadBytes = sourceWindow?.aheadBytes ?? 0
@@ -2750,6 +2803,60 @@ final class SoftwarePlaybackHost {
             category: .swPlayback
         )
         Task { await self.seek(to: target) }
+    }
+
+    // MARK: - Negative-lead (runaway clock) watchdog
+
+    /// Consecutive 0.25 s ticks the clock has been ahead of the last fed audio by more than the
+    /// policy threshold. Reset whenever the condition clears.
+    private var negativeLeadTicks = 0
+    private var lastNegativeLeadReseekAt: DispatchTime?
+
+    /// The inverse of the starvation hold: the master clock has run AHEAD of everything ever fed
+    /// to the audio renderer, so every queued sample is in the clock's past — silence that no
+    /// amount of feeding fixes, because a sample-buffer renderer never rewinds its timebase for
+    /// late audio, and video meanwhile paces off the runaway clock. Field capture 2026-09-01
+    /// 15:35: clock 144.2 s vs audio frontier 126.2 s after an in-place track switch froze the
+    /// lead signal; video crawled at 0.45x under a 25 Hz pause/release storm with no audio.
+    /// `sideAudioLeadTrackingEnabled` removes that cause; this watchdog is the recovery of last
+    /// resort for ANY frozen or lagging feed (decoder wedge, dead side reader): after 2 s of
+    /// sustained divergence, run the proven flush-and-reanchor seek at the CURRENT clock
+    /// position. Playback continues forward; only the already-silent gap is skipped.
+    private func runNegativeLeadReseek(_ aOut: AudioOutput) {
+        let policy = AetherSourceBuffer.policy
+        guard policy.negativeLeadReseekEnabled, !isLive, isPlaying, clockArmed,
+              !seekInFlight, lastRate > 0 else {
+            negativeLeadTicks = 0
+            return
+        }
+        let gateFrontier = policy.sideAudioLeadTrackingEnabled
+            ? audioOwnershipGate.audioFrontier.pts : Double.nan
+        let diagFed = demuxDiag.snapshot.lastAudioPts
+        let lastFed = gateFrontier.isFinite ? gateFrontier : diagFed
+        let clock = aOut.currentTimeSeconds
+        guard lastFed.isFinite, clock.isFinite,
+              clock - lastFed >= max(0.25, policy.negativeLeadReseekSeconds) else {
+            negativeLeadTicks = 0
+            return
+        }
+        negativeLeadTicks += 1
+        guard negativeLeadTicks >= 8 else { return }
+        if let last = lastNegativeLeadReseekAt {
+            let since = Double(DispatchTime.now().uptimeNanoseconds - last.uptimeNanoseconds)
+                / 1_000_000_000
+            guard since >= 10 else { return }
+        }
+        lastNegativeLeadReseekAt = DispatchTime.now()
+        negativeLeadTicks = 0
+        EngineLog.emit(
+            "[SWNegativeLead] action=recover clockS=\(String(format: "%.2f", clock)) "
+            + "lastFedPts=\(String(format: "%.2f", lastFed)) "
+            + "lead=\(String(format: "%.2f", lastFed - clock))s "
+            + "sideOwned=\(audioOwnershipGate.audioFrontier.sideOwned ? 1 : 0) "
+            + "decision=flush-and-reanchor-via-seek-at-clock",
+            category: .swPlayback
+        )
+        Task { await self.seek(to: clock) }
     }
 
     // MARK: - Errors

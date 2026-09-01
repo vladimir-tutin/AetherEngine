@@ -49,6 +49,22 @@ struct SWDemuxReadGateTests {
             lastAudioPts: 1_000, clockSeconds: 0) == true)
     }
 
+    @Test("side-reader audio ownership paces reads on the FIFO alone")
+    func sideOwnershipBypassesLeadPacing() {
+        let clock = 100.0
+        // Below the cap: reads continue even though the lead is at/above target (the side lead
+        // must not stop MAIN reads — they carry the video).
+        #expect(SoftwarePlaybackHost.shouldHoldDemuxRead(
+            parkedCount: 200, parkedCap: cap, clockArmed: true,
+            lastAudioPts: clock + AudioLookaheadPolicy.targetLeadSeconds, clockSeconds: clock,
+            audioOwnedBySideReader: true) == false)
+        // A frozen/negative lead must not free-run reads past the cap either.
+        #expect(SoftwarePlaybackHost.shouldHoldDemuxRead(
+            parkedCount: cap, parkedCap: cap, clockArmed: true,
+            lastAudioPts: clock - 18.0, clockSeconds: clock,
+            audioOwnedBySideReader: true) == true)
+    }
+
     @Test("no audio enqueued yet and an unreadable clock both keep reading")
     func nonFiniteInputsKeepReading() {
         #expect(SoftwarePlaybackHost.shouldHoldDemuxRead(

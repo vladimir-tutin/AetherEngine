@@ -168,6 +168,28 @@ final class AudioOwnershipGate: @unchecked Sendable {
     private let lock = NSLock()
     private var sideGeneration: UInt64?
 
+    /// Audible-audio frontier: PTS of the last buffer enqueued to the renderer by WHICHEVER
+    /// feeder currently owns audio. Once a side reader owns the renderer, the demux loop's own
+    /// last-enqueued counter freezes at the switch point (main packets are dropped above), and
+    /// every clock governor reading it — rebuffer pause, starvation hold, read-gate pacing —
+    /// then acts on a frozen lead. Field capture 2026-09-01 15:35: clock 144.2 s, frozen
+    /// counter 126.2 s, clock paused/released ~25x a second, video at 0.45x, audio silent.
+    private var frontierPtsSeconds = Double.nan
+
+    /// One lock so an ownership flip and its frontier publish atomically.
+    var audioFrontier: (pts: Double, sideOwned: Bool) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (frontierPtsSeconds, sideGeneration != nil)
+    }
+
+    /// Seek/load boundary: a pre-seek PTS must not leak into the post-seek lead.
+    func resetFrontier() {
+        lock.lock()
+        frontierPtsSeconds = .nan
+        lock.unlock()
+    }
+
     /// Packets fed since the session began, and whether any of them ever produced a buffer. Used
     /// only for the first-buffer / starvation telemetry below; the decode path itself is unchanged.
     private var mainPacketsDecoded = 0
@@ -183,6 +205,7 @@ final class AudioOwnershipGate: @unchecked Sendable {
         mainBuffersProduced = 0
         loggedFirstBuffer = false
         loggedStarvation = false
+        frontierPtsSeconds = .nan
         lock.unlock()
     }
 
@@ -239,6 +262,10 @@ final class AudioOwnershipGate: @unchecked Sendable {
             tap?(buffer)
             output.enqueue(sampleBuffer: buffer)
         }
+        if let last = buffers.last {
+            let pts = CMSampleBufferGetPresentationTimeStamp(last)
+            if pts.isValid { frontierPtsSeconds = pts.seconds }
+        }
         return buffers
     }
 
@@ -252,6 +279,8 @@ final class AudioOwnershipGate: @unchecked Sendable {
         sideGeneration = generation
         output.flush()
         output.enqueue(sampleBuffer: firstBuffer)
+        let pts = CMSampleBufferGetPresentationTimeStamp(firstBuffer)
+        if pts.isValid { frontierPtsSeconds = pts.seconds }
     }
 
     func enqueueSide(
@@ -263,6 +292,8 @@ final class AudioOwnershipGate: @unchecked Sendable {
         defer { lock.unlock() }
         guard sideGeneration == generation else { return }
         output.enqueue(sampleBuffer: buffer)
+        let pts = CMSampleBufferGetPresentationTimeStamp(buffer)
+        if pts.isValid { frontierPtsSeconds = pts.seconds }
     }
 
     func resetToMain() {
