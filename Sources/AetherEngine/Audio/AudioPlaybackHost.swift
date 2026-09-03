@@ -391,6 +391,7 @@ final class AudioPlaybackHost {
         let getClockArmed: @Sendable () -> Bool = { [weak self] in self?.clockArmed ?? true }
         let setClockArmed: @Sendable () -> Void = { [weak self] in self?.clockArmed = true }
         let getSeekGeneration: @Sendable () -> UInt64 = { [weak self] in self?.seekGeneration ?? 0 }
+        let getRepositionPending: @Sendable () -> Bool = { [weak self] in self?.repositionPending ?? false }
         let onError: @Sendable (String) -> Void = { [weak self] msg in
             Task { @MainActor [weak self] in self?.failureMessage = msg }
         }
@@ -415,7 +416,7 @@ final class AudioPlaybackHost {
                 clockArmed: getClockArmed,
                 armClock: setClockArmed,
                 seekGeneration: getSeekGeneration,
-                repositionPending: { [weak self] in self?.repositionPending ?? false },
+                repositionPending: getRepositionPending,
                 onError: onError,
                 onEnd: onEnd
             )

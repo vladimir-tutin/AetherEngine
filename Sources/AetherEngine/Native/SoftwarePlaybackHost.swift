@@ -1407,6 +1407,9 @@ final class SoftwarePlaybackHost {
         let getSeekGeneration: @Sendable () -> UInt64 = { [weak self] in
             self?.seekGeneration ?? 0
         }
+        let getRepositionPending: @Sendable () -> Bool = { [weak self] in
+            self?.repositionPending ?? false
+        }
         let getBackgroundAudioOnly: @Sendable () -> Bool = { [weak self] in
             self?.backgroundAudioOnly ?? false
         }
@@ -1509,7 +1512,7 @@ final class SoftwarePlaybackHost {
                 markClockArmed: setClockArmed,
                 onClockAnchored: onClockAnchored,
                 seekGeneration: getSeekGeneration,
-                repositionPending: { [weak self] in self?.repositionPending ?? false },
+                repositionPending: getRepositionPending,
                 backgroundAudioOnly: getBackgroundAudioOnly,
                 onError: onError,
                 onEnd: onEnd,
