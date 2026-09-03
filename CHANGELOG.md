@@ -10,7 +10,20 @@ the public-API contract.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Fixed
+
+- A single rewind on the software path no longer plays nothing for the length of the rewind. A
+  host `play()` issued inside the seek window (a client re-asserting its playing intent on the
+  seek announcement) flipped the loop flag back on while the reposition was still queued behind
+  the demuxer lock; the demux loop won the lock, read pre-seek packets under the post-seek
+  generation, the audio lead read the pre-seek frontier (14 s on a 10 s rewind) and the read gate
+  held every read until the clock had walked back to the pre-seek position. A second rewind found
+  the loop idle and landed first, which is why pressing twice always worked. `play()` inside the
+  window now records intent only (`SeekWindowTransport`), the software and audio-only loops hold
+  off the demuxer while `repositionPending` is set (`SWDemuxReadAdmission`, `[SWRepositionHold]`
+  telemetry), and the parked-video drain re-checks the seek generation per packet so the flushed
+  layer cannot be refilled with pre-seek frames. Policy: `seekRepositionHoldEnabled` (default ON,
+  off in `preChange`).
 
 ## [6.25.4] - 2026-08-14
 

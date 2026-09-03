@@ -93,6 +93,19 @@ final class AudioPlaybackHost {
         flagsLock.lock(); _seekGeneration &+= 1; flagsLock.unlock()
     }
 
+    /// Mirrors `SoftwarePlaybackHost.repositionPending`: true while a seek's reposition is queued on
+    /// `seekQueue`. The demux loop must not read behind it (see `SeekWindowTransport`).
+    nonisolated(unsafe) private var _repositionPending = false
+    nonisolated private var repositionPending: Bool {
+        get { flagsLock.lock(); defer { flagsLock.unlock() }; return _repositionPending }
+        set {
+            flagsLock.lock(); _repositionPending = newValue; flagsLock.unlock()
+            demuxCondition.lock()
+            demuxCondition.broadcast()
+            demuxCondition.unlock()
+        }
+    }
+
     nonisolated var isPlaying: Bool {
         get { flagsLock.lock(); defer { flagsLock.unlock() }; return _isPlaying }
         set {
@@ -165,6 +178,26 @@ final class AudioPlaybackHost {
     // MARK: - Transport
 
     func play() {
+        // Inside a seek window only record the intent; the landing resumes the clock and the loop
+        // (mirrors SoftwarePlaybackHost, see SeekWindowTransport for the pre-seek read race).
+        if SeekWindowTransport.playAction(
+            seekInFlight: seekInFlight,
+            holdEnabled: AetherSourceBuffer.policy.seekRepositionHoldEnabled) == .recordIntent {
+            pausedByHost = false
+            rate = lastRate
+            inFlightSeekResumeIntent = true
+            if !demuxLoopStarted {
+                demuxLoopStarted = true
+                startDemuxLoop()
+            }
+            EngineLog.emit(
+                "[AudioHost] action=play-during-reposition "
+                + "repositionPending=\(repositionPending ? 1 : 0) "
+                + "decision=record-intent-loop-stays-parked-until-landing",
+                category: .swPlayback
+            )
+            return
+        }
         // Resume the synchronizer a pause() froze (rate 0). Guarded on demuxLoopStarted so a pause() before
         // first play() doesn't eager-start the un-anchored synchronizer (would tick the clock through spin-up
         // and drop the first samples; clock is armed off the first decoded sample).
@@ -218,6 +251,11 @@ final class AudioPlaybackHost {
                                                   inFlightIntent: inFlightSeekResumeIntent)
         inFlightSeekResumeIntent = wasPlaying
         isPlaying = false
+        // Raised before the flushes so a loop woken inside the window cannot read behind the
+        // queued reposition (see SeekWindowTransport); released by the owning seek below.
+        if AetherSourceBuffer.policy.seekRepositionHoldEnabled {
+            repositionPending = true
+        }
 
         audioDecoder?.flush()
         audioOutput?.flush()
@@ -227,6 +265,14 @@ final class AudioPlaybackHost {
         let outcome = await dem.seekBounded(
             to: seconds, timeout: Self.seekBudgetSeconds, on: seekQueue,
             isSuperseded: { [weak self] in self?.seekGeneration != generation })
+        if seekGeneration == generation, repositionPending {
+            repositionPending = false
+            EngineLog.emit(
+                "[AudioHost] action=reposition-hold-release outcome=\(outcome) "
+                + "target=\(String(format: "%.3f", seconds))s decision=loop-may-read-post-seek",
+                category: .swPlayback
+            )
+        }
         guard seekGeneration == generation, !stopRequested else { return .superseded }
         seekInFlight = false
         if outcome == .stalled {
@@ -264,6 +310,7 @@ final class AudioPlaybackHost {
         stopRequested = true
         isPlaying = false
         seekInFlight = false
+        repositionPending = false
         timeTimer?.cancel()
         timeTimer = nil
 
@@ -368,6 +415,7 @@ final class AudioPlaybackHost {
                 clockArmed: getClockArmed,
                 armClock: setClockArmed,
                 seekGeneration: getSeekGeneration,
+                repositionPending: { [weak self] in self?.repositionPending ?? false },
                 onError: onError,
                 onEnd: onEnd
             )
@@ -389,6 +437,7 @@ final class AudioPlaybackHost {
         clockArmed: @Sendable () -> Bool,
         armClock: @Sendable () -> Void,
         seekGeneration: @Sendable () -> UInt64,
+        repositionPending: @Sendable () -> Bool = { false },
         onError: @Sendable (String) -> Void,
         onEnd: @Sendable () -> Void
     ) {
@@ -412,6 +461,20 @@ final class AudioPlaybackHost {
                 while !isPlaying() && !stopRequested() {
                     autoreleasepool {
                         _ = condition.wait(until: Date(timeIntervalSinceNow: 0.5))
+                    }
+                }
+                condition.unlock()
+                return true
+            }
+
+            // A seek's reposition is still queued behind the demuxer lock: reading now returns a
+            // pre-seek packet under the post-seek generation (see SeekWindowTransport). Hold.
+            if !SWDemuxReadAdmission.mayReadPacket(
+                isPlaying: true, repositionPending: repositionPending(), stopRequested: stopRequested()) {
+                condition.lock()
+                while repositionPending() && !stopRequested() {
+                    autoreleasepool {
+                        _ = condition.wait(until: Date(timeIntervalSinceNow: 0.05))
                     }
                 }
                 condition.unlock()

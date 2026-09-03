@@ -297,6 +297,23 @@ final class SoftwarePlaybackHost {
         feedLock.lock(); _seekGeneration &+= 1; feedLock.unlock()
     }
 
+    /// True from the generation bump of a VOD seek until its reposition has run on `seekQueue`
+    /// (landed, stalled, or superseded by a seek that raised it again). The demux loop must not take
+    /// the demuxer for a read while this is set: `readPacket` and the reposition contend for the same
+    /// lock, and a loop woken early (by a host `play()` inside the seek window) won that race and read
+    /// pre-seek packets under the new generation. See `SeekWindowTransport`.
+    nonisolated(unsafe) private var _repositionPending = false
+    nonisolated private var repositionPending: Bool {
+        get { feedLock.lock(); defer { feedLock.unlock() }; return _repositionPending }
+        set {
+            feedLock.lock(); _repositionPending = newValue; feedLock.unlock()
+            // A clear releases the loop's hold; wake it instead of waiting out its poll interval.
+            demuxCondition.lock()
+            demuxCondition.broadcast()
+            demuxCondition.unlock()
+        }
+    }
+
     /// Set when pause() stopped the synchronizer; play() restores the rate (previously play() only flipped isPlaying, leaving the clock frozen).
     private var pausedByHost = false
 
@@ -789,6 +806,31 @@ final class SoftwarePlaybackHost {
     // MARK: - Transport
 
     func play() {
+        // A play() inside a seek window records the intent and nothing else. The loop is parked on
+        // purpose until the reposition lands, and the landing applies `lastRate` itself (#292 stash).
+        // Flipping `isPlaying` here woke the loop while the reposition was still queued behind the
+        // demuxer lock; it read pre-seek packets and a single 10 s rewind played nothing until the
+        // clock had walked back through the pre-seek position (see SeekWindowTransport).
+        if SeekWindowTransport.playAction(
+            seekInFlight: seekInFlight,
+            holdEnabled: AetherSourceBuffer.policy.seekRepositionHoldEnabled) == .recordIntent {
+            pausedByHost = false
+            rate = lastRate
+            inFlightSeekResumeIntent = true
+            if !demuxLoopStarted, let aOut = audioOutput {
+                aOut.attachVideoLayer(renderer.displayLayer)
+                demuxLoopStarted = true
+                startDemuxLoop()
+            }
+            EngineLog.emit(
+                "[SWSeekTransport] action=play-during-reposition "
+                + "target=\(String(format: "%.3f", currentTime))s "
+                + "repositionPending=\(repositionPending ? 1 : 0) "
+                + "decision=record-intent-loop-stays-parked-until-landing",
+                category: .swPlayback
+            )
+            return
+        }
         // Resume after pause(): gate on clockArmed, not demuxLoopStarted. A rate change on the
         // un-anchored synchronizer (no media at its clock time yet) wedges the delayed-rate-change
         // machinery permanently frozen; the arming seekClock applies the current lastRate (#107).
@@ -922,6 +964,18 @@ final class SoftwarePlaybackHost {
         if !isLive {
             currentTime = seconds
             seekInFlight = true
+            // Raised before any flush so a loop woken by whatever means cannot reach the demuxer
+            // ahead of the reposition queued below. Cleared by this seek after its reposition ran,
+            // or by the seek that supersedes it (which raises it again first), or by stop().
+            if AetherSourceBuffer.policy.seekRepositionHoldEnabled {
+                repositionPending = true
+            } else {
+                EngineLog.emit(
+                    "[SWRepositionHold] action=bypass enabled=0 "
+                    + "target=\(String(format: "%.3f", seconds))s mechanism=legacy-racing-read",
+                    category: .swPlayback
+                )
+            }
             if AetherSourceBuffer.policy.seekClockPinningEnabled, let aOut = audioOutput {
                 let previousClock = aOut.currentTimeSeconds
                 aOut.seekClock(to: targetTime, rate: 0)
@@ -962,6 +1016,18 @@ final class SoftwarePlaybackHost {
         let outcome = await dem.seekBounded(
             to: seconds, timeout: Self.seekBudgetSeconds, on: seekQueue,
             isSuperseded: { [weak self] in self?.seekGeneration != generation })
+        // The reposition has run (or was skipped as superseded, in which case the newer seek raised
+        // the hold again and owns it). Only the owning seek may release the loop: a superseded seek
+        // clearing it would let the loop read behind the newer seek's still-queued reposition.
+        if seekGeneration == generation, repositionPending {
+            repositionPending = false
+            EngineLog.emit(
+                "[SWRepositionHold] action=release outcome=\(outcome) "
+                + "target=\(String(format: "%.3f", seconds))s "
+                + "resumeIntent=\(inFlightSeekResumeIntent ? 1 : 0) decision=loop-may-read-post-seek",
+                category: .swPlayback
+            )
+        }
         // A newer seek owns the state from here: it published its own target and clears the hold itself.
         // stop() can also land in the await now that this suspends, and re-arming the clock or flipping
         // isPlaying on a torn-down session would resurrect a loop that has already been told to quit.
@@ -1091,6 +1157,7 @@ final class SoftwarePlaybackHost {
         stopRequested = true
         isPlaying = false
         seekInFlight = false
+        repositionPending = false
         audioTrackSwitchReader.cancel()
         audioOwnershipGate.resetToMain()
         sideAudioTrackIndex = nil
@@ -1442,6 +1509,7 @@ final class SoftwarePlaybackHost {
                 markClockArmed: setClockArmed,
                 onClockAnchored: onClockAnchored,
                 seekGeneration: getSeekGeneration,
+                repositionPending: { [weak self] in self?.repositionPending ?? false },
                 backgroundAudioOnly: getBackgroundAudioOnly,
                 onError: onError,
                 onEnd: onEnd,
@@ -1936,6 +2004,7 @@ final class SoftwarePlaybackHost {
         markClockArmed: @Sendable () -> Void,
         onClockAnchored: @Sendable (Double) -> Void,
         seekGeneration: @Sendable () -> UInt64,
+        repositionPending: @Sendable () -> Bool = { false },
         backgroundAudioOnly: @Sendable () -> Bool,
         onError: @Sendable (String) -> Void,
         onEnd: @Sendable () -> Void,
@@ -2009,7 +2078,11 @@ final class SoftwarePlaybackHost {
         // the decoder's skip threshold = visible fast-forward burst).
         func drainParkedVideoNonblocking() {
             if seekGeneration() != parkedSeekGeneration { return }
+            // Re-checked per packet: the seek's renderer flush empties the queue, so a drain that
+            // passed the entry check just before the bump would otherwise burst the parked
+            // pre-seek tail into the freshly flushed layer as future frames.
             while !parkedVideo.isEmpty, renderer.isReadyForMoreMediaData,
+                  seekGeneration() == parkedSeekGeneration,
                   !stopRequested(), !backgroundAudioOnly() {
                 let p = parkedVideo.removeFirst()
                 videoDecoder.decode(packet: p)
@@ -2184,6 +2257,28 @@ final class SoftwarePlaybackHost {
                     }
                 }
                 condition.unlock()
+                return true
+            }
+
+            // A seek's reposition is still queued behind the demuxer lock: whatever woke this loop,
+            // reading now returns a PRE-SEEK packet under the post-seek generation (see
+            // SeekWindowTransport). Hold here until the owning seek releases it.
+            if !SWDemuxReadAdmission.mayReadPacket(
+                isPlaying: true, repositionPending: repositionPending(), stopRequested: stopRequested()) {
+                let holdStart = DispatchTime.now()
+                condition.lock()
+                while repositionPending() && !stopRequested() {
+                    autoreleasepool {
+                        _ = condition.wait(until: Date(timeIntervalSinceNow: 0.05))
+                    }
+                }
+                condition.unlock()
+                let heldMs = (DispatchTime.now().uptimeNanoseconds - holdStart.uptimeNanoseconds) / 1_000_000
+                EngineLog.emit(
+                    "[SWRepositionHold] action=held-read heldMs=\(heldMs) gen=\(seekGeneration()) "
+                    + "parked=\(parkedVideo.count) decision=read-only-after-reposition",
+                    category: .swPlayback
+                )
                 return true
             }
 

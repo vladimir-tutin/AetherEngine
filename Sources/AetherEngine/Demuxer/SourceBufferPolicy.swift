@@ -210,6 +210,14 @@ public struct AetherSourceBufferPolicy: Sendable, Equatable {
     public var negativeLeadReseekEnabled: Bool
     public var negativeLeadReseekSeconds: Double
 
+    /// Hold the demuxer-driven loops off the demuxer while a seek's reposition is queued, and make
+    /// a `play()` inside that window record intent instead of waking the loop. Without it a host
+    /// re-asserting play on the seek announcement woke the loop before the reposition took the
+    /// demuxer lock, the loop read PRE-SEEK packets under the new generation, and a 10 s rewind
+    /// showed nothing until the clock had walked back through the pre-seek position (device trace
+    /// 2026-09-03 16:24:15; a second rewind always cleared it). OFF restores the racing behavior.
+    public var seekRepositionHoldEnabled: Bool
+
     /// Allocation granularity of the block-ring window.
     public var blockSizeBytes: Int
 
@@ -288,6 +296,7 @@ public struct AetherSourceBufferPolicy: Sendable, Equatable {
         sideAudioLeadTrackingEnabled: Bool = true,
         negativeLeadReseekEnabled: Bool = true,
         negativeLeadReseekSeconds: Double = 1.5,
+        seekRepositionHoldEnabled: Bool = true,
         blockSizeBytes: Int = 1024 * 1024,
         useBlockRing: Bool = true,
         lookbackBytes: Int = 2 * 1024 * 1024,
@@ -328,6 +337,7 @@ public struct AetherSourceBufferPolicy: Sendable, Equatable {
         self.sideAudioLeadTrackingEnabled = sideAudioLeadTrackingEnabled
         self.negativeLeadReseekEnabled = negativeLeadReseekEnabled
         self.negativeLeadReseekSeconds = negativeLeadReseekSeconds
+        self.seekRepositionHoldEnabled = seekRepositionHoldEnabled
         self.blockSizeBytes = blockSizeBytes
         self.useBlockRing = useBlockRing
         self.lookbackBytes = lookbackBytes
@@ -377,6 +387,7 @@ public struct AetherSourceBufferPolicy: Sendable, Equatable {
         seekClockPinningEnabled: false,
         sideAudioLeadTrackingEnabled: false,
         negativeLeadReseekEnabled: false,
+        seekRepositionHoldEnabled: false,
         useBlockRing: false,
         throughputEnabled: false
     )
