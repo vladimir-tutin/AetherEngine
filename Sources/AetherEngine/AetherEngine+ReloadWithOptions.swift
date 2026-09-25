@@ -392,6 +392,9 @@ enum SessionOptionCorrection {
         "keepDvh1TagWithoutDV", "forceDolbyVisionOnNonDVDisplay", "dolbyVisionHandling", "matchContentEnabled",
         "panelIsInHDRMode", "attemptsHDRMasterOnUnprovenPanel", "panelPresentsDolbyVision",
         "audioBridgeMode", "isLive", "audioOnly",
+        // FlexUI: correctable. The rebuild re-runs routing, which already keeps a Dolby Vision
+        // representation the software path cannot show on the native route.
+        "decodedPCMAudio",
         "dvrWindowSeconds",
         "liveBlockingReload", "liveJoinProfile", "liveJoinStartsImmediately",
         "clampsLiveResumeToWindow", "nativeRemoteHLS", "nativeRemoteHLSIngestFallback",

@@ -625,6 +625,10 @@ suppressing `AVPlayerItemLegibleOutput` to keep the measurement running.
 | `$activeAudioTrackIndex` | The selected track's id. |
 | `selectAudioTrack(index:)` | Session-preserving reload, roughly 0.5 to 1 s of black. `index` is `TrackInfo.id`. A no-op when out of range, already active, or on a forward-only custom source (live ingest included), which cannot rebuild its pipeline: there a track change is a fresh `load` naming the stream. Every refusal is logged, so a picker that does nothing is explainable. |
 | `installAudioTap()`, `removeAudioTap()`, `audioTapHasDeliverySource`, `AetherEngine.audioTapFormat` | Opt-in decoded PCM, mono Float32 48 kHz with source-PTS stamps, off the render path. See the contract above. |
+| `audioDSPSettings` | FlexUI fork. Live PCM processing on the decoded-PCM hosts (`.software`, audio-only): output width (stereo, source, 5.1 upmix), front-centre dialogue gain, master gain and peak limiting. Gain changes reach the renderer without touching the item or the clock; a width change renegotiates the route on the ordered session queue and flushes only the audio renderer. On the native AVPlayer path the value is remembered and applied when a PCM host loads. |
+| `audioDSPIsEffective` | FlexUI fork. Whether a DSP write can affect what is rendered right now: false on the native AVPlayer/HLS path, where audio is stream-copied. |
+| `audioDSPSourceChannels` | FlexUI fork. Channel count of the PCM source feeding the DSP, 0 when no PCM host is open, so a host reports the effective layout instead of the requested one. |
+| `audioDSPDiagnostics`, `resetAudioDSPDiagnostics(reason:)` | FlexUI fork. Per-channel test tone, solo and mute. Session-scoped by design: never stashed for a later host, and cleared on load. |
 
 ## Subtitles
 
@@ -941,6 +945,7 @@ All flags default to safe values; the table is the full set. Depth for the media
 | `nativeRemoteHLS` | false | Hand a remote `master.m3u8` straight to AVPlayer: no demuxer probe, no loopback. Built for `isLive: true`; a remote HLS VOD URL reaches this route regardless (AE#154). The clock here is item time, see `clock.$sourceTime` (AE#616). |
 | `nativeRemoteHLSIngestFallback` | true | The #168 / #293 carriage recovery and the #363 401/403 bypass refusal recovery. Setting it false turns both off. |
 | `audioOnly` | false | Lean audio pipeline, no video machinery. Also set automatically when the probe finds no video stream. |
+| `decodedPCMAudio` | false | FlexUI fork. Route a compatible source through a decoded-PCM host so `audioDSPSettings` can act on it. A Dolby Vision representation the software path cannot show keeps the native route, and `audioDSPIsEffective` then reports false rather than trading correct video for audio controls. Correctable with `reloadAtCurrentPosition(applying:)`, whose rebuild re-runs the routing. |
 | `audioBridgeMode` | `.surroundCompat` | Bridge encoder for codecs that cannot stream-copy into fMP4. `.surroundCompat` uses EAC3 for a source with more than two channels and FLAC for one with two or fewer (no surround to carry). `.lossless` uses FLAC up to 7.1 throughout and needs a sink that accepts multichannel LPCM. |
 | `confirmAtmos` | false | Background per-track JOC confirmation, republishing `audioTracks` as tracks confirm. Never on the start path; skipped for live and forward-only readers. |
 | `preferredAudioLanguages` | empty | First-frame audio pick from the engine's single probe. Ordered BCP-47 / ISO 639 tags; region and script are normalized and rank within one preference (#590). An explicit `audioSourceStreamIndex` still wins. |
