@@ -1047,7 +1047,7 @@ final class SoftwarePlaybackHost {
             rate = lastRate
             inFlightSeekResumeIntent = true
             if !demuxLoopStarted, let aOut = audioOutput {
-                aOut.attachVideoLayer(renderer.displayLayer)
+                aOut.attachVideoRenderer(renderer.videoRenderer)
                 demuxLoopStarted = true
                 startDemuxLoop()
             }
