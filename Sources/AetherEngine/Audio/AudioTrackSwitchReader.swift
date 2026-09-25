@@ -1,6 +1,6 @@
 import Foundation
 import CoreMedia
-import Libavcodec
+import AetherLibavcodec
 
 /// Independent VOD audio reader used for seamless embedded-track changes.
 ///
