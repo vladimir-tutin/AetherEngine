@@ -1,5 +1,5 @@
 import Testing
-import Libavcodec
+import AetherLibavcodec
 @testable import AetherEngine
 
 /// #133 follow-up: interlaced live H.264 now routes to the SoftwarePlaybackHost (#150), exposing that

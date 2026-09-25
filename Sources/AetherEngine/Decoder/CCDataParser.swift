@@ -1,5 +1,5 @@
 import Foundation
-import Libavcodec
+import AetherLibavcodec
 
 /// Parses the bare CEA-608/708 `cc_data` triplet stream that FFmpeg's MOV demuxer emits for a
 /// QuickTime/MP4 closed-caption track (`c608`). The caption bytes are a real, demuxable subtitle stream:

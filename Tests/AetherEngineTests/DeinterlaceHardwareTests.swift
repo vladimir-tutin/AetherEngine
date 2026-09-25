@@ -1,7 +1,7 @@
 import Testing
 import CoreVideo
-import Libavutil
-import Libavfilter
+import AetherLibavutil
+import AetherLibavfilter
 @testable import AetherEngine
 
 /// yadif_videotoolbox hardware path (FFmpegBuild >= 2.1): the graph engages, emits

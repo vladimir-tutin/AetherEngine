@@ -1,6 +1,6 @@
 import XCTest
-import Libavcodec
-import Libavutil
+import AetherLibavcodec
+import AetherLibavutil
 @testable import AetherEngine
 
 /// #104: the subtitle side demuxer must set `AVDISCARD_ALL` on video/audio so it does not pull the whole

@@ -9,7 +9,7 @@
 // is the guard that routes such an index to the uniform-stride fallback instead.
 import Foundation
 import Testing
-import Libavutil
+import AetherLibavutil
 @testable import AetherEngine
 
 @Suite("HLSVideoEngine sparse keyframe-index detection (#64)")

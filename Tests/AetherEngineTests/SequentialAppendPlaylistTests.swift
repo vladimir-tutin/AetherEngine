@@ -173,7 +173,7 @@ struct SequentialAppendPlaylistTests {
                                     dvModeAvailable: false)
         engine.provider = provider
         let surfaced = FailureBox()
-        engine.onVODSourceFailed = { code, _ in surfaced.fire(code) }
+        engine.onVODSourceFailed = { code, _, _ in surfaced.fire(code) }
 
         engine.surfaceVODSourceFailure(FFmpegErr.einval, "Source audio cannot be muxed")
 

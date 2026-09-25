@@ -1,6 +1,6 @@
 import CoreGraphics
 import Foundation
-import Libavcodec
+import AetherLibavcodec
 
 extension SubtitleTextRun {
     /// Same styling, different text. Keeps the trim and fold passes from restating every attribute.

@@ -1,8 +1,8 @@
 import Testing
 import Foundation
-import Libavformat
-import Libavcodec
-import Libavutil
+import AetherLibavformat
+import AetherLibavcodec
+import AetherLibavutil
 @testable import AetherEngine
 
 /// AE#222: an E-AC-3 source whose first segment contains no audio packet wedged the muxer. movenc builds

@@ -11,7 +11,21 @@ public final class PlaybackClock: ObservableObject {
     @Published public internal(set) var currentTime: Double = 0
 
     /// Source PTS of the currently displayed frame. On native: rides AVPlayer's rendered position -- equals `currentTime` in steady play, but holds the on-screen frame during a seek or rebuffer, not the scrub target (issue #49). SW/audio: always equals `currentTime`.
+    ///
+    /// `nativeRemoteHLS` (AE#616): item time, less the lead over the picture the engine measured on its
+    /// own injected subtitle renditions (#316). The lead exists where an origin restarts a transcode at the
+    /// keyframe before a segment's slot, and is re-measured on every presented line, so it differs from
+    /// `currentTime` by that lead. With no injected rendition selected there is nothing to measure it
+    /// against, and this is item time, which can run ahead of the frame after a seek on such an origin.
     @Published public internal(set) var sourceTime: Double = 0
+
+    /// Whether `sourceTime` is known to follow the displayed frame. True on every route but
+    /// `nativeRemoteHLS`. There (AE#616) it turns true when a presented line of an injected rendition
+    /// measured the lead, and false again at every time jump (seek, item change): until the next line,
+    /// `sourceTime` carries the previous lead, which is off by however far the new anchor moved. False
+    /// for the whole session without an injected rendition selected. A host timing its own overlay off
+    /// `sourceTime` can hold it while this is false instead of detecting seeks itself.
+    @Published public internal(set) var sourceTimeFollowsPicture: Bool = true
 
     @Published public internal(set) var progress: Float = 0
 

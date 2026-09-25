@@ -161,7 +161,7 @@ enum H264SPS {
         return sc + sps + sc + pps
     }
 
-    private static func unescape(_ b: [UInt8]) -> [UInt8] {  // remove emulation-prevention bytes (00 00 03 -> 00 00)
+    static func unescape(_ b: [UInt8]) -> [UInt8] {  // remove emulation-prevention bytes (00 00 03 -> 00 00)
         var out = [UInt8](); out.reserveCapacity(b.count)
         var zeros = 0
         var i = 0

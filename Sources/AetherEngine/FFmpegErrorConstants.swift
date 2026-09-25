@@ -1,5 +1,5 @@
 import Foundation
-import Libavutil
+import AetherLibavutil
 
 /// FFmpeg error sentinels whose C macros (`AVERROR_EOF`, `AVERROR(EAGAIN)`, `AVERROR_INVALIDDATA`) Swift cannot import directly.
 enum FFmpegErr {

@@ -82,8 +82,11 @@ enum HLSPlaylist: Equatable {
 enum HLSPlaylistParser {
 
     static func parse(_ text: String) throws -> HLSPlaylist {
+        // `split(separator: "\n")` compares whole Characters, and "\r\n" is one grapheme cluster in
+        // Swift, so a CRLF playlist came back as a single line (audit NET-2, NAT-3). `isNewline` is
+        // true for "\r\n", "\n" and "\r" alike.
         let lines = text
-            .split(separator: "\n", omittingEmptySubsequences: true)
+            .split(whereSeparator: \.isNewline)
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
         guard lines.first?.hasPrefix("#EXTM3U") == true else {
@@ -177,7 +180,15 @@ enum HLSPlaylistParser {
             if line.hasPrefix("#EXT-X-TARGETDURATION:") {
                 targetDuration = Double(line.dropFirst("#EXT-X-TARGETDURATION:".count))
             } else if line.hasPrefix("#EXT-X-MEDIA-SEQUENCE:") {
-                mediaSequence = Int(line.dropFirst("#EXT-X-MEDIA-SEQUENCE:".count)) ?? 0
+                // A hostile or MITM value near Int.max makes `mediaSequence + segments.count`
+                // overflow and trap downstream (audit NET-3); reject it here instead. A merely
+                // unparseable tag keeps the pre-existing default of 0.
+                if let parsed = Int(line.dropFirst("#EXT-X-MEDIA-SEQUENCE:".count)) {
+                    guard parsed >= 0, parsed <= Int.max / 2 else {
+                        throw HLSIngestError.playlistInvalid(reason: "media sequence out of range")
+                    }
+                    mediaSequence = parsed
+                }
             } else if line.hasPrefix("#EXTINF:") {
                 let payload = line.dropFirst("#EXTINF:".count)
                 pendingDuration = Double(payload.split(separator: ",").first.map(String.init) ?? "")

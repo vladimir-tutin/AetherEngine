@@ -1,8 +1,8 @@
 import Foundation
 import Testing
-import Libavcodec
-import Libavformat
-import Libavutil
+import AetherLibavcodec
+import AetherLibavformat
+import AetherLibavutil
 @testable import AetherEngine
 
 /// #234 (cmcpherson274): a seek landing whose only later display set sits beyond the lead window

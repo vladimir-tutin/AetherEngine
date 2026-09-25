@@ -24,11 +24,11 @@ struct Issue281ColdStartRoundTripTests {
         return reader.read(into: buf, size: Int32(size))
     }
 
-    /// Waits for the speculative fetch, which by design nothing blocks on.
-    private func waitForTailSpan(_ server: ThrottledOriginServer, tailStart: Int64) async {
-        for _ in 0..<100 {
-            if server.requestedRanges.contains(where: { $0.start == tailStart }) { return }
-            try? await Task.sleep(nanoseconds: 20_000_000)
+    /// Waits for the speculative fetch, which by design nothing blocks on, so the budget is part
+    /// of the observation rather than a guess at scheduling.
+    private func waitForTailSpan(_ server: ThrottledOriginServer, tailStart: Int64) async throws {
+        try await waitFor(upTo: .seconds(10)) {
+            server.requestedRanges.contains(where: { $0.start == tailStart })
         }
     }
 
@@ -41,7 +41,7 @@ struct Issue281ColdStartRoundTripTests {
         try reader.open()
 
         let tailStart = fileSize - Int64(AVIOReader.tailPrefetchBytes)
-        await waitForTailSpan(server, tailStart: tailStart)
+        try await waitForTailSpan(server, tailStart: tailStart)
 
         let tail = try #require(server.requestedRanges.first(where: { $0.start == tailStart }),
                                 "no tail prefetch was issued: \(server.requestedRanges)")
@@ -60,7 +60,7 @@ struct Issue281ColdStartRoundTripTests {
         _ = read(reader, 64 * 1024)   // head, as a demuxer walking the box chain would
 
         let tailStart = fileSize - Int64(AVIOReader.tailPrefetchBytes)
-        await waitForTailSpan(server, tailStart: tailStart)
+        try await waitForTailSpan(server, tailStart: tailStart)
         let requestsBefore = server.rangeRequestCount
 
         #expect(reader.seek(offset: tailStart + 1024, whence: SEEK_SET) == tailStart + 1024)
@@ -99,7 +99,7 @@ struct Issue281ColdStartRoundTripTests {
         _ = read(reader, 64 * 1024)   // the box chain at the head
 
         let tailStart = fileSize - Int64(AVIOReader.tailPrefetchBytes)
-        await waitForTailSpan(server, tailStart: tailStart)   // the REQUEST is out; its body is not
+        try await waitForTailSpan(server, tailStart: tailStart)   // the REQUEST is out; its body is not
 
         #expect(reader.seek(offset: tailStart + 1024, whence: SEEK_SET) == tailStart + 1024)
         let got = read(reader, 4096)
@@ -128,7 +128,7 @@ struct Issue281ColdStartRoundTripTests {
         _ = read(reader, 64 * 1024)
 
         let tailStart = fileSize - Int64(AVIOReader.tailPrefetchBytes)
-        await waitForTailSpan(server, tailStart: tailStart)
+        try await waitForTailSpan(server, tailStart: tailStart)
         let requestsBefore = server.rangeRequestCount
 
         let startedAt = Date()
@@ -395,6 +395,14 @@ struct Issue281ColdStartRoundTripTests {
         #expect(AVIOReader.suffixRangeStart(response(nil, length: 100), expectedLength: 100) == nil)
         #expect(AVIOReader.suffixRangeStart(response("bytes */1000", length: 100),
                                             expectedLength: 100) == nil)
+        // Audit DMX-8: a suffix ends on the last byte of a numeric total, or it is not a suffix.
+        #expect(AVIOReader.suffixRangeStart(response("bytes 900-999/*", length: 100),
+                                            expectedLength: 100) == nil)
+        #expect(AVIOReader.suffixRangeStart(response("bytes 900-999/2000", length: 100),
+                                            expectedLength: 100) == nil)
+        #expect(AVIOReader.suffixRangeStart(
+            response("bytes 9223372036854775708-9223372036854775807/*", length: 100),
+            expectedLength: 100) == nil)
     }
 
     /// The calibration the in-flight test above no longer carries, checked where it costs no socket

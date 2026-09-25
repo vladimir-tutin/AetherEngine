@@ -9,10 +9,16 @@ import AetherEngine
 /// ISOLATION (`init.mp4` + that one segment, fresh decoder, no predecessor). `framesDecoded == 0` means
 /// the segment carries no usable IRAP to start from, i.e. it is not independently decodable, which is
 /// exactly what AVPlayer hits on a fresh decode at a mid-stream open-GOP boundary (#92).
-func runSegVerify(url: URL, from: Int, count: Int, dvModeAvailable: Bool, dumpDir: String? = nil) -> Int32 {
+func runSegVerify(url: URL, from: Int, count: Int, dvModeAvailable: Bool,
+                  forceDVWithoutDisplay: Bool = false,
+                  dolbyVisionHandling: DolbyVisionHandling = .automatic,
+                  dumpDir: String? = nil) -> Int32 {
     setvbuf(stdout, nil, _IONBF, 0)   // unbuffered: progressive output survives a long-running run
     print("segverify: starting engine for \(url.absoluteString)")
-    let engine = HLSVideoEngine(url: url, dvModeAvailable: dvModeAvailable)
+    let engine = HLSVideoEngine(url: url, dvModeAvailable: dvModeAvailable,
+                                forceDolbyVisionOnNonDVDisplay: forceDVWithoutDisplay,
+                                dolbyVisionHandling: dolbyVisionHandling,
+                                dolbyVisionRPUProfile: DolbyVisionRecordAudit.rpuCorrection(url: url))
     let playbackURL: URL
     do {
         playbackURL = try engine.start()
@@ -23,11 +29,14 @@ func runSegVerify(url: URL, from: Int, count: Int, dvModeAvailable: Bool, dumpDi
     print("segverify: engine started, playlist=\(playbackURL.absoluteString)")
     defer { engine.stop() }
 
-    guard var comps = URLComponents(url: playbackURL, resolvingAgainstBaseURL: false) else {
+    // The loopback server serves every resource under the session's own path prefix, so the base is
+    // the playlist's DIRECTORY. Clearing the path instead aimed every fetch at the server root, where
+    // nothing is published, and the run died on init.mp4 before a single segment was decoded.
+    guard var comps = URLComponents(url: playbackURL.deletingLastPathComponent(),
+                                    resolvingAgainstBaseURL: false) else {
         print("ERROR: cannot parse playback URL \(playbackURL)")
         return 1
     }
-    comps.path = ""
     comps.query = nil
     guard let base = comps.url else {
         print("ERROR: cannot derive loopback base from \(playbackURL)")

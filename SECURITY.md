@@ -4,10 +4,10 @@
 
 AetherEngine ships fixes on the latest released minor line. Security fixes land there first; older lines are not back-patched. Host apps pin the engine by commit SHA, so picking up a fix means bumping the pin to the patched release.
 
-| Version | Supported          |
-| ------- | ------------------ |
-| 2.1.x   | :white_check_mark: |
-| < 2.1   | :x:                |
+| Version | Supported |
+| ------- | --------- |
+| The minor line of the [latest release](https://github.com/superuser404notfound/AetherEngine/releases/latest) | :white_check_mark: |
+| Every earlier minor line | :x: |
 
 ## Reporting a vulnerability
 

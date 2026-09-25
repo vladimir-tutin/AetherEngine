@@ -53,7 +53,7 @@ extension AetherEngine {
         let rendition = liveSubtitleRenditions[ordinal]
 
         cancelSidecarTask()
-        clearSubtitleDrainTarget(channel: .primary)
+        clearSubtitleDrainTarget(channel: .primary, reason: .liveRenditionSelected)
         liveSubtitleFetchTask?.cancel()
         isSubtitleActive = true
         activeEmbeddedSubtitleStreamIndex = -1
@@ -180,10 +180,16 @@ extension AetherEngine {
         return cues.filter { $0.endTime >= horizon }
     }
 
+    /// `URLSession.shared` cannot carry a delegate, so this was the one engine fetch a host's trust
+    /// decision could never reach. Owned and process-wide for the same reason the carriage probe's
+    /// is: an uninvalidated session outlives its caller.
+    private static let renditionSession = URLSession(
+        configuration: .default, delegate: EngineTLS.sessionDelegate, delegateQueue: nil)
+
     private static func fetchText(_ url: URL, headers: [String: String]) async throws -> String {
         var request = URLRequest(url: url)
         for (key, value) in headers { request.setValue(value, forHTTPHeaderField: key) }
-        let (data, _) = try await URLSession.shared.data(for: request)
+        let (data, _) = try await renditionSession.data(for: request)
         guard let text = String(data: data, encoding: .utf8) else {
             throw HLSIngestError.playlistInvalid(reason: "rendition payload is not UTF-8")
         }

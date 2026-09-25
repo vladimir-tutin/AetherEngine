@@ -17,14 +17,27 @@ extension AetherEngine {
     /// #220 turned out to be, so the counter is polled at `triggerPollHz` and the zone walk runs once
     /// it climbs `triggerThresholdMB` above its running high-water. Pass `triggerPollHz: 0` for the
     /// plain 30 s census with no watcher.
+    ///
+    /// `triggerCaptureCap` bounds how many of those walks are logged (`0` = uncapped). The default of
+    /// twelve keeps a runaway from turning the log into a slideshow, but a session that climbs at a
+    /// steady mux rate spends one capture per threshold climbed and reaches the cap minutes before
+    /// the kill (AE#445, where the decisive final step survived only in the 30 s grid). Lift it when
+    /// the shape being hunted is a steady climb rather than a single step.
     public nonisolated static func setLargeAllocationCensusEnabled(
         _ enabled: Bool,
         triggerThresholdMB: Int = 64,
-        triggerPollHz: Double = 8
+        triggerPollHz: Double = 8,
+        triggerCaptureCap: Int = 12   // MallocBlockCensus.defaultTriggerCaptureCap, spelled out because that type is internal
     ) {
         MallocBlockCensus.isEnabled = enabled
+        // AE#445: the same switch, because they answer halves of one question. The malloc census
+        // covers the heap; the region census covers everything phys_footprint counts that malloc
+        // never sees, which is where three rounds of that issue ran out of instrument.
+        VMRegionCensus.isEnabled = enabled
+        if !enabled { VMRegionCensus.clearBaseline() }
         if enabled {
-            MallocBlockCensus.startTriggerWatch(thresholdMB: triggerThresholdMB, pollHz: triggerPollHz)
+            MallocBlockCensus.startTriggerWatch(thresholdMB: triggerThresholdMB, pollHz: triggerPollHz,
+                                                captureCap: triggerCaptureCap)
         } else {
             MallocBlockCensus.stopTriggerWatch()
         }
@@ -34,17 +47,165 @@ extension AetherEngine {
 
     /// Seconds of AVPlayer buffer ahead of the current playhead (sum of loadedTimeRanges beyond now). 0 on SW path / pre-start.
     /// Surfaced in the 30 s memprobe and the #65 VOD shift-publish diagnostic so a stale cross-epoch buffer is visible.
-    func avPlayerBufferAheadSeconds() -> Double {
+    ///
+    /// AE#422: async, because it hops off the main actor. Its one caller emits from inside a producer
+    /// restart, which is a state where the media server may not answer, and a figure that only ever
+    /// appears in a log line must not be able to block the app to produce itself.
+    func avPlayerBufferAheadSeconds() async -> Double {
         guard let avPlayer = currentAVPlayer, let item = avPlayer.currentItem else { return 0 }
-        let now = item.currentTime().seconds
-        var ahead = 0.0
-        for value in item.loadedTimeRanges {
-            let range = value.timeRangeValue
-            let start = range.start.seconds
-            let end = (range.start + range.duration).seconds
-            if end > now { ahead += end - max(start, now) }
+        return await AVFoundationOffMain.read(item, on: NativeAVPlayerHost.offMainReadQueue) { item in
+            let now = item.currentTime().seconds
+            var ahead = 0.0
+            for value in item.loadedTimeRanges {
+                let range = value.timeRangeValue
+                let start = range.start.seconds
+                let end = (range.start + range.duration).seconds
+                if end > now { ahead += end - max(start, now) }
+            }
+            return ahead
         }
-        return ahead
+    }
+
+    /// AE#418: the item's loaded ranges on the item axis. Where AVPlayer HOLDS what it fetched is the
+    /// only on-device account of where it placed a segment, and the axis is a statement about exactly
+    /// that. Off-main for the same reason as the buffer probe (AE#422).
+    func avPlayerLoadedRanges() async -> [(Double, Double)] {
+        guard let avPlayer = currentAVPlayer, let item = avPlayer.currentItem else { return [] }
+        return await AVFoundationOffMain.read(item, on: NativeAVPlayerHost.offMainReadQueue) { item in
+            item.loadedTimeRanges.map { value in
+                let r = value.timeRangeValue
+                return (r.start.seconds, (r.start + r.duration).seconds)
+            }
+        }
+    }
+
+    /// AE#509: the item's own account of itself, in the three fields a host dumps when a live join
+    /// fetches a whole window and presents none of it.
+    ///
+    /// The engine publishes `item time + playlistShiftSeconds`, so on a live source whose axis is
+    /// hours into an encoder clock the session clock and the ITEM clock are thousands of seconds
+    /// apart in a perfectly healthy session. A diagnostic that prints only the published clock
+    /// therefore cannot be read against a reporter's `AVPlayerItem.currentTime()` at all: the two
+    /// disagree by the shift by construction, which is the same disagreement a wedged session is
+    /// being accused of. Print both or neither.
+    ///
+    /// Off-main for the same reason as the buffer probe (AE#422).
+    public struct NativeItemReading: Sendable {
+        /// `AVPlayerItem.currentTime().seconds`, on the ITEM axis. NaN before the item resolves.
+        public let playhead: Double
+        /// `AVPlayerItem.loadedTimeRanges.count`. Zero is "nothing has been PLACED", which no buffer
+        /// depth can say: `isPlaybackBufferEmpty` is false on an item that fetched and placed
+        /// nothing (AE#418, a fetch is not a placement).
+        public let loadedRangeCount: Int
+        /// `AVPlayerItem.status.rawValue`: 0 unknown, 1 readyToPlay, 2 failed.
+        public let status: Int
+    }
+
+    /// The reading above, or nil when no native item is mounted (software path, pre-load, torn down).
+    public func nativeItemReading() async -> NativeItemReading? {
+        guard let avPlayer = currentAVPlayer, let item = avPlayer.currentItem else { return nil }
+        return await AVFoundationOffMain.read(item, on: NativeAVPlayerHost.offMainReadQueue) { item in
+            NativeItemReading(playhead: item.currentTime().seconds,
+                              loadedRangeCount: item.loadedTimeRanges.count,
+                              status: item.status.rawValue)
+        }
+    }
+
+    /// AE#418 round 3: check a just-published VOD axis against AVPlayer's own account of the placement
+    /// it describes, and let the session correct it when the base it composed onto was never carried.
+    ///
+    /// Polled rather than awaited on an edge, because the publish happens when the segment is FETCHED
+    /// and the ranges only move once AVPlayer has taken the bytes.
+    ///
+    /// Round 4: the first sample is the BASELINE, taken before AVPlayer can have the bytes, and every
+    /// later sample is read against it. Only a run that overlaps nothing in the baseline is this
+    /// placement's; the run that was already there answers a different question, and its own start
+    /// moves while it is asked, because AVPlayer backfills below a run after it opens. Reading the
+    /// first range that happened to hold the playhead is what let a stale run be reported as a
+    /// confirmation, one to two frames at a time, until the accumulated difference exceeded the check
+    /// itself.
+    /// Samples taken once the request behind the placement has been answered.
+    static let placementVerificationAttempts = 6
+    /// How long to keep waiting while it has NOT been. A deep re-aim makes the producer scan seconds
+    /// of source before its first segment lands, and an empty buffer says nothing about a placement
+    /// whose bytes have not gone out yet. The #93 slow-serve window reaches 25 to 50 s in the worst
+    /// case, so the wait outlasts the sampling rate: the first samples are 250 ms apart, and once the
+    /// answer is overdue they drop to one a second for the rest of it.
+    static let placementVerificationWaitSeconds = 30.0
+    static let placementVerificationIntervalMS = 250
+    static let placementVerificationSlowIntervalMS = 1000
+
+    /// AE#481: how long after a seek the landing's run is read for. The reading needs a run that
+    /// HOLDS the target, so it has to outlast the landing itself; three seconds covers a landing that
+    /// buffers on a shaped link (measured: the run holding the landing was there within 1.5 s on every
+    /// arm at 600 kbps / 300 ms) without keeping a sampler alive into the next seek.
+    static let landingAxisWaitSeconds = 3.0
+
+    /// AE#481: read what the run holding a seek landing carries, and correct the axis when the timeline
+    /// disagrees with the composition it inherited. Silent in every session whose landing stays inside
+    /// the run it was already playing, which is what a fast link produces.
+    func verifyAxisAtSeekLanding(session: HLSVideoEngine, landingItemSeconds: Double) {
+        landingAxisTask?.cancel()
+        landingAxisTask = Task { @MainActor [weak self, weak session] in
+            var waited = 0.0
+            while waited < Self.landingAxisWaitSeconds {
+                try? await Task.sleep(for: .milliseconds(Self.placementVerificationIntervalMS))
+                waited += Double(Self.placementVerificationIntervalMS) / 1000
+                guard !Task.isCancelled, let self, let session else { return }
+                let ranges = await self.avPlayerLoadedRanges()
+                guard !Task.isCancelled else { return }
+                // A publication is the end of it: the axis it wrote is the one every later reading
+                // composes onto, and sampling on would re-read what this just published.
+                if session.applyLandingAxisReading(
+                    landingItemSeconds: landingItemSeconds, ranges: ranges) { return }
+            }
+        }
+    }
+
+    func verifyPlacementAgainstLoadedRanges(session: HLSVideoEngine) {
+        placementVerificationTask?.cancel()
+        guard session.hasPlacementAwaitingMeasurement else { return }
+        placementVerificationTask = Task { @MainActor [weak self, weak session] in
+            var samplesSinceAnswered = 0
+            var lastRanges: [(Double, Double)] = []
+            var waited = 0.0
+            while waited < Self.placementVerificationWaitSeconds {
+                let intervalMS = samplesSinceAnswered > 0 || waited < 2.0
+                    ? Self.placementVerificationIntervalMS
+                    : Self.placementVerificationSlowIntervalMS
+                waited += Double(intervalMS) / 1000
+                try? await Task.sleep(for: .milliseconds(intervalMS))
+                guard !Task.isCancelled, let self, let session else { return }
+                let ranges = await self.avPlayerLoadedRanges()
+                guard !Task.isCancelled, let pending = session.pendingPlacement else { return }
+                lastRanges = ranges
+                // AE#418 round 7: the run that opens where this placement's segment begins is its own,
+                // through the axis the timeline carried or, on a timeline AVPlayer rebuilt, through no
+                // axis at all. Asked as "which run is new here", a later seek's run answers for it
+                // (measured against the picture: 21 s of error, and 41.667 s on the wide fixture).
+                if let run = HLSVideoEngine.placementRunStart(
+                    ranges: ranges, predictedSeam: pending.seam, rawSeam: pending.rawSeam) {
+                    session.reconcileAxisWithObservedPlacement(
+                        observedItemStart: run.start, itemClock: self.nativeClockSeconds,
+                        source: run.source)
+                    return
+                }
+                switch session.pendingPlacementDelivery {
+                case .some(false):
+                    // The response failed, so these bytes are never arriving.
+                    samplesSinceAnswered = Self.placementVerificationAttempts
+                case .some(true):
+                    samplesSinceAnswered += 1
+                case .none:
+                    break
+                }
+                if samplesSinceAnswered >= Self.placementVerificationAttempts { break }
+            }
+            guard !Task.isCancelled, let session, let pending = session.pendingPlacement else { return }
+            session.resolveUnreadablePlacement(
+                heldInBuffer: HLSVideoEngine.placementIsHeld(ranges: lastRanges, seam: pending.seam),
+                answered: session.pendingPlacementDelivery != nil)
+        }
     }
 
     // MARK: - Memory diagnostic
@@ -165,6 +326,11 @@ extension AetherEngine {
                     // 30 s cadence never sampled.
                     + MallocBlockCensus.probeFragment()
                     + (MallocBlockCensus.isEnabled ? "peakMB=\(MallocBlockCensus.peakSizeInUseMB) " : "")
+                    // AE#445: which VM region the footprint grew in, by tag and by delta against
+                    // the first tick. `physFP` rising while every bucket above it is flat is the
+                    // state this issue kept ending in, and it means the growth is somewhere none of
+                    // them look, not that there is nothing to find.
+                    + VMRegionCensus.probeFragment()
                     + "avioFetchedMB=\(avioMB) "
                     // #243: only the disc pull path fills this, and only then is it printed. On a
                     // remote ISO every reader fork pulls through HTTPDiscIOReader, which
@@ -358,10 +524,16 @@ extension AetherEngine {
         softwareHost?.ioWindowDiagnostics ?? nativeVideoSession?.demuxer?.ioWindowDiagnostics
     }
 
-    /// Resident bytes in the loopback HLS segment cache. nil when no native session is active.
+    /// Compressed resident bytes: software packet spool or native loopback segment cache.
     var cachedBytes: Int64? {
+        if let bytes = softwareHost?.cachedVODBytes { return bytes }
         guard let bytes = nativeVideoSession?.segmentCacheTotalBytes else { return nil }
         return Int64(bytes)
+    }
+
+    /// Short metadata lock only; never reads the packet store from the main actor.
+    var softwarePacketCacheSnapshot: SoftwarePacketReadAhead.Snapshot? {
+        softwareHost?.vodPacketCacheSnapshot
     }
 
     /// Freshly stat-ed on-disk footprint of the segment cache. nil when no native session is active. Used by `aetherctl live --report-cache-bytes`.

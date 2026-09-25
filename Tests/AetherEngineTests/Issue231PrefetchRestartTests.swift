@@ -1,6 +1,6 @@
 import Foundation
 import Testing
-import Libavcodec
+import AetherLibavcodec
 @testable import AetherEngine
 
 /// #231 (rrgomes, from a session that logged `cancelled=false harvested=22` mid-playback with

@@ -1,5 +1,5 @@
 import Foundation
-import Libavutil
+import AetherLibavutil
 
 /// Funnels FFmpeg's av_log output into EngineLog under .ffmpeg via av_log_set_callback.
 /// Without this bridge FFmpeg writes to stderr (invisible in App Store builds and in-app overlays).

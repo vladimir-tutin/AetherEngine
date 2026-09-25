@@ -113,7 +113,8 @@ enum RemoteHLSMediaSelection {
                 language: option.extendedLanguageTag,
                 isDefault: option.isDefault,
                 isForced: option.isForced,
-                isHearingImpaired: option.isSDH
+                isHearingImpaired: option.isSDH,
+                isNativelyRenderedSubtitle: true
             )
         }
     }

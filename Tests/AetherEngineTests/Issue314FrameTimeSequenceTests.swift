@@ -91,6 +91,7 @@ struct Issue314FrameTimeSequenceTests {
     /// zero therefore came up *below* the one it replaces, and a host applying the documented rule
     /// discarded every frame of the new item.
     @Test("a new renderer reports above the one it replaces")
+    @MainActor
     func newRendererOutranksTheOutgoingOne() throws {
         let outgoing = SampleBufferRenderer()
         let outgoingFrames = GenerationCollector()

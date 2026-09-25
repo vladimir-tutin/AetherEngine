@@ -1,8 +1,8 @@
 import Foundation
 import AVFoundation
-import Libavformat
-import Libavcodec
-import Libavutil
+import AetherLibavformat
+import AetherLibavcodec
+import AetherLibavutil
 
 /// In-band CEA-608 closed-caption support for a demuxable caption track (`eia_608` / QuickTime `c608`) (#77).
 ///

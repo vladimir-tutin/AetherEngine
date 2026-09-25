@@ -1,6 +1,6 @@
 import Foundation
 import CoreGraphics
-import Libavutil
+import AetherLibavutil
 
 /// Converts a decoded Dolby Vision Profile 5 / Profile 10.0 base-layer frame (which is
 /// IPT-PQ-C2, NOT standard YCbCr) into an SDR sRGB image by applying the Dolby Vision

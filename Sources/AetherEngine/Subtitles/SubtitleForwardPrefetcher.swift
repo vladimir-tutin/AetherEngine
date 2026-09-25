@@ -1,6 +1,6 @@
 import Foundation
-import Libavcodec
-import Libavutil
+import AetherLibavcodec
+import AetherLibavutil
 
 /// #151: subtitle-only forward side reader. The producer pump harvests subtitle packets only as
 /// far as its own forward park (#102), so the drainer's 60 s lead window (`subtitleDrainLeadSeconds`)
@@ -20,6 +20,11 @@ enum SubtitleForwardPrefetcher {
     /// How far behind the anchor a side reader starts reading, so the cue covering the anchor is
     /// not already behind the read head when the first packet arrives (#112 round 10).
     static let anchorBackscanSeconds: Double = 2.0
+
+    /// #416: step between two coverage notes, in seconds of source. Small against every authored
+    /// dwell (so a hole of subtitle size is always visible as one), large against a packet (so a
+    /// dense track does not take the store's lock per packet for it).
+    static let coverageNoteStepSeconds: Double = 0.5
 
     /// Where a positioning attempt landed. The byte estimate is a fallback, not a failure: the
     /// reader keeps working from wherever it put the cursor, it just cannot trust timestamps.
@@ -95,6 +100,15 @@ enum SubtitleForwardPrefetcher {
             lock.lock()
             defer { pending = nil; lock.unlock() }
             return pending
+        }
+
+        /// #496: is a move waiting, without consuming it. Both of the loop's waits ask, because the
+        /// point where the move is TAKEN sits after them: a wait that outlasts the request leaves
+        /// the reader banking packets for the stretch the viewer has left.
+        var hasPending: Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return pending != nil
         }
 
         func clear() {
@@ -228,6 +242,10 @@ enum SubtitleForwardPrefetcher {
         var timeBaseCache: [Int32: AVRational] = [:]
         var timeBaseFailures = 0
         var exit = Exit.cancelled
+        /// #416: the last read position reported to the store's coverage ledger. Reported in steps
+        /// rather than per packet: the ledger only has to be able to tell a hole of authored size
+        /// from continuous reading, and a step keeps this off the store's lock on a dense track.
+        var lastCoverageNoted = -Double.infinity
         /// #240: the valve's grant window. Set when a yield hit the cap, checked before the next
         /// arbitration so the reader keeps the link for a while rather than for one packet.
         var valveGrantedUntil: DispatchTime? = nil
@@ -248,8 +266,16 @@ enum SubtitleForwardPrefetcher {
             if let link, valveGrantedUntil.map({ DispatchTime.now() > $0 }) ?? true {
                 var yielded: Double = 0
                 while !Task.isCancelled,
-                      link.shouldYield(inAnchorGrace: DispatchTime.now() < anchorGraceUntil,
-                                       yieldedSeconds: yielded) {
+                      link.shouldYield(
+                        // #496: a pending move counts as freshly anchored. The grace exists so a
+                        // reader positioned somewhere new fills against a busy video path, and a
+                        // reader the viewer has just moved is in exactly that state; without this
+                        // the request waits behind up to a full yield cap while the region in front
+                        // of the playhead is harvested by nobody. A seek in flight still wins, that
+                        // rule sits above the grace.
+                        inAnchorGrace: DispatchTime.now() < anchorGraceUntil
+                            || reanchor?.hasPending == true,
+                        yieldedSeconds: yielded) {
                     if yielded == 0 { SubtitlePrefetchTelemetry.recordLinkYield(true) }
                     // The playhead moves while we wait, so the lead shrinks: a reader parked behind
                     // a busy pump returns to fetching on its own once it falls under the floor.
@@ -287,6 +313,12 @@ enum SubtitleForwardPrefetcher {
                 // Stamped here rather than at request time so the window between the two reads
                 // as unresolved instead of validating a position the seek has not reached yet.
                 SubtitlePrefetchTelemetry.recordReanchor(seekGeneration: target.seekGeneration)
+                // #416: the run that was reading up to here is over, and everything between where
+                // it got to and this anchor is ground nobody read. Stated as the anchor the reader
+                // ASKED for, not where the seek landed: a subtitle-axis seek lands at or before the
+                // request, so this under-claims by up to one authored gap and never over-claims.
+                store.noteHarvestAnchor(.prefetch, at: target.seconds)
+                lastCoverageNoted = -Double.infinity
                 anchorGraceUntil = DispatchTime.now()
                     + (link?.anchorGraceSeconds ?? SideReaderLinkPolicy.anchorGraceSeconds)
                 if let fresh = await playhead() { playheadSnapshot = fresh }
@@ -354,8 +386,19 @@ enum SubtitleForwardPrefetcher {
             // `prefetchLead` tracks the reader rather than the last cue, so on a sparse track it
             // now moves between cues instead of standing still.
             SubtitlePrefetchTelemetry.recordPacket(seconds: position, harvested: harvested)
+            // #416: this reader has now read to here. The pacing packets are what make the claim
+            // continuous over an authored silence, which is the stretch the ledger exists for.
+            if position >= lastCoverageNoted + coverageNoteStepSeconds {
+                store.noteHarvestProgress(.prefetch, through: position)
+                lastCoverageNoted = position
+            }
             var didPark = false
             while !Task.isCancelled, position > playheadSnapshot + leadSeconds {
+                // #496: a backward seek leaves the read position far past the new playhead, so this
+                // condition stays true for as long as the viewer stays behind it, and the loop never
+                // reaches the point where the move is taken. The pending move is what voids the
+                // position this park is judging.
+                if reanchor?.hasPending == true { break }
                 if !didPark {
                     didPark = true
                     SubtitlePrefetchTelemetry.recordPark(true)

@@ -2,7 +2,7 @@ import Testing
 import Foundation
 import CoreMedia
 import CoreVideo
-import Libavutil
+import AetherLibavutil
 @testable import AetherEngine
 
 /// #177 issue 3: anamorphic content on the software path rendered at coded dimensions (a thin
@@ -141,6 +141,7 @@ struct Issue177SARLatchTests {
     }
 
     @Test("a PAR change at identical geometry invalidates the cached format description")
+    @MainActor
     func parChangeInvalidatesFormatCache() throws {
         let renderer = SampleBufferRenderer()
 

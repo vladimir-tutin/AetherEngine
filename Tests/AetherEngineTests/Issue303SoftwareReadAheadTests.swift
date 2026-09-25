@@ -13,6 +13,7 @@ struct Issue303SoftwareReadAheadTests {
     // MARK: - Frontier
 
     @Test("the enqueued frontier follows the newest presentation timestamp, not the newest call")
+    @MainActor
     func frontierTracksMaximum() {
         let renderer = SampleBufferRenderer()
         #expect(renderer.newestEnqueuedPtsSeconds == nil)
@@ -27,6 +28,7 @@ struct Issue303SoftwareReadAheadTests {
     }
 
     @Test("a frame refused at the unschedulable-PTS gate does not advance the frontier")
+    @MainActor
     func untimedFrameDoesNotAdvanceFrontier() {
         let renderer = SampleBufferRenderer()
         renderer.enqueue(pixelBuffer: Self.makePixelBuffer(),

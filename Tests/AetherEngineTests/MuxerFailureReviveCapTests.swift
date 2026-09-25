@@ -37,7 +37,7 @@ struct MuxerFailureReviveCapTests {
         let engine = makeEngine()
         engine.muxerFailureReviveGate = MuxerFailureReviveGate(maxAttempts: 0)
         let failed = Flag()
-        engine.onVODSourceFailed = { failed.set($0, $1) }
+        engine.onVODSourceFailed = { code, reason, _ in failed.set(code, reason) }
 
         engine.handleVODMuxerFailure()
 
@@ -53,7 +53,7 @@ struct MuxerFailureReviveCapTests {
         let engine = makeEngine()
         engine.muxerFailureReviveGate = MuxerFailureReviveGate(maxAttempts: 2)
         let failed = Flag()
-        engine.onVODSourceFailed = { failed.set($0, $1) }
+        engine.onVODSourceFailed = { code, reason, _ in failed.set(code, reason) }
 
         engine.handleVODMuxerFailure()
 

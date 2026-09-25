@@ -19,12 +19,12 @@ extension AetherEngine {
 
     /// Park the current selection for the reload that follows this teardown. Called by both #127
     /// teardown paths (grace expiry and the synchronous assertion backstop) BEFORE `stopInternal`.
+    ///
+    /// Audit CORE-3: merged over what is already parked rather than replacing it. A second teardown
+    /// before the reload claims the first (an iOS `pause()` while backgrounded re-arms the grace
+    /// window) reads a session `stopInternal` has already wiped, and used to park that emptiness.
     func captureBackgroundTeardownSelection() {
-        backgroundTeardownSelection = BackgroundTeardownSelection(
-            subtitles: captureSubtitleSessionCarryover(),
-            audioTrackIndex: activeAudioTrackIndex,
-            discTitleID: activeDiscTitleID
-        )
+        backgroundTeardownSelection = liveSelection(over: backgroundTeardownSelection)
     }
 
     /// The selection a session-preserving reload must restore, claiming any parked teardown
@@ -32,7 +32,11 @@ extension AetherEngine {
     func consumeReloadSelection() -> BackgroundTeardownSelection {
         let parked = backgroundTeardownSelection
         backgroundTeardownSelection = nil
-        return BackgroundTeardownSelection(
+        return liveSelection(over: parked)
+    }
+
+    private func liveSelection(over parked: BackgroundTeardownSelection?) -> BackgroundTeardownSelection {
+        BackgroundTeardownSelection(
             subtitles: Self.mergedSubtitleCarryover(
                 live: captureSubtitleSessionCarryover(), snapshot: parked?.subtitles),
             audioTrackIndex: activeAudioTrackIndex ?? parked?.audioTrackIndex,

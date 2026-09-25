@@ -1,8 +1,8 @@
 import Testing
 import Foundation
-import Libavformat
-import Libavcodec
-import Libavutil
+import AetherLibavformat
+import AetherLibavcodec
+import AetherLibavutil
 @testable import AetherEngine
 
 /// AE#221: a FLAC source whose `STREAMINFO` declares `min_blocksize = 0` produced an HLS asset AVFoundation

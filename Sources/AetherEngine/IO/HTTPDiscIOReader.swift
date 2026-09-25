@@ -60,7 +60,8 @@ final class HTTPDiscIOReader: IOReader, @unchecked Sendable {
             c.requestCachePolicy = .reloadIgnoringLocalCacheData
             return c
         }()
-        self.session = URLSession(configuration: config)
+        self.session = URLSession(
+            configuration: config, delegate: EngineTLS.sessionDelegate, delegateQueue: nil)
 
         guard let size = Self.probeSize(
             url: url, extraHeaders: extraHeaders, session: session,
@@ -85,6 +86,15 @@ final class HTTPDiscIOReader: IOReader, @unchecked Sendable {
         let total = value[value.index(after: slash)...].trimmingCharacters(in: .whitespaces)
         guard total != "*" else { return nil }
         return Int64(total)
+    }
+
+    /// Start offset from a `Content-Range` value (`bytes 100-200/12345` -> 100). Nil for junk.
+    static func parseContentRangeStart(_ value: String) -> Int64? {
+        let trimmed = value.trimmingCharacters(in: .whitespaces)
+        guard trimmed.hasPrefix("bytes ") else { return nil }
+        let rest = trimmed.dropFirst("bytes ".count)
+        guard let dash = rest.firstIndex(of: "-") else { return nil }
+        return Int64(rest[rest.startIndex..<dash])
     }
 
     /// Next adaptive window: `base` when `position` is not the sequential continuation of the last
@@ -157,6 +167,12 @@ final class HTTPDiscIOReader: IOReader, @unchecked Sendable {
     // MARK: - HTTP
 
     /// One range GET retried up to `maxRetries` times with linear backoff; aborts early on cancel.
+    ///
+    /// Requires a 206 whose `Content-Range` start matches `offset` exactly: a proxy that answers a
+    /// range request with a full 200 (cache miss, range coalescing, a Range-stripping origin) or a
+    /// 206 that starts somewhere else places its body at `position` regardless, corrupting the disc
+    /// structure or media stream read through it (audit NET-9). The body is also trimmed to `length`
+    /// in case the server sent more than asked.
     private func fetchWithRetry(offset: Int64, length: Int) -> Data? {
         var attempt = 0
         while true {
@@ -164,8 +180,10 @@ final class HTTPDiscIOReader: IOReader, @unchecked Sendable {
             if stop { return nil }
             if let r = Self.rangeGet(url: url, extraHeaders: extraHeaders, session: session,
                                      timeout: requestTimeout, offset: offset, length: length),
-               r.status == 206 || r.status == 200, !r.body.isEmpty {
-                return r.body
+               r.status == 206, !r.body.isEmpty,
+               let contentRange = r.contentRange,
+               Self.parseContentRangeStart(contentRange) == offset {
+                return r.body.count > length ? r.body.prefix(length) : r.body
             }
             attempt += 1
             if attempt > maxRetries { return nil }

@@ -49,9 +49,24 @@ struct BackgroundKeepaliveTests {
         #expect(AetherEngine.backgroundAction(isAudioBackend: false, hasSoftwareHost: true, keepVideoAlive: false, pipActive: false, state: .paused) == .teardownVideo)
     }
 
-    @Test("do nothing when idle or loading (nothing to tear down)")
-    func doNothingWhenNotPlayable() {
+    /// Audit CORE-2: a load or seek in flight DOES have a pipeline (loopback server, AVIO connection,
+    /// the item). It is not torn down mid-flight, it is judged once it settles, and that judgement is
+    /// owed rather than skipped: a load finishing after the TV button used to start playing in the
+    /// background and cross the suspension whole.
+    @Test("a load or seek in flight is not torn down mid-flight, the decision is owed until it settles")
+    func loadOrSeekInFlightOwesTheDecision() {
         #expect(AetherEngine.backgroundAction(isAudioBackend: false, hasSoftwareHost: false, keepVideoAlive: false, pipActive: false, state: .loading) == .doNothing)
+        #expect(AetherEngine.backgroundAction(isAudioBackend: false, hasSoftwareHost: false, keepVideoAlive: false, pipActive: false, state: .seeking) == .doNothing)
+        #expect(AetherEngine.backgroundActionIsOwed(state: .loading))
+        #expect(AetherEngine.backgroundActionIsOwed(state: .seeking))
+    }
+
+    @Test("a settled or idle session owes nothing")
+    func settledStatesOweNothing() {
+        #expect(AetherEngine.backgroundAction(isAudioBackend: false, hasSoftwareHost: false, keepVideoAlive: false, pipActive: false, state: .idle) == .doNothing)
+        for state: PlaybackState in [.idle, .playing, .paused, .ended, .error("x")] {
+            #expect(!AetherEngine.backgroundActionIsOwed(state: state))
+        }
     }
 
     @Test("tvOS: an active PiP window keeps the video pipeline alive")

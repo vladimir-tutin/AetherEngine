@@ -112,6 +112,34 @@ struct HTTPDiscIOReaderTests {
         #expect(Array(out[0..<100]) == Array(src[0..<100]))
     }
 
+    // audit NET-9: a 206 that claims a different start than what was requested must never be
+    // accepted; the reader would otherwise place those bytes at `position` and corrupt whatever
+    // structure or stream is read through it.
+    @Test("A 206 whose Content-Range start does not match the request is refused, not served")
+    func misrangedResponseIsRefused() throws {
+        let src = (0..<2000).map { UInt8($0 & 0xff) }
+        let r = try #require(makeReader(src))  // the offset-0 probe is unaffected and succeeds
+        MockRangeURLProtocol.misrangedFor.insert("http://disc.test/test.iso")
+        #expect(r.seek(offset: 1000, whence: SEEK_SET) == 1000)
+        var out = [UInt8](repeating: 0, count: 100)
+        let n = out.withUnsafeMutableBufferPointer { r.read($0.baseAddress, size: 100) }
+        #expect(n == -1)
+    }
+
+    // audit NET-9: a proxy that falls back to a full 200 mid-session (cache miss, range
+    // coalescing, a Range-stripping origin) must be treated as fatal for this reader, not read as
+    // if byte 0 of the body were the requested offset.
+    @Test("A 200 answer mid-session is refused, not served as if it started at the requested offset")
+    func plain200MidSessionIsRefused() throws {
+        let src = (0..<2000).map { UInt8($0 & 0xff) }
+        let r = try #require(makeReader(src))  // the offset-0 probe is unaffected and succeeds
+        MockRangeURLProtocol.plain200AfterProbeFor.insert("http://disc.test/test.iso")
+        #expect(r.seek(offset: 1000, whence: SEEK_SET) == 1000)
+        var out = [UInt8](repeating: 0, count: 100)
+        let n = out.withUnsafeMutableBufferPointer { r.read($0.baseAddress, size: 100) }
+        #expect(n == -1)
+    }
+
     @Test("A server without range support fails init (caller falls back to streaming)")
     func noRangeSupport() {
         let url = URL(string: "http://disc.test/noRange.iso")!
@@ -143,9 +171,17 @@ final class MockRangeURLProtocol: URLProtocol, @unchecked Sendable {
     nonisolated(unsafe) static var disableRangeFor: Set<String> = []
     /// Number of leading requests per URL that should fail with a network error (retry testing).
     nonisolated(unsafe) static var failFirstForURL: [String: Int] = [:]
+    /// audit NET-9: any request at a non-zero offset gets a 206 that claims to start at 0 (a
+    /// mis-ranged response) instead of the requested offset, with junk bytes so a caller that
+    /// trusted it would read garbage rather than the source.
+    nonisolated(unsafe) static var misrangedFor: Set<String> = []
+    /// audit NET-9: any request at a non-zero offset gets a full 200 instead of a 206 (a
+    /// Range-ignoring proxy or a cache-miss fallback), body starting at byte 0 of the source.
+    nonisolated(unsafe) static var plain200AfterProbeFor: Set<String> = []
 
     static func reset() {
         bytesByURL = [:]; disableRangeFor = []; failFirstForURL = [:]
+        misrangedFor = []; plain200AfterProbeFor = []
     }
 
     override class func canInit(with request: URLRequest) -> Bool { true }
@@ -180,7 +216,16 @@ final class MockRangeURLProtocol: URLProtocol, @unchecked Sendable {
             status = 206
             headers["Content-Range"] = "bytes \(lower)-\(upper)/\(total)"
         }
-        let slice = (lower <= upper && lower < total) ? data.subdata(in: lower..<(upper + 1)) : Data()
+        var slice = (lower <= upper && lower < total) ? data.subdata(in: lower..<(upper + 1)) : Data()
+        if lower > 0, status == 206, Self.misrangedFor.contains(url.absoluteString) {
+            headers["Content-Range"] = "bytes 0-\(slice.count - 1)/\(total)"
+            slice = Data(repeating: 0xEE, count: slice.count)
+        }
+        if lower > 0, status == 206, Self.plain200AfterProbeFor.contains(url.absoluteString) {
+            status = 200
+            headers["Content-Range"] = nil
+            slice = data
+        }
         headers["Content-Length"] = String(slice.count)
         let resp = HTTPURLResponse(url: url, statusCode: status, httpVersion: "HTTP/1.1", headerFields: headers)!
         client?.urlProtocol(self, didReceive: resp, cacheStoragePolicy: .notAllowed)

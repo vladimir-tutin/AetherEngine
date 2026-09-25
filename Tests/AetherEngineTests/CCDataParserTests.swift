@@ -1,5 +1,5 @@
 import Testing
-import Libavcodec
+import AetherLibavcodec
 @testable import AetherEngine
 
 // #77: `CCDataParser` reads the bare cc_data triplet stream FFmpeg's MOV demuxer emits for a demuxable

@@ -1,9 +1,9 @@
 import Foundation
 import CoreGraphics
 import Compression
-import Libavcodec
-import Libavformat
-import Libavutil
+import AetherLibavcodec
+import AetherLibavformat
+import AetherLibavutil
 
 /// Packet-by-packet decoder for an embedded subtitle stream (SubRip/ASS/SSA/WebVTT/mov_text/PGS/DVB/HDMV).
 /// Owns one AVCodecContext per active track; HLSSegmentProducer feeds packets and bridges results to MainActor.
@@ -44,8 +44,15 @@ final class EmbeddedSubtitleDecoder {
     private let sourceVideoWidth: Int32
     private let sourceVideoHeight: Int32
 
-    /// When true and codec is ASS/SSA, cues carry the raw libavcodec event line (AetherEngine#30 styled rendering).
-    private let preserveASSMarkup: Bool
+    /// `LoadOptions.preserveASSMarkup` ALREADY GATED on this stream's codec: true only for ASS/SSA,
+    /// where cues then carry the raw libavcodec event line (AetherEngine#30 styled rendering).
+    ///
+    /// AE#587: named for the answer rather than the option because the gate is set in `init` and read
+    /// a hundred lines below, and a property carrying the option's own name reads at the emit site as
+    /// if no gate existed at all. libavcodec normalises SubRip, WebVTT and mov_text through
+    /// `ff_ass_add_rect` too, so every text codec has an ASS payload to emit and only the codec tells
+    /// them apart.
+    private let emitsRawASSLines: Bool
 
     /// #107: explicit teletext page override (nil = libzvbi `subtitle` auto-detect).
     private let teletextPage: Int?
@@ -93,7 +100,8 @@ final class EmbeddedSubtitleDecoder {
         self.codecContext = ctx
         self.sourceVideoWidth = sourceVideoWidth
         self.sourceVideoHeight = sourceVideoHeight
-        self.preserveASSMarkup = preserveASSMarkup
+        // The documented "only affects ASS / SSA codecs" gate, matching SubtitleDecoder's sidecar path.
+        self.emitsRawASSLines = preserveASSMarkup
             && (id == AV_CODEC_ID_ASS || id == AV_CODEC_ID_SSA)
         self.teletextPage = teletextPage
 
@@ -211,7 +219,9 @@ final class EmbeddedSubtitleDecoder {
                         bodies.append(parsed.body)
                         placement = placement ?? parsed.placement
                     }
-                } else if preserveASSMarkup, let raw = SubtitleRectText.rawASSLine(for: rect) {
+                } else if emitsRawASSLines, let raw = SubtitleRectText.rawASSLine(for: rect) {
+                    // ASS/SSA only; every other text codec falls through to the extraction below
+                    // (AE#587, gate in init).
                     textLines.append(raw)
                 } else if let assLine = SubtitleRectText.rawASSLine(for: rect),
                           let parsed = SubtitleRectText.styledBody(fromASSEventLine: assLine,
@@ -631,21 +641,38 @@ final class EmbeddedSubtitleDecoder {
         // Malformed rect guard: stride < width would read past the plane allocation.
         guard stride >= width else { return nil }
 
+        // AE#628: resolve the palette once. Every pixel below is then one table read instead of a
+        // palette walk plus a premultiply; on a full-canvas plane that is the difference between 5 ms
+        // and 1.3 ms per display set in release, and 211 ms and 52 ms in a debug build.
+        // Premultiplied: straight alpha produces black-fringe edges in CGImage premultipliedLast.
+        // Packed so a little-endian store lays the bytes out as R, G, B, A.
+        let alphaThreshold: UInt8 = 8
+        var visible = [Bool](repeating: false, count: 256)
+        var premultiplied = [UInt32](repeating: 0, count: 256)
+        for i in 0..<256 {
+            let b = UInt32(palettePtr[i * 4 + 0])
+            let g = UInt32(palettePtr[i * 4 + 1])
+            let red = UInt32(palettePtr[i * 4 + 2])
+            let a = UInt32(palettePtr[i * 4 + 3])
+            visible[i] = palettePtr[i * 4 + 3] >= alphaThreshold
+            premultiplied[i] = ((red * a + 127) / 255)
+                | (((g * a + 127) / 255) << 8)
+                | (((b * a + 127) / 255) << 16)
+                | (a << 24)
+        }
+
         // Re-crop to non-zero-alpha bounding box: some Blu-ray-to-MKV conversions emit full 1920x1080 ODS bitmaps
         // with cropping params that FFmpeg's pgssubdec discards, carrying ~8 MB of transparent pixels per cue.
-        let alphaThreshold: UInt8 = 8
         var minX = width, minY = height, maxX = -1, maxY = -1
-        for y in 0..<height {
-            let rowOff = y * stride
-            for x in 0..<width {
-                let palIdx = Int(pixelsPtr[rowOff + x])
-                let alpha = palettePtr[palIdx * 4 + 3]
-                if alpha >= alphaThreshold {
-                    if x < minX { minX = x }
-                    if y < minY { minY = y }
-                    if x > maxX { maxX = x }
-                    if y > maxY { maxY = y }
-                }
+        visible.withUnsafeBufferPointer { visible in
+            for y in 0..<height {
+                let row = UnsafeBufferPointer(start: pixelsPtr + y * stride, count: width)
+                guard let first = row.firstIndex(where: { visible[Int($0)] }),
+                      let last = row.lastIndex(where: { visible[Int($0)] }) else { continue }
+                minX = min(minX, first)
+                maxX = max(maxX, last)
+                if minY == height { minY = y }
+                maxY = y
             }
         }
         guard maxX >= minX, maxY >= minY else { return nil }
@@ -655,27 +682,17 @@ final class EmbeddedSubtitleDecoder {
         let absX = Int(r.x) + minX
         let absY = Int(r.y) + minY
 
-        var rgba = [UInt8](repeating: 0, count: cropW * cropH * 4)
-        for cy in 0..<cropH {
-            let srcRow = (minY + cy) * stride
-            let dstRow = cy * cropW * 4
-            for cx in 0..<cropW {
-                let palIdx = Int(pixelsPtr[srcRow + minX + cx])
-                let palOff = palIdx * 4
-                let b = palettePtr[palOff + 0]
-                let g = palettePtr[palOff + 1]
-                let red = palettePtr[palOff + 2]
-                let a = palettePtr[palOff + 3]
-                // Premultiply: straight alpha produces black-fringe edges in CGImage premultipliedLast.
-                let outOff = dstRow + cx * 4
-                rgba[outOff + 0] = UInt8((Int(red) * Int(a) + 127) / 255)
-                rgba[outOff + 1] = UInt8((Int(g) * Int(a) + 127) / 255)
-                rgba[outOff + 2] = UInt8((Int(b) * Int(a) + 127) / 255)
-                rgba[outOff + 3] = a
+        var data = Data(count: cropW * cropH * 4)
+        data.withUnsafeMutableBytes { raw in
+            let out = raw.bindMemory(to: UInt32.self)
+            premultiplied.withUnsafeBufferPointer { lut in
+                for cy in 0..<cropH {
+                    let src = pixelsPtr + (minY + cy) * stride + minX
+                    let dst = cy * cropW
+                    for cx in 0..<cropW { out[dst + cx] = lut[Int(src[cx])].littleEndian }
+                }
             }
         }
-
-        let data = Data(rgba)
         guard let provider = CGDataProvider(data: data as CFData),
               let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)
         else { return nil }

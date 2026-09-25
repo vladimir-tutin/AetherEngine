@@ -33,6 +33,27 @@ enum SWClockAnchorPolicy {
                           sessionZeroSeconds: max(0, firstSampleSeconds - initialSeconds))
     }
 
+    /// Converts a session-axis position into the source axis.
+    ///
+    /// The host publishes positions session-relative (`raw - sessionZero`), but the
+    /// demuxer, the packet store, the decoder's skip threshold and the synchronizer
+    /// clock all speak the source's own timestamps. A seek arrives on the session
+    /// axis and has to be carried back over before it reaches any of them; for a
+    /// zero-based source the two axes coincide and this is the identity.
+    ///
+    /// Without it, a mid-stream-joined source seeks to a timestamp that lies before
+    /// its own first packet (which the demuxer clamps to the start of the file),
+    /// and the packet store's reservoir, measured as `storedPacketSeconds - clock`,
+    /// reads as the whole offset. On a capture whose first PTS is six hours in, the
+    /// producer sees six hours of buffer, stops reading, and the consumer starves
+    /// with nothing to report.
+    static func sourceSeconds(forSession seconds: Double, sessionZeroSeconds: Double) -> Double {
+        guard seconds.isFinite, sessionZeroSeconds.isFinite, sessionZeroSeconds > 0 else {
+            return seconds
+        }
+        return seconds + sessionZeroSeconds
+    }
+
     /// Whether a video packet parked on renderer back-pressure has to anchor the clock itself
     /// (#337).
     ///

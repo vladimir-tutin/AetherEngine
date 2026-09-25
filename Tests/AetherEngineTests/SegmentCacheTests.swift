@@ -31,6 +31,34 @@ struct SegmentCacheTests {
         #expect(c.totalBytes == 250)
     }
 
+    @Test("A re-adopted index gets a fresh file and retires the previous one (audit SEG-4)")
+    func readoptionNeverReusesAPath() throws {
+        let c = SegmentCache(forwardWindow: 5, backwardWindow: 5)
+        defer { c.close() }
+        func staged(_ n: Int, fill: UInt8) throws -> URL {
+            let url = c.sessionDir.appendingPathComponent("staging-\(UUID().uuidString).tmp")
+            try makeData(n, fill: fill).write(to: url)
+            return url
+        }
+        c.adopt(index: 3, stagingPath: try staged(100, fill: 0x01), byteCount: 100)
+        let first = try #require(c.peekURL(index: 3))
+        c.adopt(index: 3, stagingPath: try staged(250, fill: 0x02), byteCount: 250)
+        let second = try #require(c.peekURL(index: 3))
+
+        // A reader that resolved the first URL and finds it gone must not be able to drop the
+        // second adoption, which it could while both generations shared one path.
+        #expect(first != second)
+        #expect(!FileManager.default.fileExists(atPath: first.path))
+        #expect(c.fetch(index: 3, timeout: 0.1)?.first == 0x02)
+        #expect(c.count == 1)
+        #expect(c.totalBytes == 250)
+
+        c.store(index: 3, data: makeData(40, fill: 0x03))
+        #expect(!FileManager.default.fileExists(atPath: second.path))
+        #expect(c.peek(index: 3)?.first == 0x03)
+        #expect(c.totalBytes == 40)
+    }
+
     @Test("Backward refetch does not evict already-produced forward segments")
     func backwardRefetchKeepsForward() {
         // forwardWindow small, backwardWindow wide so production never prunes the trailing end.
@@ -90,6 +118,49 @@ struct SegmentCacheTests {
         #expect(c.peek(index: 4) == nil)
         #expect(c.peek(index: 5) != nil)
         #expect(c.totalBytes == 60)   // seg 5..10 == 6 * 10 bytes
+    }
+
+    @Test("residentIndexRanges is empty when the cache is empty")
+    func residentRangesEmpty() {
+        let c = SegmentCache()
+        defer { c.close() }
+        #expect(c.residentIndexRanges().isEmpty)
+    }
+
+    @Test("residentIndexRanges reports one stored segment")
+    func residentRangesOneSegment() {
+        let c = SegmentCache()
+        defer { c.close() }
+        c.store(index: 3, data: makeData(10))
+        #expect(c.residentIndexRanges() == [3...3])
+    }
+
+    @Test("residentIndexRanges merges adjacent segments")
+    func residentRangesAdjacentSegments() {
+        let c = SegmentCache()
+        defer { c.close() }
+        c.store(index: 3, data: makeData(10))
+        c.store(index: 4, data: makeData(10))
+        #expect(c.residentIndexRanges() == [3...4])
+    }
+
+    @Test("residentIndexRanges preserves separated islands")
+    func residentRangesSeparatedSegments() {
+        let c = SegmentCache()
+        defer { c.close() }
+        c.store(index: 1, data: makeData(10))
+        c.store(index: 2, data: makeData(10))
+        c.store(index: 4, data: makeData(10))
+        #expect(c.residentIndexRanges() == [1...2, 4...4])
+    }
+
+    @Test("residentIndexRanges reflects evictBelow")
+    func residentRangesAfterEviction() {
+        let c = SegmentCache()
+        defer { c.close() }
+        for index in [1, 2, 4] { c.store(index: index, data: makeData(10)) }
+        c.evictBelow(2)
+        #expect(c.residentIndexRanges() == [2...2, 4...4])
     }
 
     @Test("Init version resolution picks the highest fromSegment at or below the index")

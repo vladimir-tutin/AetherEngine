@@ -1,8 +1,8 @@
 import Foundation
 import CoreMedia
 import CoreVideo
-import Libavformat
-import Libavcodec
+import AetherLibavformat
+import AetherLibavcodec
 
 /// Decoded frame callback. `hdr10PlusT35` carries HDR10+ dynamic metadata serialised to ITU-T T.35 bytes
 /// (kCMSampleAttachmentKey_HDR10PlusPerFrameData format); nil for non-HDR10+ streams.
@@ -22,8 +22,17 @@ protocol VideoDecodingPipeline: AnyObject, Sendable {
     var onA53Captions: (@Sendable ([CCDataParser.CCTriplet], Double) -> Void)? { get set }
     var skipUntilPTS: CMTime? { get set }
 
+    /// AE#492: the decoder's current feed epoch. A caller that decides a batch of packets is
+    /// current captures this, hands it back with each one, and the decoder refuses any packet whose
+    /// epoch `flush()` has since retired. Read and compared under the same lock `flush()` takes, so
+    /// a flush and a feed cannot interleave: the alternative is a caller re-reading a generation it
+    /// cannot hold across the call it is about to make.
+    var feedEpoch: UInt64 { get }
+
     func open(stream: UnsafeMutablePointer<AVStream>, onFrame: @escaping DecodedFrameHandler) throws
-    func decode(packet: UnsafeMutablePointer<AVPacket>)
+    /// `epoch` is the value read from `feedEpoch` when this packet was decided to be current;
+    /// `nil` from a caller with no seek of its own to be invalidated by.
+    func decode(packet: UnsafeMutablePointer<AVPacket>, epoch: UInt64?)
     func flush()
     func close()
 }

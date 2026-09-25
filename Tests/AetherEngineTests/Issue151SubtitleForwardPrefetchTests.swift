@@ -1,6 +1,6 @@
 import Foundation
 import Testing
-import Libavcodec
+import AetherLibavcodec
 @testable import AetherEngine
 
 /// #151 (rrgomes): on direct-play sources the SubtitlePacketStore's forward frontier ends at the
@@ -91,7 +91,7 @@ struct Issue151SubtitleForwardPrefetchTests {
         }
 
         // 2 / 30 / 55 s are inside the lead; 90 s is the packet whose read trips the park.
-        let reachedPark = await Self.waitUntil { store.frontier(streamIndex: 0) == 90 }
+        let reachedPark = try await waitFor(upTo: .seconds(5)) { store.frontier(streamIndex: 0) == 90 }
         #expect(reachedPark, "prefetch never reached the park point (frontier=\(store.frontier(streamIndex: 0) ?? -1))")
 
         // Parked: the 120 s event must not be read while the playhead stays at 0.
@@ -146,6 +146,18 @@ struct Issue151SubtitleForwardPrefetchTests {
             isLive: false, hasEmbeddedDrainTargets: true, hasSource: false))
     }
 
+    @Test("prefetch holds whenever its origin is paced or serial")
+    func meteredOriginHoldTruthTable() {
+        #expect(!SubtitleForwardPrefetcher.shouldHold(
+            originPaced: false, originSerial: false))
+        #expect(SubtitleForwardPrefetcher.shouldHold(
+            originPaced: true, originSerial: false))
+        #expect(SubtitleForwardPrefetcher.shouldHold(
+            originPaced: false, originSerial: true))
+        #expect(SubtitleForwardPrefetcher.shouldHold(
+            originPaced: true, originSerial: true))
+    }
+
     /// A drain-tick jump (seek) re-anchors the prefetcher; a fresh selection (no cursor yet) does
     /// not, because the selection path starts it itself; steady decode ticks never restart it.
     @Test("re-anchor fires on a jump with an existing cursor only")
@@ -165,15 +177,6 @@ struct Issue151SubtitleForwardPrefetchTests {
 
     // MARK: - Helpers
 
-    private static func waitUntil(deadlineSeconds: Double = 5,
-                                  _ condition: @Sendable () -> Bool) async -> Bool {
-        let deadline = Date().addingTimeInterval(deadlineSeconds)
-        while Date() < deadline {
-            if condition() { return true }
-            try? await Task.sleep(nanoseconds: 20_000_000)
-        }
-        return condition()
-    }
 }
 
 /// Returns the initial playhead exactly once, nil on every later call (engine torn down mid-read).

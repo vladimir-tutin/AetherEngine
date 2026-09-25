@@ -1,4 +1,4 @@
-import Libavutil
+import AetherLibavutil
 
 /// Whether a declared sample aspect ratio deserves to be believed. Two gates that catch different
 /// lies; both are cheap enough to run per frame.
@@ -51,5 +51,22 @@ enum PixelAspectPolicy {
     /// Display aspect the coded frame resolves to once the SAR is applied.
     static func displayAspect(sar: AVRational, width: Int32, height: Int32) -> Double {
         (Double(width) * Double(sar.num)) / (Double(height) * Double(sar.den))
+    }
+
+    /// The ratio a stream actually deserves, or nil when there is nothing to correct. Bitstream
+    /// first, container second (`declaredStreamSAR`), then both gates above. Square pixels return
+    /// nil rather than 1:1, because a correction of one is a correction a consumer cannot tell from
+    /// a real one.
+    ///
+    /// This is the single answer every consumer of a source SAR is meant to take: the VT decoder
+    /// (#354), the fMP4 the loopback serves, and the ratio the engine publishes to its host. Two of
+    /// them resolving it separately is two shapes that can disagree about one picture.
+    static func declaredPixelAspect(
+        bitstream: AVRational, container: AVRational, width: Int32, height: Int32
+    ) -> AVRational? {
+        let declared = SoftwareVideoDecoder.declaredStreamSAR(bitstream: bitstream, container: container)
+        guard let sane = saneSAR(declared, width: width, height: height),
+              sane.num != sane.den else { return nil }
+        return sane
     }
 }

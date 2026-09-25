@@ -1,6 +1,6 @@
 import Foundation
-import Libavfilter
-import Libavutil
+import AetherLibavfilter
+import AetherLibavutil
 
 /// Deinterlacer selection + cadence for the software-decode path, resolved from `LoadOptions`
 /// at load time and handed to `SoftwareVideoDecoder` before `open`.
@@ -131,6 +131,10 @@ final class DeinterlaceFilter {
         timeBase: AVRational,
         engine wanted: Engine
     ) -> Bool {
+        // AE#492: the build cost belongs on the line that reports the build. A seek tears the graph
+        // down, so this is paid per seek on interlaced sources and never on progressive ones, and
+        // without the number the two are not comparable.
+        let buildStart = DispatchTime.now()
         // Engine-specific preconditions.
         switch wanted {
         case .hardware:
@@ -295,8 +299,9 @@ final class DeinterlaceFilter {
         width = frame.pointee.width
         height = frame.pointee.height
         pixFmt = frame.pointee.format
+        let buildMs = Double(DispatchTime.now().uptimeNanoseconds - buildStart.uptimeNanoseconds) / 1e6
         EngineLog.emit(
-            "[Deinterlace] engaged [\(wanted.rawValue)]: \(width)x\(height) pixFmt=\(pixFmt) (\(chain)) outTB=\(outputTimeBase.num)/\(outputTimeBase.den)",
+            "[Deinterlace] engaged [\(wanted.rawValue)]: \(width)x\(height) pixFmt=\(pixFmt) (\(chain)) outTB=\(outputTimeBase.num)/\(outputTimeBase.den) built in \(String(format: "%.1f", buildMs))ms",
             category: .swPlayback
         )
         return true

@@ -1,6 +1,6 @@
 import Foundation
-import Libavcodec
-import Libavutil
+import AetherLibavcodec
+import AetherLibavutil
 
 /// #232: verifies a DECLARED interlaced H.264 stream against what the decoder actually emits.
 ///

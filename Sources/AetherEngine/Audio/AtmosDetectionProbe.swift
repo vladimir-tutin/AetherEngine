@@ -1,7 +1,7 @@
 import Foundation
-import Libavformat
-import Libavcodec
-import Libavutil
+import AetherLibavformat
+import AetherLibavcodec
+import AetherLibavutil
 
 /// Bounds (and optional track override) for `AetherEngine.probeDetectingAtmos`'s bounded EAC3/JOC decode pass.
 ///
@@ -25,8 +25,8 @@ public struct AtmosDetectionOptions: Sendable, Equatable {
     /// empty-audio source.
     public var maxPackets: Int
 
-    /// Stop after this many cumulative packet bytes, independent of packet count. Guards a stream with
-    /// abnormally large packets from exhausting the `maxPackets` budget slowly. Default 8 MiB.
+    /// Maximum cumulative bytes offered to the decoder. A packet exceeding the remaining allowance is
+    /// rejected before decode. This is not an input-read or native allocation ceiling. Default 8 MiB.
     public var maxBytes: Int64
 
     /// Soft wall-clock budget checked BETWEEN packet reads. This is NOT preemptive: a single blocking
@@ -137,6 +137,15 @@ extension AetherEngine {
     /// Packet ceiling for the AVDISCARD_ALL fuse, saturating instead of trapping: `maxPackets` is a public
     /// option and `Int.max` is a plausible "no limit" value for a host to pass (`forwardBufferSegments`
     /// takes exactly that), which would overflow a plain multiply.
+    /// Source bytes the probe may consume across every stream. With the other streams at AVDISCARD_ALL
+    /// the demuxer reads and drops a video run inside one `av_read_frame`, where neither `maxBytes` nor
+    /// the packet fuse sees it. Wider than the HDR10+ budget because the audio sits behind interleaved
+    /// UHD video here: 16 x `maxBytes`, at least 64 MiB. Saturating: `maxBytes` is public.
+    nonisolated static func atmosInputByteBudget(maxBytes: Int64) -> Int64 {
+        let (product, overflowed) = max(0, maxBytes).multipliedReportingOverflow(by: 16)
+        return overflowed ? .max : max(product, 64 * 1024 * 1024)
+    }
+
     nonisolated static func atmosForeignPacketFuse(maxPackets: Int) -> Int {
         let (product, overflowed) = maxPackets.multipliedReportingOverflow(by: foreignPacketFuseMultiplier)
         return overflowed ? Int.max : product
@@ -228,6 +237,8 @@ extension AetherEngine {
         // exhaust the 8 MiB byte cap in well under a second of container data, and the probe returns
         // .byteCap having fed the decoder nothing -- reporting "not Atmos" for genuinely Atmos media.
         demuxer.discardAllStreamsExcept([targetIndex])
+        demuxer.beginInputByteBudget(Self.atmosInputByteBudget(maxBytes: options.maxBytes))
+        defer { demuxer.endInputByteBudget() }
 
         while true {
             let elapsed = Double(DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds) / 1_000_000_000
@@ -242,15 +253,26 @@ extension AetherEngine {
             do {
                 packet = try demuxer.readPacket()
             } catch {
-                return stopped(.demuxError)
+                return stopped(demuxer.inputByteBudgetExhausted ? .byteCap : .demuxError)
             }
             guard let pkt = packet else {
-                return stopped(.demuxEOF)
+                return stopped(demuxer.inputByteBudgetExhausted ? .byteCap : .demuxEOF)
+            }
+            let afterRead = Double(DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds) / 1_000_000_000
+            if afterRead >= options.timeBudget {
+                av_packet_unref(pkt)
+                av_packet_free_safe(pkt)
+                return stopped(.timeCap)
             }
 
             var confirmed = false
             packetsSeen += 1
             if pkt.pointee.stream_index == targetIndex {
+                guard Int64(pkt.pointee.size) <= options.maxBytes - bytesRead else {
+                    av_packet_unref(pkt)
+                    av_packet_free_safe(pkt)
+                    return stopped(.byteCap)
+                }
                 // Charge the decode budget only for packets actually offered to the decoder, so a coarse
                 // interleave or a large leading video run can never starve the probe of audio.
                 packetsRead += 1
@@ -272,6 +294,9 @@ extension AetherEngine {
             av_packet_free_safe(pkt)
 
             if confirmed {
+                // A decoded JOC frame is evidence the pass already paid for. The wall-clock budget bounds
+                // what this pass SPENDS, so an overrun retires the pass, it does not retract its answer:
+                // a caller cannot tell a withheld confirmation apart from a source that carries no Atmos.
                 return AtmosDetectionOutcome(
                     stopReason: .frameDecoded, packetsRead: packetsRead, bytesRead: bytesRead,
                     decodedProfile: lastProfile

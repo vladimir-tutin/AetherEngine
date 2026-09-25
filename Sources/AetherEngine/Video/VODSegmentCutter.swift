@@ -17,12 +17,15 @@ struct VODSegmentCutter {
     /// Plan boundaries on the ITEM axis, in the timestamps the PLAN is expressed in: `boundaries[i]`
     /// is the start of segment `baseIndex + i`, i.e. the plan's source timestamp minus the plan anchor.
     ///
-    /// #358: for a keyframe-aligned plan those timestamps come from the container index, and mov/mp4
-    /// index entries are DECODE timestamps. The gate is therefore fed decode timestamps too. Feeding
-    /// it presentation timestamps let a keyframe reach boundaries beyond its own by its composition
-    /// offset, which is a couple of frames on an ordinary encode and was 3 s on a remux carrying an
-    /// edit list; every boundary inside that offset was consumed and never opened a segment, while
-    /// the playlist kept offering it.
+    /// #358 / AE#561: for a keyframe-aligned plan those timestamps come from the container index, and
+    /// the caller feeds the gate the packet timestamp stamped on the SAME axis (`PlanBoundaryAxis`):
+    /// decode for a mov/mp4 sample table, presentation for a Matroska Cue. Both mismatches have been
+    /// paid for. Presentation against decode boundaries let a keyframe reach boundaries beyond its own
+    /// by its composition offset (a couple of frames on an ordinary encode, 3 s on a remux carrying an
+    /// edit list), and every boundary inside that offset was consumed without opening a segment while
+    /// the playlist kept offering it (#358). Decode against presentation boundaries let no keyframe
+    /// reach its own boundary at all, so audio opened every segment and each one began mid-GOP,
+    /// carrying no random-access point a cold decode could start on (AE#561).
     /// `boundaries.count` is the segment count + 1 (the last entry is the end of the final segment).
     ///
     /// AE#268: packets reach the cutter with the producer's shift already subtracted, so they are on

@@ -32,7 +32,8 @@ private func audioSmokeTest(url: URL, seconds playSeconds: Double) async -> Int3
         return 1
     }
     let backend = engine.playbackBackend
-    print("backend=\(backend.rawValue) decoder=\(engine.activeAudioDecoder ?? "?") duration=\(String(format: "%.1f", engine.duration))s")
+    print("backend=\(backend.rawValue) decoder=\(engine.activeAudioDecoder ?? "?") "
+          + "delivery=\(engine.audioDelivery.rawValue) duration=\(String(format: "%.1f", engine.duration))s")
     guard backend == .audio else {
         print("FAIL: expected backend .audio, got \(backend.rawValue)")
         return 1

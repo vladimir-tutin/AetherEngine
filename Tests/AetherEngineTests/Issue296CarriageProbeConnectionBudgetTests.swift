@@ -266,6 +266,7 @@ final class Issue296CarriageProbeConnectionBudgetTests: XCTestCase {
         let verdict = await HLSCarriageProbe.classifyDeferredSegmentHead(
             url: try XCTUnwrap(URL(string: "https://cap.test/direct0.ts")),
             httpHeaders: ["X-Fixture": "allowed"],
+            credentialOrigin: try XCTUnwrap(URL(string: "https://cap.test/live.m3u8")),
             session: session
         )
 
@@ -284,6 +285,7 @@ final class Issue296CarriageProbeConnectionBudgetTests: XCTestCase {
         let verdict = await HLSCarriageProbe.classifyDeferredSegmentHead(
             url: try XCTUnwrap(URL(string: "https://cap.test/gone.ts")),
             httpHeaders: [:],
+            credentialOrigin: try XCTUnwrap(URL(string: "https://cap.test/live.m3u8")),
             session: session
         )
 

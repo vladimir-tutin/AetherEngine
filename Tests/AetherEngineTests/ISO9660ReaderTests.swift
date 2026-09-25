@@ -32,6 +32,26 @@ final class ISO9660ReaderTests: XCTestCase {
         }
     }
 
+    // audit NET-5: an unchecked 32-bit directory length let a crafted root record zero-fill up to
+    // 4 GB (jetsam on tvOS/iOS) and then trap converting `count - got` to Int32. Must throw a
+    // normal error instead, and never attempt the allocation.
+    func test_hostileRootLengthIsRejectedNotAllocated() throws {
+        var pvd = [UInt8](repeating: 0, count: ISO9660Fixture.sectorSize)
+        pvd[0] = 1
+        for (i, b) in Array("CD001".utf8).enumerated() { pvd[1 + i] = b }
+        pvd[6] = 1
+        for (i, b) in ISO9660Fixture.both16(ISO9660Fixture.sectorSize).enumerated() { pvd[128 + i] = b }
+        let rootRec = ISO9660Fixture.dirRecord(name: [0x00], isDir: true, lba: 17, length: 0xFFFF_FFFF)
+        for (i, b) in rootRec.enumerated() { pvd[156 + i] = b }
+        var image = [UInt8](repeating: 0, count: 18 * ISO9660Fixture.sectorSize)
+        for (i, b) in pvd.enumerated() { image[16 * ISO9660Fixture.sectorSize + i] = b }
+
+        let iso = try ISO9660Reader(reader: DataIOReader(data: Data(image)))
+        XCTAssertThrowsError(try iso.list(directory: "VIDEO_TS")) { err in
+            guard case DiscError.malformed = err else { return XCTFail("wrong error: \(err)") }
+        }
+    }
+
     func test_truncatedImageThrowsMalformedOrNotISO() throws {
         // PVD present but root extent cut off: must throw, not trap.
         let full = ISO9660Fixture.make(files: [.init(name: "VTS_01_1.VOB", length: 100)])

@@ -1,6 +1,6 @@
 import Testing
 import Foundation
-import Libavcodec
+import AetherLibavcodec
 @testable import AetherEngine
 
 /// AE#232: a declared interlaced field order is a claim about carriage, not evidence that any frame

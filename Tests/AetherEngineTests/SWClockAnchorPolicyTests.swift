@@ -70,4 +70,42 @@ struct SWClockAnchorPolicyTests {
         #expect(r.anchorSeconds == 10)
         #expect(r.sessionZeroSeconds == 0)
     }
+
+    // MARK: - Carrying a seek target back to the source axis
+
+    @Test("a zero-based source seeks on the axis it already uses")
+    func sourceSecondsIsIdentityWithoutAnOffset() {
+        #expect(SWClockAnchorPolicy.sourceSeconds(forSession: 35.29, sessionZeroSeconds: 0) == 35.29)
+        #expect(SWClockAnchorPolicy.sourceSeconds(forSession: 0, sessionZeroSeconds: 0) == 0)
+    }
+
+    @Test("a mid-stream-joined source seeks past its own first packet, not before it")
+    func sourceSecondsCarriesTheOffset() {
+        // The capture that found this: first PTS 24549.835 s, a 64 s file, and a
+        // seek to 35.29 s of session time. Without the carry the demuxer is asked
+        // for a timestamp six hours before the file begins and clamps to its start,
+        // and the packet store's reservoir reads as the whole offset.
+        let target = SWClockAnchorPolicy.sourceSeconds(
+            forSession: 35.29,
+            sessionZeroSeconds: 24_549.835
+        )
+        #expect(target == 24_585.125)
+    }
+
+    @Test("the carry is the inverse of the position the host publishes")
+    func sourceSecondsRoundTripsThePublishedPosition() {
+        let zero = 24_549.835
+        for session in [0.0, 1.0, 35.29, 64.564] {
+            let raw = SWClockAnchorPolicy.sourceSeconds(forSession: session, sessionZeroSeconds: zero)
+            // `SoftwarePlaybackHost` publishes `max(0, raw - zero)`.
+            #expect(abs(max(0, raw - zero) - session) < 1e-9)
+        }
+    }
+
+    @Test("a target that cannot be expressed is passed through rather than made worse")
+    func sourceSecondsRefusesNonsense() {
+        #expect(SWClockAnchorPolicy.sourceSeconds(forSession: 10, sessionZeroSeconds: -5) == 10)
+        #expect(SWClockAnchorPolicy.sourceSeconds(forSession: 10, sessionZeroSeconds: .nan) == 10)
+        #expect(SWClockAnchorPolicy.sourceSeconds(forSession: .infinity, sessionZeroSeconds: 100).isInfinite)
+    }
 }

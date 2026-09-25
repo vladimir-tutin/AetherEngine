@@ -7,6 +7,9 @@ import Foundation
 struct DisplayRejection: Sendable, Equatable {
     let code: Int
     let message: String
+    /// `NSError.domain` of the item error behind the rejection: the message is AVFoundation's
+    /// localized text, so the domain is what still classifies once it is published (#376).
+    let domain: String?
 }
 
 /// Pure master to media fallback decision (#98). Kept separate and pure so the gate is testable
@@ -24,6 +27,20 @@ enum MasterFallbackDecision {
     /// The two AVFoundationErrorDomain codes that mean "this display cannot present the master".
     static func isDisplayRejectionCode(_ code: Int) -> Bool {
         code == -11868 || code == -11848
+    }
+
+    /// AE#535: whether a refusal teaches the process something about the panel.
+    ///
+    /// A display rejection answers "does this output configuration accept an HDR master" only while
+    /// the display is eligible for HDR at all. Measured on an Apple TV 4K on tvOS 26.6: an audio route
+    /// death right after a display mode switch opens a window in which the criteria readout reads
+    /// `matching=off hdrEligible=no`, a session-preserving reload lands in it, and AVPlayer fails the
+    /// master with -11868 because nothing HDR is compatible WITH AN INELIGIBLE DISPLAY. That refusal is
+    /// fully explained by the window, so it earns this item its media fallback and nothing more.
+    /// Latching it cost the rest of the viewing session its master, and in a process that never
+    /// backgrounds the AE#588 clear never came.
+    static func shouldLatchPanelRefusal(code: Int, displayEligibleForHDRNow: Bool) -> Bool {
+        isDisplayRejectionCode(code) && displayEligibleForHDRNow
     }
 
     /// Any code that means "AVPlayer rejected the served master itself": the display-rejection pair

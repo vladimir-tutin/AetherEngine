@@ -1,5 +1,5 @@
 import XCTest
-import Libavcodec
+import AetherLibavcodec
 @testable import AetherEngine
 
 final class SecondarySubtitleChannelTests: XCTestCase {

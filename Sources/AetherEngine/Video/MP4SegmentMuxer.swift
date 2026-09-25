@@ -1,8 +1,8 @@
 import Darwin
 import Foundation
-import Libavformat
-import Libavcodec
-import Libavutil
+import AetherLibavformat
+import AetherLibavcodec
+import AetherLibavutil
 
 /// Long-lived fragmented-MP4 muxer for one playback session. ONE AVFormatContext (mp4 muxer,
 /// NOT hls wrapper) with movflags +empty_moov+default_base_moof+frag_custom+delay_moov.
@@ -39,18 +39,33 @@ final class MP4SegmentMuxer {
         let range: AVColorRange
     }
 
+    /// What happens to the source `dvcC` / `dvvC` record on its way into the fMP4 sample entry.
+    ///
+    /// One value, not a set of Bools: the four outcomes exclude each other, and while that was only
+    /// stated in comments a caller could ask for a strip AND a rewrite and get whichever the muxer's
+    /// if-chain reached first.
+    enum DoviConfigPolicy: Sendable, Equatable {
+        /// Stream-copy the record unchanged. Genuine P5, and P8.x on a DV panel.
+        case keep
+        /// Drop `AV_PKT_DATA_DOVI_CONF` before write_header. P7's base layer and P8.2 (hvc1 + dvcC
+        /// trips VT -12906), and P8.x on a non-DV panel (-11868).
+        case strip
+        /// Rewrite to a valid P8.1: `dv_profile=8`, `compat=1`, `el_present=0`. P7-on-DV-panel
+        /// (paired with the per-packet RPU conversion) and the malformed "P8.6" compat id (#53).
+        case rewriteToProfile81
+        /// Rewrite to P5: `dv_profile=5`, `compat=0`, `el_present=0`. AE#455, opt-in. The bitstream
+        /// stays a P8.1 with an HDR10 base layer; only the container claim changes, which is what
+        /// makes AVPlayer run its own DV composition on a panel that cannot do DV itself.
+        case rewriteToProfile5
+    }
+
     struct VideoConfig {
         let codecpar: UnsafePointer<AVCodecParameters>
         let timeBase: AVRational
         /// Forces fourCC on the output stream codec_tag (e.g. hvc1; hev1 default rejected by AVPlayer).
         let codecTagOverride: String?
-        /// Drop AV_PKT_DATA_DOVI_CONF before avformat_write_header; hvc1+dvcC trips VT -12906.
-        /// Mutually exclusive with `rewriteDoviConfigTo81`.
-        let stripDolbyVisionMetadata: Bool
-        /// Rewrite dvcC to valid P8.1 (dv_profile=8, compat=1, el_present=0) instead of stripping.
-        /// Used for P7-on-DV-panel (paired with per-packet RPU rewrite) and malformed "P8.6"
-        /// (invalid compat id; no packet rewrite needed). Mutually exclusive with `stripDolbyVisionMetadata`.
-        let rewriteDoviConfigTo81: Bool
+        /// What to do with the source Dolby Vision configuration record. See `DoviConfigPolicy`.
+        let doviConfig: DoviConfigPolicy
         /// Optional color-signaling override. See `ColorOverride`.
         let colorOverride: ColorOverride?
         /// Replaces codecpar.extradata after avcodec_parameters_copy. Used when the source hvcC
@@ -62,16 +77,14 @@ final class MP4SegmentMuxer {
             codecpar: UnsafePointer<AVCodecParameters>,
             timeBase: AVRational,
             codecTagOverride: String?,
-            stripDolbyVisionMetadata: Bool = false,
-            rewriteDoviConfigTo81: Bool = false,
+            doviConfig: DoviConfigPolicy = .keep,
             colorOverride: ColorOverride? = nil,
             extradataOverride: [UInt8]? = nil
         ) {
             self.codecpar = codecpar
             self.timeBase = timeBase
             self.codecTagOverride = codecTagOverride
-            self.stripDolbyVisionMetadata = stripDolbyVisionMetadata
-            self.rewriteDoviConfigTo81 = rewriteDoviConfigTo81
+            self.doviConfig = doviConfig
             self.colorOverride = colorOverride
             self.extradataOverride = extradataOverride
         }
@@ -80,6 +93,16 @@ final class MP4SegmentMuxer {
     struct AudioConfig {
         let codecpar: UnsafePointer<AVCodecParameters>
         let timeBase: AVRational
+        /// AE#458: ISO 639-2/T for the track's `mdhd`. Nil writes nothing, leaving movenc's `und`.
+        let language: String?
+
+        init(codecpar: UnsafePointer<AVCodecParameters>,
+             timeBase: AVRational,
+             language: String? = nil) {
+            self.codecpar = codecpar
+            self.timeBase = timeBase
+            self.language = language
+        }
     }
 
     /// Result of a segment cut. `deferredAwaitingAudioSampleEntry` is a THIRD state, distinct from both
@@ -140,6 +163,30 @@ final class MP4SegmentMuxer {
     /// from codecpar alone, so they never wedge, and gating the #64 RAM-cap flush on them would needlessly
     /// weaken that memory bound. Latched at init from the audio codec_id.
     private let audioNeedsParsedPacketForMoov: Bool
+    /// Width of the video track's NAL length prefix (avcC / hvcC), nil when the track is not
+    /// length-prefixed at all. Latched at init: it is a property of the configuration record that
+    /// lands in the sample entry, and the AE#561 sanitizer walks every video sample with it.
+    private let videoNALLengthPrefixSize: Int?
+    /// AE#561 harness switch: the sanitizer removes the only shape that reproduces a segment Apple's
+    /// parser refuses, so the rung underneath it (the software-path escalation) would have nothing to
+    /// be measured against. Read once from the environment, never set in a shipped configuration.
+    static let nalChainSanitizerDisabled =
+        ProcessInfo.processInfo.environment["AETHER_DISABLE_NAL_SANITIZER"] != nil
+    /// How many video samples the AE#561 sanitizer has had to cut, over this muxer's life.
+    private var truncatedVideoSamples: Int = 0
+    /// Audit BIT-1: a video sample of this track walked exactly as a length-prefixed chain, so a
+    /// `00 00 01` head is a 256-511 byte length from here on, not an Annex B start code.
+    private var videoNALFramingConfirmed = false
+
+    private func sanitizerCut(_ bytes: UnsafeRawBufferPointer, lengthPrefixSize: Int) -> Int? {
+        let cut = NALUnitChain.completeRunLength(
+            bytes, lengthPrefixSize: lengthPrefixSize, framingConfirmed: videoNALFramingConfirmed)
+        if cut == nil, !videoNALFramingConfirmed,
+           NALUnitChain.walksExactly(bytes, lengthPrefixSize: lengthPrefixSize) {
+            videoNALFramingConfirmed = true
+        }
+        return cut
+    }
 
     /// Only AC-3 / E-AC-3 / TrueHD build their mp4 sample entry from a parsed packet (dac3/dec3/dmlp),
     /// so only they can hit the "moov before audio parsed" wedge and need the #64-flush guard. Shared with
@@ -165,6 +212,17 @@ final class MP4SegmentMuxer {
     private(set) var muxerVideoTimeBase: AVRational = AVRational(num: 1, den: 1)
     private(set) var muxerAudioTimeBase: AVRational = AVRational(num: 1, den: 1)
     private let haveAudio: Bool
+
+    /// AE#464: host audio offset for this muxer, in seconds. Fixed for the muxer's life on purpose:
+    /// two offsets inside one output track are not splicable (the seam gains a gap or an overlap of
+    /// exactly the change, and a change that moves audio earlier is eaten by
+    /// `OutputTimestampSanitizer`'s strictly-increasing DTS rule), so a new offset has to be a new
+    /// muxer, which the producer restart provides.
+    private let audioDelaySeconds: Double
+
+    /// The same offset in the muxer's OUTPUT audio time base, latched once the header has rewritten
+    /// it. Packets reach `writePacket` already rescaled, so this is the base the shift must be in.
+    private var audioDelayTicks: Int64 = 0
 
     /// Mid-segment fragment-flush bound (#64). With movflags +frag_custom a moof+mdat is emitted only at
     /// an explicit segment cut; a degenerate plan (sparse-keyframe TS index) or any very long segment
@@ -196,13 +254,33 @@ final class MP4SegmentMuxer {
         audio: AudioConfig?,
         maxBufferedFragmentSeconds: Double = 8.0,
         audioMoovPrimeFrame: [UInt8]? = nil,
+        audioDelaySeconds: Double = 0,
         onInitCaptured: @escaping (Data) -> Void
     ) throws {
         self.currentSegmentIndex = initialSegmentIndex
         self.sessionDir = sessionDir
         self.haveAudio = audio != nil
+        self.audioDelaySeconds = audioDelaySeconds
         self.audioNeedsParsedPacketForMoov =
             audio.map { Self.audioNeedsParsedPacketForMoov($0.codecpar.pointee.codec_id) } ?? false
+        // AE#561: the override, when there is one, is the record that reaches the sample entry. Both
+        // carry the same width (the #19 rebuild keeps the source header's first 22 bytes), so this
+        // only matters for a source whose own extradata is missing or Annex B.
+        if let override = video.extradataOverride {
+            self.videoNALLengthPrefixSize = override.withUnsafeBufferPointer {
+                NALUnitChain.lengthPrefixSize(
+                    codecID: video.codecpar.pointee.codec_id,
+                    extradata: $0.baseAddress,
+                    extradataSize: $0.count
+                )
+            }
+        } else {
+            self.videoNALLengthPrefixSize = NALUnitChain.lengthPrefixSize(
+                codecID: video.codecpar.pointee.codec_id,
+                extradata: UnsafePointer(video.codecpar.pointee.extradata),
+                extradataSize: Int(video.codecpar.pointee.extradata_size)
+            )
+        }
 
         let firstPath = Self.stagingPath(forSegmentIndex: initialSegmentIndex,
                                          in: sessionDir)
@@ -282,6 +360,21 @@ final class MP4SegmentMuxer {
         muxerVideoTimeBase = ctx.pointee.streams.advanced(by: 0).pointee!.pointee.time_base
         if haveAudio {
             muxerAudioTimeBase = ctx.pointee.streams.advanced(by: 1).pointee!.pointee.time_base
+            // AE#464: same reason as the bound below. Latched after write_header rewrote the stream
+            // time_base, because that is the base the packets arrive in.
+            audioDelayTicks = Self.audioDelayTicks(seconds: audioDelaySeconds,
+                                                   audioTimeBase: muxerAudioTimeBase)
+            if audioDelayTicks != 0 {
+                // Release-visible: which muxer carries which offset is the only way to tell "the host
+                // set it" from "the segments being served were cut with it", and a restart is what
+                // moves the session from one to the other.
+                EngineLog.emit(
+                    "[MP4SegmentMuxer] AE#464 cutting seg\(initialSegmentIndex)+ with audio delay "
+                    + String(format: "%+.0f ms", audioDelaySeconds * 1000)
+                    + " (\(audioDelayTicks) ticks @ \(muxerAudioTimeBase.den)/\(muxerAudioTimeBase.num))",
+                    category: .session
+                )
+            }
         }
         // Bound is in the muxer's rewritten output video TB: packets reach writePacket already rescaled
         // to muxerVideoTimeBase, so the window math must use it (not the source TB). Latched here, after
@@ -301,6 +394,18 @@ final class MP4SegmentMuxer {
     }
 
     private let byteCounter: ByteCounter
+
+    // MARK: - Audio delay conversion (pure, AE#464)
+
+    /// The host's audio offset in `audioTimeBase` ticks. Rounded rather than truncated so a nudge
+    /// smaller than one tick still moves in the direction it was asked for instead of vanishing.
+    static func audioDelayTicks(seconds: Double, audioTimeBase: AVRational) -> Int64 {
+        guard seconds != 0, seconds.isFinite,
+              audioTimeBase.num > 0, audioTimeBase.den > 0 else { return 0 }
+        let ticks = seconds * Double(audioTimeBase.den) / Double(audioTimeBase.num)
+        guard ticks.isFinite, abs(ticks) < Double(Int64.max) else { return 0 }
+        return Int64(ticks.rounded())
+    }
 
     // MARK: - Buffered-fragment bound math (pure, #64)
 
@@ -399,10 +504,15 @@ final class MP4SegmentMuxer {
            let tag = Self.mkTag(fromFourCC: override) {
             videoStream.pointee.codecpar.pointee.codec_tag = tag
         }
-        if video.rewriteDoviConfigTo81 {
-            Self.rewriteDoviConfigToProfile81(videoStream.pointee.codecpar)
-        } else if video.stripDolbyVisionMetadata {
+        switch video.doviConfig {
+        case .keep:
+            break
+        case .strip:
             Self.stripDolbyVisionSideData(videoStream.pointee.codecpar)
+        case .rewriteToProfile81:
+            Self.rewriteDoviConfig(videoStream.pointee.codecpar, profile: 8, blCompatibilityID: 1)
+        case .rewriteToProfile5:
+            Self.rewriteDoviConfig(videoStream.pointee.codecpar, profile: 5, blCompatibilityID: 0)
         }
         if let co = video.colorOverride {
             videoStream.pointee.codecpar.pointee.color_primaries = co.primaries
@@ -422,6 +532,15 @@ final class MP4SegmentMuxer {
                 throw MuxerError.copyParametersFailed(code: aCopy)
             }
             audioStream.pointee.time_base = audio.timeBase
+            // AE#458: movenc reads this in mov_init, so it has to be set before write_header. With one
+            // muxed audio track and no EXT-X-MEDIA rendition, mdhd is the only place AVFoundation can
+            // read a track language from.
+            if let language = audio.language {
+                av_dict_set(&audioStream.pointee.metadata, "language", language, 0)
+            }
+            // AE#382: a source-container codec_tag (MPEG-TS stream type / registration descriptor) makes
+            // movenc refuse the header, which the audio cascade reads as "cannot stream-copy" and bridges.
+            Self.dropForeignAudioCodecTag(ctx: ctx, codecpar: audioStream.pointee.codecpar)
             // AE#221: repair a degenerate FLAC STREAMINFO before movenc serialises it into dfLa.
             if let streamInfo = Self.sanitizedFLACExtradata(UnsafePointer(audioStream.pointee.codecpar)) {
                 Self.replaceExtradata(audioStream.pointee.codecpar, with: streamInfo)
@@ -468,6 +587,17 @@ final class MP4SegmentMuxer {
     @discardableResult
     func writePacket(_ packet: UnsafeMutablePointer<AVPacket>) -> (rc: Int32, written: WrittenTimestamps) {
         guard let ctx = formatContext else { return (-1, .none) }
+
+        // AE#464: the host's lip-sync offset, applied to the audio track only and BEFORE the
+        // sanitizer, so the invariants it enforces hold for the timestamps that actually land in the
+        // segment. Video is left alone deliberately: its timestamps are what the playlist timeline,
+        // the segment boundaries and every seek are expressed in, so moving them would move the
+        // session's reported position and the subtitle axis along with the sound.
+        if audioDelayTicks != 0, packet.pointee.stream_index == audioOutputStreamIndex {
+            if packet.pointee.pts != Int64.min { packet.pointee.pts &+= audioDelayTicks }
+            if packet.pointee.dts != Int64.min { packet.pointee.dts &+= audioDelayTicks }
+        }
+
         let clean = timestampSanitizer.sanitize(
             streamIndex: packet.pointee.stream_index,
             pts: packet.pointee.pts,
@@ -495,6 +625,38 @@ final class MP4SegmentMuxer {
                 flushPendingFragment()
                 fragmentWindowFirstVideoDts = dts
             }
+        }
+
+        // AE#561: a damaged source can carry a video sample whose NAL chain declares a unit that
+        // reaches past the end of the packet. Apple's fMP4 parser walks that chain by addition and
+        // answers the whole segment with -19602, which kills the session and every reload onto the
+        // same segment; libavcodec's own decoder answers such a packet by skipping the frame, which
+        // is why the file plays elsewhere. Cut the sample at its last complete NAL, which is what
+        // MKVToolNix writes when it remuxes one of these files.
+        if streamIndex == videoOutputStreamIndex,
+           !Self.nalChainSanitizerDisabled,
+           let lengthPrefixSize = videoNALLengthPrefixSize,
+           let data = packet.pointee.data,
+           packet.pointee.size > 0,
+           let complete = sanitizerCut(
+               UnsafeRawBufferPointer(start: data, count: Int(packet.pointee.size)),
+               lengthPrefixSize: lengthPrefixSize
+           ) {
+            truncatedVideoSamples += 1
+            if truncatedVideoSamples <= 5 || truncatedVideoSamples % 100 == 0 {
+                EngineLog.emit(
+                    "[MP4SegmentMuxer] #561 video sample at dts=\(packet.pointee.dts) carries an "
+                    + "incomplete NAL chain: \(packet.pointee.size) bytes, \(complete) of them "
+                    + "complete; cut to the last whole unit (#\(truncatedVideoSamples) this muxer)",
+                    category: .session
+                )
+            }
+            if complete == 0 {
+                // Nothing in the sample survives the walk, so there is no picture to hand over.
+                av_packet_unref(packet)
+                return (0, .none)
+            }
+            av_shrink_packet(packet, Int32(complete))
         }
 
         // av_write_frame was tried as a leak hypothesis; no impact on 8 MB/s mallocMB growth
@@ -845,11 +1007,78 @@ final class MP4SegmentMuxer {
         return tag
     }
 
-    /// Mutate AV_PKT_DATA_DOVI_CONF in-place: dv_profile=8, compat=1 (HDR10), el_present_flag=0.
-    /// Used for P7-on-DV-panel (paired with per-packet RPU conversion) and "P8.6" (invalid compat id only).
-    /// No-op when DOVI side data is absent.
-    private static func rewriteDoviConfigToProfile81(
-        _ codecpar: UnsafeMutablePointer<AVCodecParameters>
+    /// AE#382: true when the mp4 muxer accepts `tag` for `codecID`, i.e. when the source tag may stay.
+    ///
+    /// The mpegts demuxer stamps `codecpar.codec_tag` with the PMT stream type (`0x87` for E-AC-3, `0x81`
+    /// for AC-3) or, when the PMT carries a registration descriptor, with its fourcc (`EAC3`, `AC-3`).
+    /// `avcodec_parameters_copy` carries that into the output stream, and movenc then looks the (tag, codec)
+    /// pair up in the mp4 tag table, finds nothing, and refuses the whole header: "Could not find tag for
+    /// codec eac3 in stream #1" -> `AVERROR(EINVAL)`. libavformat's own guard in `init_muxer` would have
+    /// caught it one layer earlier, but it only fires at `FF_COMPLIANCE_NORMAL`; we run
+    /// `strict_std_compliance = -2` for the Dolby Vision atoms, and below NORMAL that guard passes a foreign
+    /// tag through untouched. So the tag has to be dropped here.
+    ///
+    /// The rule mirrors `streamcopy_init` in fftools/ffmpeg_mux_init.c, which is why an `ffmpeg -c copy`
+    /// remux of the same source succeeds: keep the tag when the output format has no tag table at all, when
+    /// it maps back to the same codec id (it is already an mp4 tag; `av_codec_get_id` matches
+    /// case-insensitively, exactly like movenc's own validation, so a `AC-3` descriptor is fine), or when
+    /// mp4 knows no tag for this codec whatsoever (nothing better to offer; movenc then fails loudly and the
+    /// audio cascade bridges). Otherwise clear it and let `init_muxer` fill in the canonical tag (`ec-3`).
+    static func mp4AcceptsAudioCodecTag(
+        tags: UnsafePointer<OpaquePointer?>?,
+        codecID: AVCodecID,
+        tag: UInt32
+    ) -> Bool {
+        guard tag != 0 else { return true }
+        guard let tags else { return true }
+        if av_codec_get_id(tags, tag) == codecID { return true }
+        var canonical: UInt32 = 0
+        return av_codec_get_tag2(tags, codecID, &canonical) == 0
+    }
+
+    /// Applies `mp4AcceptsAudioCodecTag` to the muxer's own copy of the audio parameters.
+    ///
+    /// Audio only. The video tag is chosen deliberately by `VideoConfig.codecTagOverride` (every route in
+    /// `CodecRoutePolicy` sets one, which is why a TS video stream never carried its `HEVC`/`H264` tag into
+    /// the header), and the same rule would be actively wrong there: `dvh1` is not in the mp4 table at all
+    /// (mov.c handles it), so a Dolby Vision sample entry would be silently demoted to `hvc1`.
+    private static func dropForeignAudioCodecTag(
+        ctx: UnsafeMutablePointer<AVFormatContext>,
+        codecpar: UnsafeMutablePointer<AVCodecParameters>
+    ) {
+        let tag = codecpar.pointee.codec_tag
+        let codecID = codecpar.pointee.codec_id
+        guard !mp4AcceptsAudioCodecTag(
+            tags: ctx.pointee.oformat?.pointee.codec_tag,
+            codecID: codecID,
+            tag: tag
+        ) else { return }
+        codecpar.pointee.codec_tag = 0
+        EngineLog.emit(
+            "[MP4SegmentMuxer] audio codec_tag \(Self.fourCCDescription(tag)) is a source-container tag the "
+            + "mp4 muxer rejects for \(avcodec_get_name(codecID).map { String(cString: $0) } ?? "?"); "
+            + "cleared so the canonical sample entry is written (stream-copy stays available)",
+            category: .session
+        )
+    }
+
+    /// Printable form of a codec tag: the fourcc when all four bytes are printable ASCII, else hex.
+    /// An MPEG-TS PMT stream type (0x87) is not a fourcc, so printing it as one would be noise.
+    static func fourCCDescription(_ tag: UInt32) -> String {
+        let bytes = [UInt8(tag & 0xFF), UInt8((tag >> 8) & 0xFF), UInt8((tag >> 16) & 0xFF), UInt8((tag >> 24) & 0xFF)]
+        if bytes.allSatisfy({ $0 >= 0x20 && $0 < 0x7F }) {
+            return "'" + String(decoding: bytes, as: UTF8.self) + "'"
+        }
+        return String(format: "0x%08x", tag)
+    }
+
+    /// Mutate AV_PKT_DATA_DOVI_CONF in-place to the given profile / base-layer compatibility, always
+    /// clearing `el_present_flag` (every route that rewrites emits a single layer). No-op when DOVI
+    /// side data is absent. Internal, not private, so the rewrite can be asserted on directly.
+    static func rewriteDoviConfig(
+        _ codecpar: UnsafeMutablePointer<AVCodecParameters>,
+        profile: UInt8,
+        blCompatibilityID: UInt8
     ) {
         let count = Int(codecpar.pointee.nb_coded_side_data)
         guard count > 0, let sideData = codecpar.pointee.coded_side_data else { return }
@@ -863,8 +1092,8 @@ final class MP4SegmentMuxer {
                 to: AVDOVIDecoderConfigurationRecord.self,
                 capacity: 1
             ) { rec in
-                rec.pointee.dv_profile = 8
-                rec.pointee.dv_bl_signal_compatibility_id = 1
+                rec.pointee.dv_profile = profile
+                rec.pointee.dv_bl_signal_compatibility_id = blCompatibilityID
                 rec.pointee.el_present_flag = 0
             }
             return
@@ -872,7 +1101,7 @@ final class MP4SegmentMuxer {
     }
 
     /// Strip AV_PKT_DATA_DOVI_CONF from coded_side_data; hvc1+dvcC trips VT -12906.
-    private static func stripDolbyVisionSideData(
+    static func stripDolbyVisionSideData(
         _ codecpar: UnsafeMutablePointer<AVCodecParameters>
     ) {
         guard codecpar.pointee.nb_coded_side_data > 0,

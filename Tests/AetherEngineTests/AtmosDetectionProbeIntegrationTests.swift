@@ -1,7 +1,7 @@
 import Testing
 import Foundation
-import Libavformat
-import Libavcodec
+import AetherLibavformat
+import AetherLibavcodec
 @testable import AetherEngine
 
 /// Fixture-backed tests for the bounded EAC3/JOC decode-detection path (`AetherEngine.detectAtmos` /
@@ -162,7 +162,7 @@ struct AtmosDetectionProbeIntegrationTests {
         defer { demuxer.close() }
         try demuxer.open(reader: DataIOReader(data: Self.data(Self.eac3PlainBase64)), formatHint: "mp4")
 
-        let options = AtmosDetectionOptions(maxBytes: 1)
+        let options = AtmosDetectionOptions(maxBytes: 256)
         let targetIndex = AetherEngine.atmosDecodeTargetIndex(options: options, defaultAudioStreamIndex: demuxer.audioStreamIndex)
         let outcome = AetherEngine.detectAtmos(demuxer: demuxer, targetIndex: targetIndex, options: options)
 
@@ -170,6 +170,20 @@ struct AtmosDetectionProbeIntegrationTests {
         #expect(outcome.stopReason == .frameDecoded)
         #expect(outcome.decodedProfile != nil)
         #expect(outcome.confirmedAtmos == false)
+    }
+
+    @Test("an oversized first audio packet is rejected before decode")
+    func oversizedPacketCannotConfirm() throws {
+        let demuxer = Demuxer()
+        defer { demuxer.close() }
+        try demuxer.open(reader: DataIOReader(data: Self.data(Self.eac3PlainBase64)), formatHint: "mp4")
+        let outcome = AetherEngine.detectAtmos(
+            demuxer: demuxer, targetIndex: demuxer.audioStreamIndex,
+            options: AtmosDetectionOptions(maxBytes: 1))
+        #expect(outcome.stopReason == .byteCap)
+        #expect(outcome.packetsRead == 0)
+        #expect(outcome.bytesRead == 0)
+        #expect(outcome.decodedProfile == nil)
     }
 
     @Test("AAC audio never opens an EAC3 decoder (.notEAC3), never confirmed Atmos")

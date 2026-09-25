@@ -1,7 +1,7 @@
 import Testing
 import Foundation
-import Libavutil
-import Libavformat
+import AetherLibavutil
+import AetherLibavformat
 @testable import AetherEngine
 
 // #75: a remote MP4 with an embedded cover-art stream (mjpeg, unresolvable 0x0) made

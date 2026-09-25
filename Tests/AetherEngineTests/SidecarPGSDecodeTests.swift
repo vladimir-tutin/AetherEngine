@@ -40,7 +40,7 @@ struct SidecarPGSDecodeTests {
         guard FileManager.default.fileExists(atPath: fixtureURL.path) else { return }
         let result = try await SubtitleDecoder.decodeFile(url: fixtureURL, httpHeaders: [:], preserveASSMarkup: false)
         let store = NativeSubtitleCueStore()
-        SubtitleImageOCR.appendRecognized(cues: Array(result.cues.prefix(8)), language: "eng", to: store)
+        await SubtitleImageOCR.appendRecognized(cues: Array(result.cues.prefix(8)), language: "eng", to: store)
         let recognized = store.snapshotCues()
         #expect(!recognized.isEmpty)
         for cue in recognized {

@@ -1,5 +1,5 @@
 import Testing
-import Libavutil
+import AetherLibavutil
 @testable import AetherEngine
 
 /// Deterministic checks for the Dolby Vision Profile 5 still-colour primitives (#103).

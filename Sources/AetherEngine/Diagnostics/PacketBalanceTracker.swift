@@ -1,5 +1,5 @@
 import Foundation
-import Libavcodec
+import AetherLibavcodec
 
 /// Tracks Swift-initiated av_packet_alloc/free calls; `alive = allocs - frees` in the engine memory probe.
 /// Healthy pump steady-state: low single digit (1 in-flight source packet, 1 each for pendingVideoPkt/pendingAudioPkt, 0..N FLAC bridge packets).

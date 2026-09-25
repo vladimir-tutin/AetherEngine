@@ -1,5 +1,5 @@
 import Foundation
-import Libavutil
+import AetherLibavutil
 import Testing
 @testable import AetherEngine
 

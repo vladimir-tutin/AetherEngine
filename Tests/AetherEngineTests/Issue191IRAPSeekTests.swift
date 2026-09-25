@@ -1,5 +1,5 @@
 import Foundation
-import Libavcodec
+import AetherLibavcodec
 import Testing
 @testable import AetherEngine
 

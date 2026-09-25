@@ -1,6 +1,6 @@
 import XCTest
 import AVFAudio
-import Libavcodec
+import AetherLibavcodec
 @testable import AetherEngine
 
 /// #95: tap decoder (compressed packets to mono Float32 48 kHz) and the per-segment

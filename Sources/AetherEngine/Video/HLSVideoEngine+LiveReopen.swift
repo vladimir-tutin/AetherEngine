@@ -167,6 +167,21 @@ extension HLSVideoEngine {
 
     func handlePumpFinished(_ prod: HLSSegmentProducer,
                                     reason: HLSSegmentProducer.PumpExitReason) {
+        // Audit HLS-1: a superseded pump (the #79 markClosed of a wedged read, or stop()) reports
+        // an aborted read as `.readError`. Acting on it spent the session-lifetime revive gate,
+        // doomed the replacement demuxer and queued an authoritative restart at a stale position.
+        restartLock.lock()
+        let isCurrent = producer === prod
+        restartLock.unlock()
+        guard isCurrent else {
+            if case .stopRequested = reason {} else {
+                EngineLog.emit(
+                    "[HLSVideoEngine] superseded producer exited (reason=\(reason)); not the session's pump, ignored",
+                    category: .session
+                )
+            }
+            return
+        }
         // #65 (VOD only): a broken backpressure wedge means AVPlayer is stuck behind a parked producer.
         // Re-anchor the producer on AVPlayer's real position so the segments it is starved for get produced.
         if case .backpressureWedge = reason {
@@ -195,6 +210,23 @@ extension HLSVideoEngine {
                 restartLock.lock()
                 sessionAudioMoovPrimeUnobtainable = true
                 restartLock.unlock()
+            }
+            // AE#396: a bridged session whose DECODER produced not one frame has nothing a revive can
+            // reach. The restart path rebuilds the muxer and re-opens the encoder (#99 failure mode B),
+            // and both sit downstream of the arm that failed: the same decoder is handed the same bytes
+            // and answers the same way, which is exactly what the reporter measured, three attempts with
+            // identical packet counts finishing in 12 to 23 ms. Spend the words instead of the budget.
+            // Frames decoded but nothing emitted is the ENCODER side, which a rebuild does heal, so that
+            // shape keeps its revive.
+            if !isLiveSession, let bridge = prod.audioBridgeFeedStats, bridge.decodedNothing {
+                EngineLog.emit(
+                    "[HLSVideoEngine] AE#396 the audio bridge decoded nothing, so the mp4 sample entry "
+                    + "can never be built and a revive would re-read the same bytes: \(bridge.summary)",
+                    category: .session
+                )
+                surfaceVODSourceFailure(FFmpegErr.einval, "Audio track could not be decoded",
+                                        kind: .audioBridgeProducedNoOutput)
+                return
             }
             if isLiveSession {
                 handleLiveMuxerFailure(prod)
@@ -298,8 +330,15 @@ extension HLSVideoEngine {
             return
         case .segmentStall:
             // SSAI ad pod the cutter can't cut through; URL reopen would re-enter it. Delegate to host for server-muxed fallback.
+            //
+            // AE#446 round 8: unless the gate never opened, in which case there was no cutter to
+            // stall and no pod to blame. Same delegation, but the line has to say which of the two
+            // it saw, because the two send a reader looking in different places.
             EngineLog.emit(
-                "[HLSVideoEngine] live segment cutter stalled (likely SSAI ad pod); "
+                (prod.videoGateOpened
+                 ? "[HLSVideoEngine] live segment cutter stalled (likely SSAI ad pod); "
+                 : "[HLSVideoEngine] live join produced nothing at all (no video packet ever "
+                   + "reached the cutter, so the source is not delivering the video it declares); ")
                 + "requesting host retune to the server route",
                 category: .session
             )
@@ -359,13 +398,46 @@ extension HLSVideoEngine {
     /// demuxer whose read just threw is marked suspect so performRestart replaces it via the #79
     /// fresh-demuxer path instead of seeking the failed connection.
     func handleVODReadErrorExit(_ code: Int32) {
+        // #377: the reader knows the difference between a source that is gone and one that is
+        // metering us, and loses it on the way here: the give-up arm returns a bare `-1`, FFmpeg
+        // renders that as "Operation not permitted", and this is what arrives. Ask the budget,
+        // which stamped the refusal when the status was read.
+        //
+        // The distinction is worth two different behaviours, because a 429 is a NOT-YET. Spending
+        // the ordinary two-attempt budget on it burns both attempts inside a minute, each one
+        // reopening from byte 0 against an origin that is refusing precisely that, and then
+        // declares the source "not readable in this session" while the same stream plays instantly
+        // if the user backs out and presses play. That verdict is not just unhelpful, it is false.
+        let metered = OriginRequestBudget.shared.refusedRecently(
+            sourceURL, within: Self.rateLimitVerdictWindowSeconds)
+
         restartLock.lock()
-        let admitted = readErrorReviveGate.admit()
-        let attempts = readErrorReviveGate.attempts
-        let cap = readErrorReviveGate.maxAttempts
+        let admitted = metered ? rateLimitReviveGate.admit() : readErrorReviveGate.admit()
+        let attempts = metered ? rateLimitReviveGate.attempts : readErrorReviveGate.attempts
+        let cap = metered ? 0 : readErrorReviveGate.maxAttempts
+        let spent = metered ? rateLimitReviveGate.elapsedSeconds() : 0
+        let budget = rateLimitReviveGate.budgetSeconds
         if admitted { mainDemuxerSuspectDead = true }
         restartLock.unlock()
         guard admitted else {
+            if metered {
+                // #377 round 5: the status code says "refused", it does not say what for, and the
+                // two answers need different fixes. The books do carry the difference, and this is
+                // the last line a session gets, so it says what they hold rather than asserting the
+                // shape the code has been guessing at since round 1.
+                EngineLog.emit(
+                    "[HLSVideoEngine] #377 VOD refusing-source budget spent "
+                    + "(\(String(format: "%.0f", spent))s of \(String(format: "%.0f", budget))s "
+                    + "across \(attempts) attempts); giving up. The source is REFUSING us, "
+                    + "not lost: retrying this same request later is expected to work, and handing "
+                    + "off to another player will meet the same refusal."
+                    + OriginRequestBudget.shared.refusalShapeNote(for: sourceURL),
+                    category: .session
+                )
+                surfaceVODSourceFailure(code, "Source is rate limiting this session",
+                                        kind: .sourceRateLimited)
+                return
+            }
             EngineLog.emit(
                 "[HLSVideoEngine] #169 VOD readError revive cap reached "
                 + "(\(attempts) failures, cap \(cap)); giving up (source not readable in this session)",
@@ -382,14 +454,56 @@ extension HLSVideoEngine {
             frozenPosition: frozen, pendingSeekTarget: recoverySeekTargetProvider?(),
             currentRendered: frozen)
         let idx = segmentIndexForPlaylistTime(anchor)
+
+        guard metered else {
+            EngineLog.emit(
+                "[HLSVideoEngine] #169 VOD pump died mid-session (readError \(code)); "
+                + "rebuilding producer on a fresh demuxer at "
+                + "\(String(format: "%.2f", anchor))s -> seg\(idx) "
+                + "(attempt \(attempts)/\(cap))",
+                category: .session
+            )
+            requestRestart(at: idx, authoritative: true)
+            return
+        }
+
+        // A refusing origin gets time before the next ask. Reopening immediately is what turned the
+        // two ordinary attempts into two more refusals: the request that just failed is reissued
+        // against an origin that has not moved. The delay grows per attempt so a session that is
+        // inside a refusal window stops re-asking every few seconds without ending.
+        let delay = Self.rateLimitReviveDelay(attempt: attempts)
+        // #377 round 6: hold the stall on the host's axis for as long as the budget runs. The
+        // reader emits `.flowing` as it EXITS, deliberately, so the terminal outcome carries the
+        // state; between that exit and the rebuilt reader's first byte there is no reader at all,
+        // and the phase said "playing" through minutes in which nothing was being delivered. The
+        // reporter's correction to this issue is exactly that window: it is a viewer watching a
+        // stalled picture, not accounting.
+        onNetworkPhaseChanged?(.reconnecting)
         EngineLog.emit(
-            "[HLSVideoEngine] #169 VOD pump died mid-session (readError \(code)); "
-            + "rebuilding producer on a fresh demuxer at "
-            + "\(String(format: "%.2f", anchor))s -> seg\(idx) "
-            + "(attempt \(attempts)/\(cap))",
+            "[HLSVideoEngine] #377 VOD pump died mid-session on a REFUSING origin (readError \(code)); "
+            + "waiting \(String(format: "%.0f", delay))s before rebuilding the producer at "
+            + "\(String(format: "%.2f", anchor))s -> seg\(idx) (attempt \(attempts), "
+            + "\(String(format: "%.0f", spent))s of \(String(format: "%.0f", budget))s spent)",
             category: .session
         )
-        requestRestart(at: idx, authoritative: true)
+        Task.detached(priority: .userInitiated) { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            guard let self else { return }
+            self.requestRestart(at: idx, authoritative: true)
+        }
+    }
+
+    /// #377: how long a refusal keeps classifying a read error as metering. The reader's give-up
+    /// arm exits within seconds of the last refused status (its own backoff is spent before it
+    /// returns), so this only has to cover that gap, not a whole session.
+    static let rateLimitVerdictWindowSeconds: TimeInterval = 60
+
+    /// #377: backoff before re-asking a metered origin. Grows per attempt and is capped, so the
+    /// last attempts are spaced widely enough to outlast a per-minute quota window.
+    static func rateLimitReviveDelay(attempt: Int) -> TimeInterval {
+        let ladder: [TimeInterval] = [3, 8, 20, 45]
+        guard attempt >= 1 else { return ladder[0] }
+        return ladder[min(attempt - 1, ladder.count - 1)]
     }
 
     /// AE#169 round 3: re-anchor a VOD session whose pump starved its scan-forward gate to EOF.
@@ -531,6 +645,22 @@ extension HLSVideoEngine {
             // with nothing in it to act on. The readError arm above has surfaced its own exhaustion
             // since AE#169; this is the same shape and gets the same last word. -22 is what movenc
             // returns for the moov it cannot write, so the code carries the real cause.
+            //
+            // AE#396: which cause that is depends on whether the audio was bridged. A silent bridge is
+            // not a source that cannot be muxed, it is a source whose audio this engine could not
+            // TRANSCODE, and the two ask a host for opposite things: `vodSourceFailed` reads as "the
+            // source is gone" and ends a fallback ladder, while a second player that decodes the track
+            // itself plays this file. So name the bridge when the bridge is the one that stayed quiet.
+            if let bridge = audioBridge?.feedStats, bridge.packetsEmitted == 0 {
+                EngineLog.emit(
+                    "[HLSVideoEngine] AE#396 the moov was never buildable because the audio bridge "
+                    + "emitted nothing this session: \(bridge.summary)",
+                    category: .session
+                )
+                surfaceVODSourceFailure(FFmpegErr.einval, "Audio could not be transcoded for playback",
+                                        kind: .audioBridgeProducedNoOutput)
+                return
+            }
             surfaceVODSourceFailure(FFmpegErr.einval, "Source audio cannot be muxed")
             return
         }
@@ -605,11 +735,12 @@ extension HLSVideoEngine {
                 liveReopenOutputEndSeconds: outputEnd
             )
             newProd.firstSegmentDiscontinuous = true
-            newProd.onVideoShiftKnown = { [weak self] shiftPts, _ in
+            newProd.onVideoShiftKnown = { [weak self] shiftPts, _, _ in
                 self?.handleLiveTimelineRebase(shiftPts, seamOutputSeconds: outputEnd)
             }
             producer = newProd
             restartLock.unlock()
+            retireProducer(failed)   // AE#443: the session's totals outlive the producer that held them
             newProd.start()
             EngineLog.emit(
                 "[HLSVideoEngine] live producer rebuilt in place: continuing at seg\(nextIndex) "
@@ -692,6 +823,36 @@ extension HLSVideoEngine {
             + " (attempt \(attempts)/\(Self.maxConsecutiveWedgeReanchors))",
             category: .session
         )
+        // AE#421: the two repairs are not interchangeable, and which one goes first is decided by
+        // whether the consumer could have the content it is silent about. Measured twice by the
+        // reporter, on an Apple TV and on a Mac: the producer had already served, the re-anchor
+        // changed nothing for the whole six-second grace (zero fetches), and the nudge that followed
+        // landed the seek in 240 ms. A re-anchor is the repair for a consumer STARVED of content
+        // nobody is producing. A consumer silent on a segment that is already on disk is not
+        // starved, and re-anchoring there throws the pump's forward work away to rebuild what it
+        // already has (the reporting run put it back from seg15 to seg3).
+        if Self.wedgeRepair(targetStored: provider?.hasStoredSegment(at: idx) ?? false) == .nudgeConsumerFirst {
+            EngineLog.emit(
+                "[HLSVideoEngine] #421 backpressure wedge with seg\(idx) already stored: the consumer "
+                + "is silent on content it can have, so nudging it before touching the producer "
+                + "(pos=\(String(format: "%.2f", anchor))s, attempt \(attempts)/\(Self.maxConsecutiveWedgeReanchors))",
+                category: .session
+            )
+            onConsumerReengageNeeded?(anchor)
+            // The nudge is cheap and reversible, but it is not guaranteed: if the consumer is still
+            // silent after the grace, fall back to the re-anchor rather than leaving it wedged.
+            afterGraceIfConsumerStaysSilent(capturedPosition: pos) { [weak self] _ in
+                guard let self else { return }
+                EngineLog.emit(
+                    "[HLSVideoEngine] #421 nudge did not re-engage the consumer within "
+                    + "\(Int(Self.consumerReengageGraceSeconds))s; re-anchoring producer to seg\(idx) after all",
+                    category: .session
+                )
+                self.requestRestart(at: idx, authoritative: true)
+            }
+            return
+        }
+
         // #79: re-anchor authoritatively. The anchor is where recovery must aim (pending seek target,
         // else AVPlayer's real position), so it must win the coalescer's pending slot over any stale
         // in-flight scrub target (else the producer settles at the scrub target and AVPlayer stays starved).
@@ -701,18 +862,8 @@ extension HLSVideoEngine {
         // never resumes REQUESTING (zero GETs, waitingToMinimizeStalls forever, item never fails).
         // Watch the provider's fetch counter through a grace window; if the consumer stays silent
         // while it still wants to play, ask the host for a re-engage nudge.
-        let fetchesAtReanchor = provider?.mediaFetchCount ?? 0
-        let epoch = sessionEpochSnapshot()
-        Task.detached(priority: .userInitiated) { [weak self] in
-            try? await Task.sleep(nanoseconds: UInt64(Self.consumerReengageGraceSeconds * 1_000_000_000))
-            guard let self, self.isSessionEpochCurrent(epoch) else { return }
-            let fetchesNow = self.provider?.mediaFetchCount ?? 0
-            guard fetchesNow == fetchesAtReanchor,
-                  self.playIntentProvider?() == true else { return }
-            // #115: re-read the position at nudge time. On VOD the consumer keeps rendering
-            // buffered segments through the grace window, so the wedge-trip capture is behind
-            // the on-screen frame and a zero-tolerance nudge to it replays visibly.
-            let freshPos = self.currentPlaybackPositionProvider?() ?? pos
+        afterGraceIfConsumerStaysSilent(capturedPosition: pos) { [weak self] freshPos in
+            guard let self else { return }
             EngineLog.emit(
                 "[HLSVideoEngine] #65 consumer re-engage: no segment fetch for "
                 + "\(Int(Self.consumerReengageGraceSeconds))s after wedge re-anchor "
@@ -722,6 +873,37 @@ extension HLSVideoEngine {
                 category: .session
             )
             self.onConsumerReengageNeeded?(freshPos)
+        }
+    }
+
+    /// AE#421: which repair a wedge calls for.
+    enum WedgeRepair: Equatable {
+        /// The target is not produced: the consumer has nothing to fetch, so move the producer.
+        case reanchorProducer
+        /// The target is on disk: the consumer is silent about content it can have, so move IT.
+        case nudgeConsumerFirst
+    }
+
+    static func wedgeRepair(targetStored: Bool) -> WedgeRepair {
+        return targetStored ? .nudgeConsumerFirst : .reanchorProducer
+    }
+
+    /// Run `follow` once the grace window has passed WITHOUT the consumer fetching anything, so a
+    /// repair that took effect is never followed by a second one. `follow` receives the position
+    /// re-read at that moment (#115: on VOD the consumer keeps rendering buffered segments through
+    /// the window, so the trip capture is behind the on-screen frame and acting on it replays
+    /// visibly).
+    private func afterGraceIfConsumerStaysSilent(
+        capturedPosition: Double, _ follow: @escaping @Sendable (Double) -> Void
+    ) {
+        let fetchesBefore = provider?.mediaFetchCount ?? 0
+        let epoch = sessionEpochSnapshot()
+        Task.detached(priority: .userInitiated) { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(Self.consumerReengageGraceSeconds * 1_000_000_000))
+            guard let self, self.isSessionEpochCurrent(epoch) else { return }
+            guard (self.provider?.mediaFetchCount ?? 0) == fetchesBefore,
+                  self.playIntentProvider?() == true else { return }
+            follow(self.currentPlaybackPositionProvider?() ?? capturedPosition)
         }
     }
 
@@ -736,7 +918,9 @@ extension HLSVideoEngine {
             try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
 
             let dem = Demuxer()
-            registerReopenDemuxer(dem)  // register before blocking open so stop() can abort via markClosed
+            // Audit HLS-2: a zap during the sleep above must not open the old channel; on a
+            // single-slot tuner that orphan open takes the slot the new channel needs.
+            guard registerReopenDemuxer(dem, failedProducer: failedProducer) else { return }
             defer { unregisterReopenDemuxer(dem) }
             var freshReader: IOReader?
             do {
@@ -806,10 +990,14 @@ extension HLSVideoEngine {
         return producer === p
     }
 
-    private func registerReopenDemuxer(_ dem: Demuxer) {
+    /// Registers `dem` for `stop()` to abort, atomically with the check that the session still
+    /// belongs to `failedProducer`. False means a stop or a newer producer already took over.
+    func registerReopenDemuxer(_ dem: Demuxer, failedProducer: HLSSegmentProducer) -> Bool {
         restartLock.lock()
+        defer { restartLock.unlock() }
+        guard producer === failedProducer else { return false }
         reopenDemuxer = dem
-        restartLock.unlock()
+        return true
     }
 
     private func unregisterReopenDemuxer(_ dem: Demuxer) {
@@ -833,6 +1021,12 @@ extension HLSVideoEngine {
         }
         let oldDem = demuxer
         demuxer = dem
+        // #433: the reopen replaces the reader the phase axis describes. The lost source's reader parked
+        // the host on `.stalled`, and this demuxer was never handed the sink at all, so the axis kept
+        // reporting a transport that no longer exists for the rest of the session.
+        oldDem?.onNetworkPhaseChanged = nil
+        dem.onNetworkPhaseChanged = onNetworkPhaseChanged
+        dem.playIntentProvider = playIntentProvider   // #377: the reopened held connection is bounded by a pause, not by a parked producer
         let (nextIndex, outputEnd) = prov.liveContinuationPoint()
         do {
             let newProd = try makeProducer(
@@ -841,7 +1035,7 @@ extension HLSVideoEngine {
             )
             // Fresh connection joins the broadcast at "now"; source clock jumps, so the seam carries #EXT-X-DISCONTINUITY. Shift handoff deferred to seam to avoid jumping the host clock while pre-loss content is on screen.
             newProd.firstSegmentDiscontinuous = true
-            newProd.onVideoShiftKnown = { [weak self] shiftPts, _ in
+            newProd.onVideoShiftKnown = { [weak self] shiftPts, _, _ in
                 self?.handleLiveTimelineRebase(shiftPts, seamOutputSeconds: outputEnd)
             }
             producer = newProd
@@ -850,6 +1044,11 @@ extension HLSVideoEngine {
             let oldReader = reopenCustomReader
             if freshReader != nil { reopenCustomReader = freshReader }
             restartLock.unlock()
+            // AE#443: the swap is final only here; the catch below puts `oldDem` back, and folding it
+            // there would count the same reader's bytes twice. A reopen replaces the reader and the
+            // producer, not the session's totals.
+            retireProducer(failedProducer)
+            retireDemuxer(oldDem)
             oldDem?.close()
             if freshReader != nil { oldReader?.close() }
             newProd.start()
@@ -861,6 +1060,9 @@ extension HLSVideoEngine {
             return .done
         } catch {
             demuxer = oldDem
+            // The swap did not happen: the axis goes back to the reader that is still installed (#433).
+            dem.onNetworkPhaseChanged = nil
+            oldDem?.onNetworkPhaseChanged = onNetworkPhaseChanged
             restartLock.unlock()
             dem.close()
             freshReader?.close()

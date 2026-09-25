@@ -2,7 +2,7 @@
 // Side packet yields when its rescaled timestamp is strictly lower; ties go to main. Blocking
 // read mechanics are not testable without demuxers.
 import XCTest
-import Libavutil
+import AetherLibavutil
 @testable import AetherEngine
 
 final class DualSourceMergeOrderTests: XCTestCase {

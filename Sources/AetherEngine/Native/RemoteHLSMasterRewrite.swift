@@ -59,14 +59,36 @@ enum RemoteHLSMasterRewrite {
                         originURL: URL,
                         renditions: [Rendition],
                         mediaPlaylistBandwidth: Int = 5_000_000) throws -> String {
+        try rewriteDeclaringNames(originPlaylist: originPlaylist, originURL: originURL,
+                                  renditions: renditions,
+                                  mediaPlaylistBandwidth: mediaPlaylistBandwidth).master
+    }
+
+    /// The rewritten master, and the NAME it declares for each rendition, in `renditions` order.
+    struct Rewritten: Equatable, Sendable {
+        var master: String
+        var renditionNames: [String]
+    }
+
+    /// `rewrite`, also answering with the exact NAME each rendition was written under. The engine
+    /// selects an injected rendition by that NAME and hides it from the legible list by it, so it has
+    /// to key on what the master says, not on the name it asked for (audit NAT-2): a sidecar that
+    /// repeats another's name, or the origin's, is written with a disambiguator.
+    static func rewriteDeclaringNames(originPlaylist: String,
+                                      originURL: URL,
+                                      renditions: [Rendition],
+                                      mediaPlaylistBandwidth: Int = 5_000_000) throws -> Rewritten {
         guard !renditions.isEmpty else { throw Refusal.noRenditions }
         let lines = originPlaylist.components(separatedBy: .newlines)
         guard lines.contains(where: { $0.trimmingCharacters(in: .whitespaces).hasPrefix("#EXTM3U") }) else {
             throw Refusal.notAPlaylist
         }
         guard lines.contains(where: { $0.hasPrefix("#EXT-X-STREAM-INF:") }) else {
-            return wrapMediaPlaylist(originURL: originURL, renditions: renditions,
-                                     bandwidth: mediaPlaylistBandwidth)
+            let names = declaredNames(for: renditions, taken: [])
+            return Rewritten(
+                master: wrapMediaPlaylist(originURL: originURL, renditions: renditions, names: names,
+                                          bandwidth: mediaPlaylistBandwidth),
+                renditionNames: names)
         }
         return try rewriteMaster(lines: lines, originURL: originURL, renditions: renditions)
     }
@@ -75,20 +97,19 @@ enum RemoteHLSMasterRewrite {
 
     private static func rewriteMaster(lines: [String],
                                       originURL: URL,
-                                      renditions: [Rendition]) throws -> String {
+                                      renditions: [Rendition]) throws -> Rewritten {
         // Which groups the injected renditions have to join: every SUBTITLES group the origin declares
         // (a variant references exactly one, and different variants may reference different ones), plus
         // our own group if any variant references none.
         var originGroups: [String] = []
-        var namesPerGroup: [String: Set<String>] = [:]
+        var originNames: Set<String> = []
         for line in lines where line.hasPrefix("#EXT-X-MEDIA:") {
             guard HLSPlaylistParser.attribute("TYPE", in: line) == "SUBTITLES",
                   let group = HLSPlaylistParser.attribute("GROUP-ID", in: line) else { continue }
             if !originGroups.contains(group) { originGroups.append(group) }
-            if let name = HLSPlaylistParser.attribute("NAME", in: line) {
-                namesPerGroup[group, default: []].insert(name)
-            }
+            if let name = HLSPlaylistParser.attribute("NAME", in: line) { originNames.insert(name) }
         }
+        let names = declaredNames(for: renditions, taken: originNames)
         let variantsWithoutGroup = lines.contains {
             $0.hasPrefix("#EXT-X-STREAM-INF:") && HLSPlaylistParser.attribute("SUBTITLES", in: $0) == nil
         }
@@ -113,8 +134,8 @@ enum RemoteHLSMasterRewrite {
                 // The renditions have to be declared before the first variant references their group.
                 if !injected {
                     out.append(contentsOf: mediaTags(renditions: renditions,
-                                                     groups: targetGroups,
-                                                     takenNames: namesPerGroup))
+                                                     names: names,
+                                                     groups: targetGroups))
                     injected = true
                 }
                 out.append(withSubtitlesGroup(trimmed))
@@ -124,7 +145,7 @@ enum RemoteHLSMasterRewrite {
             out.append(rewriteURIAttribute(in: line, against: originURL))
         }
         guard sawVariantURI else { throw Refusal.masterWithoutVariants }
-        return out.joined(separator: "\n") + "\n"
+        return Rewritten(master: out.joined(separator: "\n") + "\n", renditionNames: names)
     }
 
     /// A variant that already names a SUBTITLES group keeps it (the injected renditions joined that
@@ -138,11 +159,12 @@ enum RemoteHLSMasterRewrite {
 
     private static func wrapMediaPlaylist(originURL: URL,
                                           renditions: [Rendition],
+                                          names: [String],
                                           bandwidth: Int) -> String {
         var lines = ["#EXTM3U", "#EXT-X-INDEPENDENT-SEGMENTS"]
         lines.append(contentsOf: mediaTags(renditions: renditions,
-                                           groups: [injectedGroupID],
-                                           takenNames: [:]))
+                                           names: names,
+                                           groups: [injectedGroupID]))
         lines.append("#EXT-X-STREAM-INF:BANDWIDTH=\(bandwidth),SUBTITLES=\"\(injectedGroupID)\"")
         lines.append(originURL.absoluteString)
         return lines.joined(separator: "\n") + "\n"
@@ -156,14 +178,12 @@ enum RemoteHLSMasterRewrite {
     /// rendition whose language matches the selected audio regardless of the user's caption preference
     /// (Sodalite#38). `isForced` still rides the published `TrackInfo` so a host can label and pick it.
     private static func mediaTags(renditions: [Rendition],
-                                  groups: [String],
-                                  takenNames: [String: Set<String>]) -> [String] {
+                                  names: [String],
+                                  groups: [String]) -> [String] {
         var tags: [String] = []
         for group in groups {
-            var used = takenNames[group] ?? []
-            for rendition in renditions {
-                let name = uniqueName(rendition.name, in: &used)
-                var attrs = ["TYPE=SUBTITLES", "GROUP-ID=\"\(group)\"", "NAME=\"\(escaped(name))\""]
+            for (rendition, name) in zip(renditions, names) {
+                var attrs = ["TYPE=SUBTITLES", "GROUP-ID=\"\(group)\"", "NAME=\"\(name)\""]
                 if let language = rendition.language, !language.isEmpty {
                     attrs.append("LANGUAGE=\"\(escaped(language))\"")
                 }
@@ -181,7 +201,14 @@ enum RemoteHLSMasterRewrite {
 
     /// NAMEs must be unique within a group or AVFoundation collapses the legible options into one. The
     /// origin's own names are already taken, so a sidecar that repeats one gets a numeric disambiguator
-    /// rather than silently disappearing from the picker.
+    /// rather than silently disappearing from the picker. One name per rendition across every group,
+    /// taken against the origin names of all of them, so the engine can select it by that one string;
+    /// uniqueness is decided on the escaped form, which is the one the master carries.
+    private static func declaredNames(for renditions: [Rendition], taken: Set<String>) -> [String] {
+        var used = taken
+        return renditions.map { uniqueName(escaped($0.name), in: &used) }
+    }
+
     private static func uniqueName(_ preferred: String, in used: inout Set<String>) -> String {
         let base = preferred.isEmpty ? "Subtitle" : preferred
         if !used.contains(base) {
@@ -196,8 +223,21 @@ enum RemoteHLSMasterRewrite {
     }
 
     /// Quoted attribute values cannot carry a `"`; a name that contains one would truncate the tag.
+    /// Nor a line break or any other control character (audit NAT-6): a sidecar name is host input,
+    /// often a file name or server metadata, and a CR/LF in it would end the tag and let the rest of
+    /// the name write its own master lines, a variant included. Mapped per scalar, because CRLF is a
+    /// single Character and a Character-level test would let it through as one.
     private static func escaped(_ value: String) -> String {
-        value.replacingOccurrences(of: "\"", with: "'")
+        var out = String.UnicodeScalarView()
+        for scalar in value.unicodeScalars {
+            switch scalar.properties.generalCategory {
+            case .control, .lineSeparator, .paragraphSeparator:
+                out.append(" ")
+            default:
+                out.append(scalar == "\"" ? "'" : scalar)
+            }
+        }
+        return String(out)
     }
 
     // MARK: - URI absolutisation

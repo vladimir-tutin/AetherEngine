@@ -33,7 +33,8 @@ final class AudioTapHLSFetcher: @unchecked Sendable {
             let cfg = URLSessionConfiguration.ephemeral
             cfg.timeoutIntervalForRequest = 10
             cfg.timeoutIntervalForResource = 30
-            self.session = URLSession(configuration: cfg)
+            self.session = URLSession(
+                configuration: cfg, delegate: EngineTLS.sessionDelegate, delegateQueue: nil)
         }
         self.httpHeaders = httpHeaders
     }

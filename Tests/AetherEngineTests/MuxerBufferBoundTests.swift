@@ -7,7 +7,7 @@
 // muxer's rewritten output video time base.
 import Foundation
 import Testing
-import Libavutil
+import AetherLibavutil
 @testable import AetherEngine
 
 @Suite("MP4SegmentMuxer buffered-fragment bound (#64)")

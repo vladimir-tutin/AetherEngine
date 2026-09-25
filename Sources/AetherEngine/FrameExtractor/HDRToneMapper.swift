@@ -1,6 +1,6 @@
 import Foundation
-import Libavfilter
-import Libavutil
+import AetherLibavfilter
+import AetherLibavutil
 
 /// Tone-maps a decoded HDR (PQ/HLG, BT.2020) AVFrame to SDR BT.709 RGBA via a
 /// zscale + tonemap libavfilter graph (one graph per call; extractor is low-frequency).
@@ -21,10 +21,17 @@ struct HDRToneMapper {
         let sar = frame.pointee.sample_aspect_ratio
         let sarNum = sar.num > 0 ? sar.num : 1
         let sarDen = sar.den > 0 ? sar.den : 1
+        // AE#499: colorspace and range belong in the args. Without them the link is configured as
+        // unspecified, the first frame arrives as BT.2020 and buffersrc warns that changing frame
+        // properties on the fly is not supported by all filters. zscale reads the frame rather than the
+        // link, so this was never the cause of a failure, but a graph that describes its own input
+        // wrongly is a bad place to debug the next one from.
         let args = "video_size=\(frame.pointee.width)x\(frame.pointee.height)" +
                    ":pix_fmt=\(frame.pointee.format)" +
                    ":time_base=\(timeBase.num)/\(timeBase.den)" +
-                   ":pixel_aspect=\(sarNum)/\(sarDen)"
+                   ":pixel_aspect=\(sarNum)/\(sarDen)" +
+                   ":colorspace=\(frame.pointee.colorspace.rawValue)" +
+                   ":range=\(frame.pointee.color_range.rawValue)"
 
         var srcCtx: UnsafeMutablePointer<AVFilterContext>?
         var sinkCtx: UnsafeMutablePointer<AVFilterContext>?

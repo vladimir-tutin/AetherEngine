@@ -1,6 +1,6 @@
 import Foundation
-import Libavcodec
-import Libavutil
+import AetherLibavcodec
+import AetherLibavutil
 import Dovi
 
 /// In-place DV P7 -> P8.1 rewrite: drops unspec63 EL NALs, rewrites unspec62 RPU via libdovi mode 2. AVCC layout (4-byte BE length prefix); libdovi handles emulation-prevention bytes internally.

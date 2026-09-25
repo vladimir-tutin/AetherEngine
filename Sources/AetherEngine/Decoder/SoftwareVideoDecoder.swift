@@ -2,10 +2,10 @@ import Foundation
 import CoreMedia
 import CoreVideo
 import VideoToolbox
-import Libavformat
-import Libavcodec
-import Libavutil
-import Libswscale
+import AetherLibavformat
+import AetherLibavcodec
+import AetherLibavutil
+import AetherLibswscale
 
 /// libavcodec software video decoder for codecs without VideoToolbox support (e.g. AV1/dav1d on Apple TV).
 /// Uses sws_scale (SIMD/NEON-optimized) for YUV→NV12/P010 conversion; required to hit 24fps at 1080p for AV1.
@@ -50,6 +50,12 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         set { skipLock.lock(); _skipUntilPTS = newValue; skipLock.unlock() }
     }
     private var _skipUntilPTS: CMTime?
+
+    /// AE#492: guarded by `lock`, the same one `flush()` and `decode(packet:epoch:)` take.
+    private var _feedEpoch: UInt64 = 0
+    var feedEpoch: UInt64 {
+        lock.lock(); defer { lock.unlock() }; return _feedEpoch
+    }
     private let skipLock = NSLock()
 
     /// Clear the skip threshold only if it is still the one we acted on.
@@ -72,8 +78,24 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// applied to the filter there (mutating it mid-stream would need a graph rebuild).
     var deinterlaceConfig = DeinterlaceConfig()
 
+    /// #544: decode on the calling thread with no frame-level threading. Set before `open`; the
+    /// still extractor is the only caller, everything on a playback path wants the parallel default.
+    var decodesSingleThreaded = false
+
+    /// AE#499: what the container declared about colour, captured at `open` before a single frame
+    /// exists. A decoded frame carries the VUI alone, and a remux whose VUI is empty would otherwise
+    /// reach `attachColorSpace` as an untagged picture, so an HDR10 file decoded in software lost its
+    /// PQ / BT.2020 attachments while the same file through the hardware decoder (which reads
+    /// `codecpar`) kept them. Written once in `open`, before the host can feed a packet, and read on
+    /// the decode thread afterwards, the same discipline `use10Bit` and the other open-time fields keep.
+    private var containerColor = ColorDescription.unspecified
+
     /// Deinterlaced frames dropped for carrying no PTS (see the drop site in decode()). Guarded by `lock`.
     private var droppedUntimestampedFields = 0
+
+    /// #407: frames whose PTS was reconstructed from `best_effort_timestamp` (see the repair site
+    /// in drainDecodedFrames()). Guarded by `lock`.
+    private var repairedTimestamps = 0
 
     /// GPU-side copy from the hw-deinterlace filter's pool buffers into `pixelBufferPool` (see
     /// the VT branch in emit()). Created lazily on the first hw frame; guarded by `lock`.
@@ -135,8 +157,15 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             return AV_PIX_FMT_YUV420P
         }
 
-        ctx.pointee.thread_count = Int32(ProcessInfo.processInfo.activeProcessorCount)
-        ctx.pointee.thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE
+        if decodesSingleThreaded {
+            // #544: a still run is one short GOP decoded once. Frame-level threading buys throughput
+            // nobody is waiting for and costs output delay plus a second worker pool.
+            ctx.pointee.thread_count = 1
+            ctx.pointee.thread_type = 0
+        } else {
+            ctx.pointee.thread_count = Int32(ProcessInfo.processInfo.activeProcessorCount)
+            ctx.pointee.thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE
+        }
 
         // Belt-and-suspenders hwaccel=none: some decoders ignore get_format.
         var opts: OpaquePointer?
@@ -148,12 +177,25 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         }
         av_dict_free(&opts)
 
+        containerColor = ColorDescription(codecpar: codecpar)
         let bitsPerSample = codecpar.pointee.bits_per_raw_sample
         let isHDRTransfer = ColorAttachments.isHDRTransfer(codecpar.pointee.color_trc)
         use10Bit = bitsPerSample > 8 || isHDRTransfer
 
         // Release-visible log (no #if DEBUG): needed for TestFlight users and DrHurt #4 black-screen reports.
         EngineLog.emit("[SWDecoder] Opened: \(codecpar.pointee.width)x\(codecpar.pointee.height), codec=\(String(cString: codec.pointee.name)), threads=\(ctx.pointee.thread_count), \(use10Bit ? "10-bit" : "8-bit")", category: .swPlayback)
+    }
+
+    /// #407: the timestamp to put on a decoded frame that carries none, or nil when the frame is
+    /// already timed (the common case, and the one that must stay untouched: a decoder-set PTS is
+    /// always at least as good as the reconstruction, and `best_effort_timestamp` can trail it).
+    ///
+    /// `AV_NOPTS_VALUE` is `Int64.min`. `best_effort_timestamp` is libavcodec's own
+    /// `guess_correct_pts(pts, pkt_dts)`, so a frame with neither cannot be timed by any means the
+    /// decoder has and stays unschedulable; the layer below drops it rather than wedging the queue.
+    static func repairedPTS(pts: Int64, bestEffort: Int64) -> Int64? {
+        guard pts == Int64.min, bestEffort != Int64.min else { return nil }
+        return bestEffort
     }
 
     /// What to do with a packet after `avcodec_send_packet` returned `ret` (#220).
@@ -180,8 +222,13 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// an error, and returning on it both dropped the packet and left the output queue full, so
     /// every subsequent send hit the same wall: video wedged permanently until a seek flushed
     /// the decoder, while audio kept playing.
-    func decode(packet: UnsafeMutablePointer<AVPacket>) {
+    func decode(packet: UnsafeMutablePointer<AVPacket>, epoch: UInt64? = nil) {
         lock.lock()
+        // AE#492: a packet decided on before a flush must not be sent after it. Checked here rather
+        // than at the caller because only this lock orders the two: `flush()` takes it to retire the
+        // epoch, so either the send happens first and the flush drops what it produced, or the flush
+        // happens first and the send never runs.
+        if let epoch, epoch != _feedEpoch { lock.unlock(); return }
         guard let ctx = codecContext else { lock.unlock(); return }
         var sendRet = avcodec_send_packet(ctx, packet)
         lock.unlock()
@@ -189,6 +236,8 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         if Self.disposition(forSendResult: sendRet) == .drainAndRetry {
             drainDecodedFrames()
             lock.lock()
+            // Audit DEC-1: the drain drops the lock between frames, so a flush can land in it.
+            if let epoch, epoch != _feedEpoch { lock.unlock(); return }
             sendRet = codecContext == nil ? FFmpegErr.einval : avcodec_send_packet(ctx, packet)
             lock.unlock()
         }
@@ -218,6 +267,33 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             guard codecContext != nil else { lock.unlock(); break }
             let ret = avcodec_receive_frame(ctx, f)
             guard ret >= 0 else { lock.unlock(); break }
+
+            // AE#499: fill the fields the VUI left open from the container's declaration BEFORE any
+            // consumer reads the frame, for the same reason the timestamp repair below runs here.
+            ColorDescription.backfill(frame: f, container: containerColor)
+
+            // #407: repair the frame's own timestamp BEFORE anything reads it. A frame that reaches
+            // the renderer with no PTS is unschedulable and gets dropped there, so every consumer
+            // below (captions, the deinterlace graph, emit) has to see the repaired value, not just
+            // the one that happens to be looked at last. `best_effort_timestamp` is libavcodec's
+            // guess_correct_pts(pts, pkt_dts), the same reconstruction every other FFmpeg-based
+            // player consumes, and it is the only timestamp left when the container carried decode
+            // timestamps alone: Matroska V_MS/VFW/FOURCC tracks (VC-1, the legacy MS codecs) put the
+            // block time in DTS, and live MPEG-TS delivers untimed pictures outright. The demuxer's
+            // `+genpts` normally fills those in a packet earlier; this is the layer that has to hold
+            // when it cannot (an open that never got the flag, a frame the reconstruction skipped).
+            if let repaired = Self.repairedPTS(
+                pts: f.pointee.pts, bestEffort: f.pointee.best_effort_timestamp
+            ) {
+                f.pointee.pts = repaired
+                repairedTimestamps += 1
+                if repairedTimestamps == 1 || repairedTimestamps % 250 == 0 {
+                    EngineLog.emit(
+                        "[SWDecoder] repaired \(repairedTimestamps) frame timestamp(s) from best_effort_timestamp",
+                        category: .swPlayback
+                    )
+                }
+            }
 
             // #131: A53 captions surface as decoded-frame side data on the FFmpeg path (MPEG-2
             // picture user data and friends). Presentation order by construction of decoder output.
@@ -357,11 +433,24 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         onFrame?(pixelBuffer, cmPTS, hdr10PlusData)
     }
 
+    /// #544: `resetFilterGraph: false` keeps the deinterlace graph across the flush. The still
+    /// extractor flushes before every run, and rebuilding the graph means a fresh Metal pipeline, a
+    /// fresh full-resolution hwframes pool AND an unconditional `[Deinterlace] engaged` line, about
+    /// sixteen times a second while a viewer holds the scrub. That line alone overwrites a host's
+    /// whole diagnostic ring in half a minute. A still run decodes a full GOP and returns the frame
+    /// at its target, so the filter has context from this position by the time that frame is made.
     func flush() {
+        flush(resetFilterGraph: true)
+    }
+
+    func flush(resetFilterGraph: Bool) {
         lock.lock()
         defer { lock.unlock() }
+        // AE#492: retires every packet a caller had already decided to send. Bumped under the lock,
+        // so a feed that has not reached `avcodec_send_packet` yet is refused from here on.
+        _feedEpoch &+= 1
         // Deinterlacer temporal references are stale across seeks; drop the graph (lazily rebuilt on next interlaced frame).
-        deinterlacer.teardown()
+        if resetFilterGraph { deinterlacer.teardown() }
         guard let ctx = codecContext else { return }
         avcodec_flush_buffers(ctx)
     }
@@ -567,12 +656,23 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
 
     // MARK: - Pixel Aspect Ratio (anamorphic SD)
 
-    /// The stream's declared SAR, bitstream first. Neither field alone is the whole answer: codecpar
-    /// carries what the bitstream said (the mpegts / mpeg-ps parsers fill it), while a
-    /// container-declared ratio reaches AVStream alone. Sanity is not judged here; the caller runs
-    /// both gates against the frame.
+    /// The stream's declared SAR. Neither field alone is the whole answer: codecpar carries what the
+    /// bitstream said (the mpegts / mpeg-ps parsers fill it), while a container-declared ratio
+    /// reaches AVStream alone (Matroska's DisplayWidth quotient, MP4's `pasp`).
+    ///
+    /// A container that declares a real correction wins, because it is the later authoring layer:
+    /// `mkvmerge --aspect-ratio` writes DisplayWidth and leaves the bitstream alone, so the two
+    /// disagree by design and the newer one is the intent. This is also what every ffmpeg-based
+    /// player resolves to (`av_guess_sample_aspect_ratio` returns the stream ratio wherever it is
+    /// set), and what an MP4 `pasp` means to AVFoundation. A SQUARE declaration is not a
+    /// correction and therefore not a claim to prefer, on either side: reading `1:1` out of the
+    /// bitstream as "declared" is what hid a container-declared ratio entirely.
+    ///
+    /// Sanity is not judged here; the caller runs both gates against the frame.
     static func declaredStreamSAR(bitstream: AVRational, container: AVRational) -> AVRational {
-        (bitstream.num > 0 && bitstream.den > 0) ? bitstream : container
+        if container.num > 0, container.den > 0, container.num != container.den { return container }
+        if bitstream.num > 0, bitstream.den > 0 { return bitstream }
+        return container
     }
 
     /// #177 resolution order: frame -> codec context -> stream, first sane wins. The frame usually
@@ -582,12 +682,21 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// #290: sanity is judged against the coded dimensions, so a SAR whose numbers are plausible
     /// but whose display aspect is not (a live 1080p channel declaring 3:1) drops through to the
     /// next source, and to square pixels when no source survives. See `PixelAspectPolicy`.
+    ///
+    /// A square candidate does not end the search either. It corrects nothing, so treating it as an
+    /// answer only means the axes behind it are never read: an anamorphic MKV whose H.264 VUI says
+    /// square (the shape `mkvmerge --aspect-ratio` leaves behind) was drawn at its coded size while
+    /// the ratio sat in the container, one axis further down. nil and 1:1 attach the same nothing.
     static func resolveSAR(
         frame: AVRational, codecCtx: AVRational, stream: AVRational, width: Int32, height: Int32
     ) -> AVRational? {
-        PixelAspectPolicy.saneSAR(frame, width: width, height: height)
-            ?? PixelAspectPolicy.saneSAR(codecCtx, width: width, height: height)
-            ?? PixelAspectPolicy.saneSAR(stream, width: width, height: height)
+        for candidate in [frame, codecCtx, stream] {
+            if let sane = PixelAspectPolicy.saneSAR(candidate, width: width, height: height),
+               sane.num != sane.den {
+                return sane
+            }
+        }
+        return nil
     }
 
     /// #177 per-stream latch: the first sane non-square SAR wins for the rest of the stream, so

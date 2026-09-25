@@ -16,13 +16,15 @@ struct MasterRoutingTests {
                        displayHDR: Bool = false, nativeSubs: Bool = false,
                        panelEngagesOnDemand: Bool = false,
                        frameRateKnown: Bool = true,
-                       hevcNeedsMasterSignaling: Bool = false) -> Bool {
+                       hevcNeedsMasterSignaling: Bool = false,
+                       audioRendition: Bool = false) -> Bool {
         HLSVideoEngine.resolveUseMasterPlaylist(
             videoRange: videoRange, effectiveDvMode: effectiveDvMode,
             panelIsInHDRMode: panelHDR, displaySupportsHDR: displayHDR,
             hasNativeSubs: nativeSubs, builtInPanelEngagesOnDemand: panelEngagesOnDemand,
             frameRateKnown: frameRateKnown,
-            videoCodecNeedsMasterSignaling: hevcNeedsMasterSignaling)
+            videoCodecNeedsMasterSignaling: hevcNeedsMasterSignaling,
+            hasAudioRendition: audioRendition)
     }
 
     @Test("tvOS: HDR source on an SDR-parked panel stays media-direct (-11848 guard)")
@@ -61,6 +63,28 @@ struct MasterRoutingTests {
     // AE#187: tvOS HW HEVC needs the codec advertised in a master's CODECS attribute; a bare media
     // playlist fails with tracks count=0 / -12848 (H.264 is fine media-direct). The caller scopes the
     // flag to tvOS + HEVC; the pure decision forces the master wherever it is routing-safe.
+
+    // AE#458: EXT-X-MEDIA:TYPE=AUDIO lives only in a master, and it is the ONLY place AVFoundation
+    // reads an audio language from on an HLS asset. Without this the 6.60.0 rendition reached AVKit
+    // only where something else had already forced the master, so SDR H.264 (and SDR HEVC off tvOS)
+    // kept showing "Not Specified" (htrung14, device-observed on the tvOS transport bar).
+
+    @Test("AE#458: a labelled audio track forces the master for SDR on any panel")
+    func audioRenditionForcesSDRMaster() {
+        #expect(route(videoRange: .sdr, audioRendition: true))
+        #expect(route(videoRange: .sdr, panelEngagesOnDemand: true, audioRendition: true))
+        // Nothing to advertise leaves the SDR default untouched.
+        #expect(!route(videoRange: .sdr))
+    }
+
+    @Test("AE#458: a labelled audio track does not force an HDR master onto an unready panel")
+    func audioRenditionRespectsHDRPanelReadiness() {
+        #expect(!route(videoRange: .pq, displayHDR: true, audioRendition: true))
+        #expect(route(videoRange: .pq, panelHDR: true, displayHDR: true, audioRendition: true))
+        // #130: a PQ variant without FRAME-RATE is unloadable, and a language does not change that.
+        #expect(!route(videoRange: .pq, panelHDR: true, displayHDR: true,
+                       frameRateKnown: false, audioRendition: true))
+    }
 
     @Test("AE#187: HEVC signaling forces the master for SDR on any panel")
     func hevcSignalingForcesSDRMaster() {

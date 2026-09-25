@@ -8,7 +8,7 @@
 // segment k produced continuously and segment k re-produced by a restart must match.
 import Foundation
 import Testing
-import Libavcodec
+import AetherLibavcodec
 @testable import AetherEngine
 
 // MARK: - Minimal fMP4 reader (moof/traf: tfhd track id, tfdt base time, trun sample count)

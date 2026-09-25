@@ -1,7 +1,7 @@
 import Foundation
 import Testing
-import Libavcodec
-import Libavutil
+import AetherLibavcodec
+import AetherLibavutil
 @testable import AetherEngine
 
 /// #230 (rrgomes, reading the software path for #220): the #151 forward prefetcher's park was

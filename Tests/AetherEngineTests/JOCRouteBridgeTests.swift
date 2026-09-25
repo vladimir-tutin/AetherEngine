@@ -1,5 +1,5 @@
 import Testing
-import Libavcodec
+import AetherLibavcodec
 @testable import AetherEngine
 
 /// EAC3/JOC routing tests. EAC3 always stream-copies (CODECS string "ec-3" for both JOC and plain 5.1); FLAC bridge is never route-driven (AetherEngine#34).

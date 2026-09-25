@@ -49,7 +49,7 @@ func runExtract(url: URL, at seconds: Double, mode: FrameMode, loops: Int, maxWi
         if let image {
             produced += 1
             if i == 0 {
-                let out = "/tmp/aetherctl-extract-\(mode).png"
+                let out = debugOutputPath("aetherctl-extract-\(mode).png")
                 if writePNG(image, to: out) {
                     print("Wrote \(image.width)x\(image.height) -> \(out)")
                 } else {

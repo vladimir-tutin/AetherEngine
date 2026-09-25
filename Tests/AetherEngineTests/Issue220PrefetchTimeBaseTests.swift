@@ -1,6 +1,6 @@
 import Foundation
 import Testing
-import Libavutil
+import AetherLibavutil
 @testable import AetherEngine
 
 /// #220 (rrgomes): the #151 prefetcher memoized its own time-base lookup failure. A nil

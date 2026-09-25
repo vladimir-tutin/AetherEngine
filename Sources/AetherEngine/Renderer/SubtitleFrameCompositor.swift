@@ -116,10 +116,33 @@ final class SubtitleFrameCompositor: @unchecked Sendable {
             logFailureOnce("pool exhausted")
             return buffer
         }
+        // Audit DEC-3: the renderer builds the format description from the delivered buffer, so
+        // the output has to carry the source's pixel aspect ratio and colour tags, or anamorphic
+        // content shows at coded size and HDR drops to SDR for as long as a cue is up. Carried
+        // before the render too, because CoreImage picks the YCbCr matrix from the destination.
+        Self.carryAttachments(from: buffer, to: output)
         let base = CIImage(cvPixelBuffer: buffer)
         let composited = overlay.composited(over: base)
-        ciContext.render(composited, to: output, bounds: CGRect(x: 0, y: 0, width: width, height: height), colorSpace: CGColorSpace(name: CGColorSpace.itur_709))
+        ciContext.render(composited, to: output, bounds: CGRect(x: 0, y: 0, width: width, height: height),
+                         colorSpace: Self.renderColorSpace(for: buffer))
+        Self.carryAttachments(from: buffer, to: output)
         return output
+    }
+
+    /// The source's own colour space, so the render encodes the picture the way it was decoded
+    /// (PQ and HLG included). BT.709 only when the source carries no usable tags.
+    nonisolated static func renderColorSpace(for buffer: CVPixelBuffer) -> CGColorSpace {
+        if let attachments = CVBufferCopyAttachments(buffer, .shouldPropagate),
+           let space = CVImageBufferCreateColorSpaceFromAttachments(attachments)?.takeRetainedValue() {
+            return space
+        }
+        return CGColorSpace(name: CGColorSpace.itur_709) ?? CGColorSpaceCreateDeviceRGB()
+    }
+
+    /// Replaces rather than adds: a recycled pool buffer can hold a previous source's tags.
+    nonisolated static func carryAttachments(from source: CVPixelBuffer, to output: CVPixelBuffer) {
+        CVBufferRemoveAllAttachments(output)
+        CVBufferPropagateAttachments(source, output)
     }
 
     /// One CGImage per cue-set change: text cues bottom-up in the default look, image cues at their
@@ -317,7 +340,11 @@ final class SubtitleFrameCompositor: @unchecked Sendable {
         }
     }
 
+    /// Audit DEC-5: `reset()` clears the pool under `lock` from the actor while the decode thread can
+    /// be in here, so the pool reference is only read and replaced under the same lock.
     private func dequeueBuffer(width: Int, height: Int, pixelFormat: OSType) -> CVPixelBuffer? {
+        lock.lock()
+        defer { lock.unlock() }
         if poolFormat?.width != width || poolFormat?.height != height || poolFormat?.pixelFormat != pixelFormat {
             let attrs: [CFString: Any] = [
                 kCVPixelBufferWidthKey: width,

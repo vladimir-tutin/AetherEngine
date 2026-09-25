@@ -120,6 +120,28 @@ struct SegmentFetchWaitTests {
         #expect(elapsed >= 0.3)
     }
 
+    @Test("a fetch riding a restart that outlives close() returns instead of spinning")
+    func rideStopsWhenCacheCloses() {
+        let cache = SegmentCache(forwardWindow: 10, backwardWindow: 10)
+        storeAbove(cache, range: 45...50)
+        cache.close()
+        let recorder = Recorder()
+        let polls = PollCounter()
+        let provider = VideoSegmentProvider(
+            cache: cache, segments: segments(60), codecsString: "hvc1", supplementalCodecs: nil,
+            resolution: (1920, 1080), videoRange: .sdr, frameRate: 24.0, hdcpLevel: nil,
+            sourceBitrate: 8_000_000,
+            restartHandler: { idx in recorder.record(idx) },
+            restartActivity: { _ = polls.increment(); return true },
+            initialRestartIndex: 0,
+            repositionWaitSlice: 0.05,
+            repositionRideCapSeconds: 30.0
+        )
+        let served = provider.mediaSegment(at: 40)
+        #expect(served == nil)
+        #expect(polls.increment() <= 3)
+    }
+
     @Test("resume-anchored provider cold-waits at the anchor instead of restarting the producer")
     func resumeAnchorColdStart() {
         let cache = SegmentCache(forwardWindow: 10, backwardWindow: 10)

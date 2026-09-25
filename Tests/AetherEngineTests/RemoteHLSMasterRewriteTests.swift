@@ -245,4 +245,62 @@ struct RemoteHLSMasterRewriteTests {
             originPlaylist: master, originURL: Self.origin, renditions: [Self.english])
         #expect(Self.lines(out).contains("https://cdn.test/other/main.m3u8"))
     }
+
+    // MARK: - Declared names (audit NAT-2)
+
+    private static func declaredNames(in master: String, uri: String) -> [String] {
+        lines(master).filter { $0.contains("URI=\"\(uri)\"") }
+            .compactMap { HLSPlaylistParser.attribute("NAME", in: $0) }
+    }
+
+    /// The engine selects an injected rendition by NAME and hides it from the legible list by NAME.
+    /// It used to key on the name the track asked for, so a disambiguated sidecar selected the
+    /// origin's rendition, and the origin's own track disappeared from the list.
+    @Test("The names handed back are exactly the ones the master declares, one per rendition in every group")
+    func declaredNamesMatchTheMaster() throws {
+        let out = try RemoteHLSMasterRewrite.rewriteDeclaringNames(
+            originPlaylist: Self.masterMixedGroups, originURL: Self.origin,
+            renditions: [Self.english,
+                         RemoteHLSMasterRewrite.Rendition(ordinal: 1, name: "English", language: "en"),
+                         RemoteHLSMasterRewrite.Rendition(ordinal: 2, name: "The \"Cut\"")])
+
+        #expect(out.renditionNames == ["English 2", "English 3", "The 'Cut'"])
+        for (ordinal, name) in out.renditionNames.enumerated() {
+            let declared = Self.declaredNames(in: out.master, uri: "subs_\(ordinal).m3u8")
+            #expect(declared == [name, name], "one NAME for the rendition in both groups")
+        }
+    }
+
+    @Test("A wrapped media playlist hands back its names too")
+    func wrappedPlaylistDeclaresNames() throws {
+        let media = "#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6,\nseg0.ts\n#EXT-X-ENDLIST\n"
+        let out = try RemoteHLSMasterRewrite.rewriteDeclaringNames(
+            originPlaylist: media, originURL: Self.origin,
+            renditions: [Self.english,
+                         RemoteHLSMasterRewrite.Rendition(ordinal: 1, name: "English", language: "en")])
+        #expect(out.renditionNames == ["English", "English 2"])
+        #expect(Self.declaredNames(in: out.master, uri: "subs_1.m3u8") == ["English 2"])
+    }
+
+    // MARK: - Control characters (audit NAT-6)
+
+    /// A sidecar name is host input, typically a file name or server metadata. A line break in it
+    /// ended the tag, and the rest of the name wrote master lines of its own, a variant included.
+    @Test("A line break in a name or language cannot write a line into the master")
+    func lineBreaksCannotInjectLines() throws {
+        let hostile = "x\r\n#EXT-X-STREAM-INF:BANDWIDTH=1\r\nhttp://attacker.test/v.m3u8\n#"
+        let out = try RemoteHLSMasterRewrite.rewriteDeclaringNames(
+            originPlaylist: Self.master, originURL: Self.origin,
+            renditions: [RemoteHLSMasterRewrite.Rendition(
+                ordinal: 0, name: hostile, language: "en\u{2028}#EXT-X-ENDLIST\u{85}x")])
+
+        let all = Self.lines(out.master)
+        #expect(all.filter { $0.hasPrefix("#EXT-X-STREAM-INF:") }.count == 1)
+        #expect(!all.contains { $0.hasPrefix("http://attacker.test") })
+        #expect(!all.contains("#EXT-X-ENDLIST"))
+        #expect(all.filter { $0.hasPrefix("#EXT-X-MEDIA:") }.count == 1)
+        let name = try #require(out.renditionNames.first)
+        #expect(!name.unicodeScalars.contains { $0.properties.generalCategory == .control })
+        #expect(Self.declaredNames(in: out.master, uri: "subs_0.m3u8") == [name])
+    }
 }

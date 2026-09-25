@@ -89,7 +89,7 @@ final class FileHandleIOReader: IOReader, @unchecked Sendable {
 }
 
 /// Load media through load(source:) with a custom IOReader and print engine state once a second. Tests both native (seekable) and software (seekable or forward-only) paths.
-func runCustomIO(path: String, inMemory: Bool, forwardOnly: Bool, audioOnly: Bool, reload: Bool, switchAudio: Bool, selectSubs: Bool, extract: Bool, audioIndex: Int32? = nil) -> Int32 {
+func runCustomIO(path: String, inMemory: Bool, forwardOnly: Bool, audioOnly: Bool, reload: Bool, switchAudio: Bool, selectSubs: Bool, extract: Bool, audioIndex: Int32? = nil, reloadDecodePath: DecodePath? = nil) -> Int32 {
     EngineLog.handler = { print($0) }
     var modeDesc: String
     switch (inMemory, forwardOnly) {
@@ -102,7 +102,7 @@ func runCustomIO(path: String, inMemory: Bool, forwardOnly: Bool, audioOnly: Boo
     print("aetherctl customio: \(path) (\(modeDesc))")
     let box = UncheckedBox<Int32?>(nil)
     Task { @MainActor in
-        box.value = await customIOSmokeTest(path: path, inMemory: inMemory, forwardOnly: forwardOnly, audioOnly: audioOnly, reload: reload, switchAudio: switchAudio, selectSubs: selectSubs, extract: extract, audioIndex: audioIndex)
+        box.value = await customIOSmokeTest(path: path, inMemory: inMemory, forwardOnly: forwardOnly, audioOnly: audioOnly, reload: reload, switchAudio: switchAudio, selectSubs: selectSubs, extract: extract, audioIndex: audioIndex, reloadDecodePath: reloadDecodePath)
         CFRunLoopStop(CFRunLoopGetMain())
     }
     CFRunLoopRun()
@@ -110,7 +110,7 @@ func runCustomIO(path: String, inMemory: Bool, forwardOnly: Bool, audioOnly: Boo
 }
 
 @MainActor
-private func customIOSmokeTest(path: String, inMemory: Bool, forwardOnly: Bool, audioOnly: Bool, reload: Bool, switchAudio: Bool, selectSubs: Bool, extract: Bool, audioIndex: Int32? = nil) async -> Int32 {
+private func customIOSmokeTest(path: String, inMemory: Bool, forwardOnly: Bool, audioOnly: Bool, reload: Bool, switchAudio: Bool, selectSubs: Bool, extract: Bool, audioIndex: Int32? = nil, reloadDecodePath: DecodePath? = nil) async -> Int32 {
     let reader: FileHandleIOReader
     do {
         reader = try FileHandleIOReader(path: path, inMemory: inMemory, forwardOnly: forwardOnly)
@@ -190,10 +190,44 @@ private func customIOSmokeTest(path: String, inMemory: Bool, forwardOnly: Bool, 
     }
 
     if reload {
-        do { try await engine.reloadAtCurrentPosition() } catch {
-            print("VERDICT: reload threw: \(error.localizedDescription)"); engine.stop(); return 5
+        // AE#461 follow-up: --reload-decode-path corrects the session onto the software path across
+        // the rebuild that keeps the retained reader, which is the shape where the correction used
+        // to be accepted and then ignored. The backend on both sides is the observable.
+        let beforeBackend = engine.playbackBackend
+        let beforePos = engine.currentTime
+        do {
+            if let reloadDecodePath {
+                print(String(format: "  RELOAD applying preferredDecodePath=%@: playhead=%.2fs backend=%@",
+                             reloadDecodePath.rawValue, beforePos, "\(beforeBackend)"))
+                try await engine.reloadAtCurrentPosition { $0.preferredDecodePath = reloadDecodePath }
+            } else {
+                try await engine.reloadAtCurrentPosition()
+            }
+        } catch {
+            // A refused decode-path correction is a legitimate outcome, and the claim worth
+            // measuring is that it cost the session nothing: the guards it stands in for live after
+            // the routing decision inside `load`, where reaching them means the session is already
+            // torn down. Report the surviving state rather than exiting on the throw.
+            guard reloadDecodePath != nil else {
+                print("VERDICT: reload threw: \(error.localizedDescription)"); engine.stop(); return 5
+            }
+            print("  REFUSED: \(error.localizedDescription)")
+            print(String(format: "  REFUSED state=%@ backend=%@ playhead=%.2fs (was %.2fs) decoder=%@",
+                         "\(engine.state)", "\(engine.playbackBackend)",
+                         engine.currentTime, beforePos, engine.activeVideoDecoder ?? "nil"))
+            if case .playing = engine.state, engine.playbackBackend == beforeBackend {
+                print("VERDICT: correction refused, session untouched and still playing")
+                engine.stop(); return 0
+            }
+            print("VERDICT: correction refused but the session did not survive it"); engine.stop(); return 5
         }
         try? await Task.sleep(nanoseconds: 600_000_000)
+        if reloadDecodePath != nil {
+            print(String(format: "  RELOAD done: playhead %.2fs -> %.2fs, backend %@ -> %@, decoder=%@",
+                         beforePos, engine.currentTime,
+                         "\(beforeBackend)", "\(engine.playbackBackend)",
+                         engine.activeVideoDecoder ?? "nil"))
+        }
         if case .playing = engine.state {
             print("VERDICT: reload OK, still playing")
         } else {

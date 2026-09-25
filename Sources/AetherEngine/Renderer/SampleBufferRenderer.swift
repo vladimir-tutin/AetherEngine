@@ -8,28 +8,20 @@ import CoreVideo
 /// Includes a small reorder buffer (4 frames) to handle B-frame decode
 /// order from VTDecompressionSession. Frames are sorted by PTS before
 /// being enqueued to the display layer in strict presentation order.
-/// Which display-layer flush operation a flush request maps to. Split out of SampleBufferRenderer.flush()
-/// as a pure value so the seek-holds-frame contract (issue #90) is testable without a live
-/// AVSampleBufferDisplayLayer.
-enum DisplayFlushOp: Equatable {
-    /// tvOS 18+/iOS 18+/macOS 15+: AVSampleBufferVideoRenderer.flush(removingDisplayedImage:).
-    case rendererFlush(removingDisplayedImage: Bool)
-    /// Legacy AVSampleBufferDisplayLayer.flushAndRemoveImage(), clears the visible frame.
-    case removeImage
-    /// Legacy AVSampleBufferDisplayLayer.flush(), keeps the last frame on screen (hold through seek).
-    case holdImage
-
-    static func resolve(removingDisplayedImage: Bool, modernRenderer: Bool) -> DisplayFlushOp {
-        if modernRenderer {
-            return .rendererFlush(removingDisplayedImage: removingDisplayedImage)
-        }
-        return removingDisplayedImage ? .removeImage : .holdImage
-    }
-}
-
 final class SampleBufferRenderer: @unchecked Sendable {
 
-    private(set) var displayLayer: AVSampleBufferDisplayLayer
+    let displayLayer: AVSampleBufferDisplayLayer
+
+    /// The layer's queue surface, taken once on the main actor at construction (#351). The 27 SDKs
+    /// isolate `AVSampleBufferDisplayLayer` to the main actor, `AVSampleBufferVideoRenderer` is not, so
+    /// the decode thread enqueues, flushes and reads status through this and never touches the layer.
+    /// A stored reference cannot drift from the layer: neither is ever replaced, HDR output flips
+    /// `preferredDynamicRange` on the same layer.
+    ///
+    /// tvOS 26+ fails the deprecated layer enqueue/flush/isReadyForMoreMediaData under an
+    /// AVSampleBufferRenderSynchronizer with FigVideoQueueRemote -12080 after the first enqueue, so
+    /// this renderer is the only queue target, and the one the synchronizer is given.
+    let videoRenderer: AVSampleBufferVideoRenderer
 
     /// SW-PiP Phase C: composites active subtitle cues into frames while PiP is active (the system
     /// window renders only this layer, the host overlay cannot reach it).
@@ -88,8 +80,24 @@ final class SampleBufferRenderer: @unchecked Sendable {
     private var loggedLayerFailed = false
     private var loggedNotReady = false
     /// Internal (not private) for #298 tests: the gate's job is that untimed frames never get here.
+    /// Guarded by `reorderLock` since #407: the 1 Hz diagnostic reads it off the main actor while the
+    /// decode thread writes it, and the two counts it is compared against are read under the same lock.
     private(set) var enqueueCount = 0
     private var hdr10PlusAttachedCount = 0
+
+    /// #407: frames that reached `flushFrame` and still never got to the layer, because the sample
+    /// buffer could not be built. Separate from `_untimedFramesDropped` (refused before the reorder
+    /// buffer) and from the post-seek skip, which is a decision rather than a loss. Guarded by
+    /// `reorderLock`.
+    private var _sampleBuildFailures = 0
+
+    /// #407: spacing of the timestamps actually handed to the layer, over the interval since the last
+    /// snapshot. `framesEnqueued` counts DECODER OUTPUT, so a per-second frame count reads healthy for
+    /// an even 24 fps timeline and for one carrying a doubled or a duplicate interval alike; only the
+    /// spacing separates them. Guarded by `reorderLock`, reset by `takeCadence()`.
+    private var _lastHandedPtsSeconds: Double?
+    private var _minHandedDeltaSeconds = Double.infinity
+    private var _maxHandedDeltaSeconds = -Double.infinity
 
     /// #298: frames refused at the enqueue gate for carrying an unschedulable PTS. Guarded by `reorderLock`.
     private var _untimedFramesDropped = 0
@@ -138,8 +146,17 @@ final class SampleBufferRenderer: @unchecked Sendable {
         if let settled { observer?(settled) }
     }
 
-    init() {
-        displayLayer = Self.makeDisplayLayer(isHDR: false)
+    /// #489: the gravity is a construction parameter, not something a caller assigns afterwards.
+    /// The engine holds the host app's picture mode across loads, and a layer that starts on the
+    /// default and is corrected a moment later shows one frame of the wrong fill.
+    ///
+    /// Main-actor isolated because the layer is (#351); the only production caller,
+    /// `SoftwarePlaybackHost`, already is.
+    @MainActor
+    init(videoGravity: AVLayerVideoGravity = .resizeAspect) {
+        let layer = Self.makeDisplayLayer(isHDR: false, gravity: videoGravity)
+        displayLayer = layer
+        videoRenderer = layer.sampleBufferRenderer
     }
 
     /// #303: what the display did with the frames, as the renderer itself counts them. Our own
@@ -152,24 +169,51 @@ final class SampleBufferRenderer: @unchecked Sendable {
         let accumulatedDelay: TimeInterval
     }
 
-    /// nil where the metrics cannot be asked for: an OS predating the API, or the pre-tvOS-18 path
-    /// where the queue target is the display layer itself rather than an `AVSampleBufferVideoRenderer`.
+    /// #407: what the renderer itself put on the layer, as opposed to what the decoder produced.
+    /// `RenderMetrics` describes the layer's verdict on frames it received; this describes the frames
+    /// it received, which is the half no counter covered while a report of visible judder read clean
+    /// on every one of them.
+    struct Cadence: Sendable {
+        /// Cumulative frames handed to the queue target.
+        let handedOver: Int
+        /// Cumulative frames lost between the decoder callback and the layer: unschedulable
+        /// timestamps plus failed sample-buffer builds. A gap between the decoder's count and
+        /// `handedOver` that this does not account for is a post-seek skip.
+        let lostBeforeLayer: Int
+        /// Shortest and longest gap between consecutive handed-over timestamps over the interval,
+        /// nil when fewer than two frames were handed over. Source axis, seconds.
+        let minDeltaSeconds: Double?
+        let maxDeltaSeconds: Double?
+    }
+
+    /// Reads the cadence counters and resets the per-interval spacing extremes. Called at 1 Hz by the
+    /// diagnostic line; the cumulative counts survive, the min/max describe the interval only.
+    func takeCadence() -> Cadence {
+        reorderLock.lock()
+        defer { reorderLock.unlock() }
+        let minD = _minHandedDeltaSeconds.isFinite ? _minHandedDeltaSeconds : nil
+        let maxD = _maxHandedDeltaSeconds.isFinite ? _maxHandedDeltaSeconds : nil
+        _minHandedDeltaSeconds = .infinity
+        _maxHandedDeltaSeconds = -.infinity
+        return Cadence(handedOver: enqueueCount,
+                       lostBeforeLayer: _untimedFramesDropped + _sampleBuildFailures,
+                       minDeltaSeconds: minD, maxDeltaSeconds: maxD)
+    }
+
+    /// nil only on visionOS 1.0: the metrics accessor arrived in tvOS/iOS 17.4, macOS 14.4 and visionOS
+    /// 1.1, and visionOS is the one platform whose package floor still sits below it.
     ///
-    /// #313: main-actor isolated, and reading through the completion-handler accessor rather than
-    /// the async one, because the two halves of that constraint come from different toolchains and
-    /// no single `await` on `videoPerformanceMetrics` satisfies both. An SDK that isolates the layer
-    /// to the main actor refuses to hand `sampleBufferRenderer` to any other domain; a toolchain
-    /// that imports the async accessor as `nonisolated` refuses to take that non-Sendable renderer
-    /// from the main actor. The completion form suspends without moving the renderer anywhere, so it
-    /// holds on both. Every caller is main-actor isolated already, so the annotation costs no hop.
+    /// #313: reads through the completion-handler accessor rather than the async one. A toolchain that
+    /// imports the async accessor as `nonisolated` refuses to take the non-Sendable renderer across an
+    /// actor boundary, and the completion form suspends without moving the renderer anywhere. Main-actor
+    /// isolated because every caller is, so the annotation costs no hop.
     ///
-    /// #344: the version list gates the metrics accessor (tvOS/iOS 17.4, macOS 14.4, visionOS 1.1),
-    /// not the renderer, which exists from visionOS 1.0. tvOS/iOS 18 and macOS 15 stay as they are:
-    /// below them `queueTarget` is the display layer, so there is no renderer to ask.
+    /// #344: visionOS has to be named. Falling through to `*` resolves it to the declared floor (1.0),
+    /// which is a compile error rather than a runtime nil.
     @MainActor
     func loadRenderMetrics() async -> RenderMetrics? {
-        guard #available(tvOS 18.0, iOS 18.0, macOS 15.0, visionOS 1.1, *) else { return nil }
-        let renderer = displayLayer.sampleBufferRenderer
+        guard #available(visionOS 1.1, *) else { return nil }
+        let renderer = videoRenderer
         return await withCheckedContinuation { (cont: CheckedContinuation<RenderMetrics?, Never>) in
             renderer.loadVideoPerformanceMetrics { m in
                 guard let m else { return cont.resume(returning: nil) }
@@ -183,33 +227,22 @@ final class SampleBufferRenderer: @unchecked Sendable {
 
     // MARK: - Queue rendering target
 
-    /// tvOS 18+ / iOS 18+ / macOS 15+: use AVSampleBufferVideoRenderer via displayLayer.sampleBufferRenderer. Calling the deprecated layer enqueue/flush/isReadyForMoreMediaData on tvOS 26+ with AVSampleBufferRenderSynchronizer fails with FigVideoQueueRemote -12080 after the first enqueue. Older OSes use the layer directly via AVQueuedSampleBufferRendering. visionOS is not named because it has the renderer from 1.0, which is the package floor, so the `*` arm is the renderer arm there and naming it would be a check that is always true.
-    var queueTarget: any AVQueuedSampleBufferRendering {
-        if #available(tvOS 18.0, iOS 18.0, macOS 15.0, *) {
-            return displayLayer.sampleBufferRenderer
-        }
-        return displayLayer
-    }
+    /// `videoRenderer` as the protocol the enqueue path has always called it through, so the per-frame
+    /// enqueue and back-pressure calls keep the dispatch they had.
+    var queueTarget: any AVQueuedSampleBufferRendering { videoRenderer }
 
-    /// Demux-loop back-pressure gate. Post-tvOS 18 split: reading the layer's own isReadyForMoreMediaData stays optimistically true even when the sampleBufferRenderer queue is full, causing FigVideoQueueRemote -12080 on over-enqueue.
+    /// Demux-loop back-pressure gate. Read from the renderer, never the layer: the layer's own
+    /// isReadyForMoreMediaData stays optimistically true even when the renderer queue is full, causing
+    /// FigVideoQueueRemote -12080 on over-enqueue.
     var isReadyForMoreMediaData: Bool {
         queueTarget.isReadyForMoreMediaData
     }
 
-    private var queueStatus: AVQueuedSampleBufferRenderingStatus {
-        if #available(tvOS 18.0, iOS 18.0, macOS 15.0, *) {
-            return displayLayer.sampleBufferRenderer.status
-        }
-        return displayLayer.status
-    }
+    private var queueStatus: AVQueuedSampleBufferRenderingStatus { videoRenderer.status }
 
-    private var queueError: Error? {
-        if #available(tvOS 18.0, iOS 18.0, macOS 15.0, *) {
-            return displayLayer.sampleBufferRenderer.error
-        }
-        return displayLayer.error
-    }
+    private var queueError: Error? { videoRenderer.error }
 
+    @MainActor
     private static func makeDisplayLayer(isHDR: Bool, gravity: AVLayerVideoGravity = .resizeAspect) -> AVSampleBufferDisplayLayer {
         let layer = AVSampleBufferDisplayLayer()
         layer.videoGravity = gravity
@@ -222,9 +255,7 @@ final class SampleBufferRenderer: @unchecked Sendable {
             layer.preferredDynamicRange = isHDR ? .high : .standard
         } else {
             #if os(iOS) || os(macOS)
-            if #available(iOS 17.0, macOS 14.0, *) {
-                layer.wantsExtendedDynamicRangeContent = isHDR
-            }
+            layer.wantsExtendedDynamicRangeContent = isHDR
             #endif
         }
         return layer
@@ -236,9 +267,7 @@ final class SampleBufferRenderer: @unchecked Sendable {
             displayLayer.preferredDynamicRange = isHDR ? .high : .standard
         } else {
             #if os(iOS) || os(macOS)
-            if #available(iOS 17.0, macOS 14.0, *) {
-                displayLayer.wantsExtendedDynamicRangeContent = isHDR
-            }
+            displayLayer.wantsExtendedDynamicRangeContent = isHDR
             #endif
         }
     }
@@ -298,8 +327,11 @@ final class SampleBufferRenderer: @unchecked Sendable {
 
         while reorderBuffer.count > reorderDepth {
             let (pb, t, hdr) = reorderBuffer.removeFirst()
+            // #407: the successor is already held, so its timestamp is the frame's exact duration at
+            // no extra latency. Read before the unlock, since enqueue() runs on the decode thread.
+            let next = reorderBuffer.first?.1
             reorderLock.unlock()
-            flushFrame(pixelBuffer: pb, pts: t, hdr10PlusData: hdr)
+            flushFrame(pixelBuffer: pb, pts: t, hdr10PlusData: hdr, nextPTS: next)
             reorderLock.lock()
         }
 
@@ -312,6 +344,9 @@ final class SampleBufferRenderer: @unchecked Sendable {
     func flush(removingDisplayedImage: Bool = true) {
         reorderLock.lock()
         reorderBuffer.removeAll()
+        // #407: the next frame handed over will not follow the last one, so the gap between them is
+        // not a cadence measurement. Left standing, every seek would report one enormous interval.
+        _lastHandedPtsSeconds = nil
         // #303: nothing is held any more, so the frontier is not a frontier. Left standing, a
         // backward seek would keep reporting the pre-seek timestamp and read as a cushion of
         // however far the seek travelled.
@@ -323,18 +358,7 @@ final class SampleBufferRenderer: @unchecked Sendable {
         cachedFormatKey = nil
         reorderLock.unlock()
 
-        let modern: Bool
-        if #available(tvOS 18.0, iOS 18.0, macOS 15.0, *) { modern = true } else { modern = false }
-        switch DisplayFlushOp.resolve(removingDisplayedImage: removingDisplayedImage, modernRenderer: modern) {
-        case .rendererFlush(let remove):
-            if #available(tvOS 18.0, iOS 18.0, macOS 15.0, *) {
-                displayLayer.sampleBufferRenderer.flush(removingDisplayedImage: remove) { }
-            }
-        case .removeImage:
-            displayLayer.flushAndRemoveImage()
-        case .holdImage:
-            displayLayer.flush()
-        }
+        videoRenderer.flush(removingDisplayedImage: removingDisplayedImage) { }
     }
 
     /// Send all buffered frames to the display layer (call at EOF).
@@ -344,16 +368,28 @@ final class SampleBufferRenderer: @unchecked Sendable {
         reorderBuffer.removeAll()
         reorderLock.unlock()
 
-        for (pb, t, hdr) in remaining {
-            flushFrame(pixelBuffer: pb, pts: t, hdr10PlusData: hdr)
+        for (i, (pb, t, hdr)) in remaining.enumerated() {
+            // The final frame has no successor, so it is handed over untimed in length: at end of
+            // media that is the frame that stays on screen, and a length is exactly what it must not
+            // have.
+            let next = i + 1 < remaining.count ? remaining[i + 1].1 : nil
+            flushFrame(pixelBuffer: pb, pts: t, hdr10PlusData: hdr, nextPTS: next)
         }
     }
 
     // MARK: - Internal
 
-    private func flushFrame(pixelBuffer: CVPixelBuffer, pts: CMTime, hdr10PlusData: Data?) {
+    private func flushFrame(pixelBuffer: CVPixelBuffer, pts: CMTime, hdr10PlusData: Data?,
+                            nextPTS: CMTime? = nil) {
         let outputBuffer = subtitleCompositor.composite(pixelBuffer, ptsSeconds: pts.seconds)
-        guard let sampleBuffer = createSampleBuffer(from: outputBuffer, pts: pts) else {
+        guard let sampleBuffer = createSampleBuffer(
+            from: outputBuffer, pts: pts,
+            duration: Self.frameDuration(from: pts, to: nextPTS)) else {
+            // #407: a frame the decoder produced and the layer never saw. Counted, because the
+            // per-second frame count is taken on the decoder's side of this line.
+            reorderLock.lock()
+            _sampleBuildFailures += 1
+            reorderLock.unlock()
             return
         }
         // HDR10+ attachment overrides any payload baked into the bitstream (VT may strip per-frame SEI on decode).
@@ -393,10 +429,22 @@ final class SampleBufferRenderer: @unchecked Sendable {
         reorderLock.unlock()
         observer?(SoftwareVideoFrameTime(presentation: pts, generation: generation))
 
+        reorderLock.lock()
         enqueueCount += 1
+        // #407: the spacing of what the layer was given, which is the thing a frame COUNT cannot say.
+        if let previous = _lastHandedPtsSeconds {
+            let delta = CMTimeGetSeconds(pts) - previous
+            if delta.isFinite {
+                _minHandedDeltaSeconds = min(_minHandedDeltaSeconds, delta)
+                _maxHandedDeltaSeconds = max(_maxHandedDeltaSeconds, delta)
+            }
+        }
+        _lastHandedPtsSeconds = CMTimeGetSeconds(pts)
+        let handed = enqueueCount
+        reorderLock.unlock()
         // Sparse milestones so a stall is distinguishable from "logging stopped at #30"; bounded to 4 lines/hour at 60 fps.
-        if enqueueCount == 1 || enqueueCount == 30 || enqueueCount == 100 || enqueueCount == 1000 || enqueueCount == 5000 {
-            EngineLog.emit("[Renderer] enqueue #\(enqueueCount): status=\(statusName) ready=\(queueTarget.isReadyForMoreMediaData) error=\(queueError?.localizedDescription ?? "nil")", category: .swPlayback)
+        if handed == 1 || handed == 30 || handed == 100 || handed == 1000 || handed == 5000 {
+            EngineLog.emit("[Renderer] enqueue #\(handed): status=\(statusName) ready=\(queueTarget.isReadyForMoreMediaData) error=\(queueError?.localizedDescription ?? "nil")", category: .swPlayback)
         }
     }
 
@@ -421,8 +469,21 @@ final class SampleBufferRenderer: @unchecked Sendable {
             desc, usePixelAspectRatio: true, useCleanAperture: true)
     }
 
+    /// #407: the length a frame is presented for, from the successor the reorder buffer is already
+    /// holding. `.invalid` for the last frame of a stream (nothing follows it) and for a successor
+    /// that cannot be a frame length: a non-positive gap is a duplicate or a reordering fault, and a
+    /// gap past a second is a stream discontinuity, neither of which is a duration to present for.
+    static func frameDuration(from pts: CMTime, to nextPTS: CMTime?) -> CMTime {
+        guard let nextPTS, pts.isNumeric, nextPTS.isNumeric else { return .invalid }
+        let delta = CMTimeSubtract(nextPTS, pts)
+        let seconds = CMTimeGetSeconds(delta)
+        guard seconds > 0, seconds <= 1.0 else { return .invalid }
+        return delta
+    }
+
     /// Internal (not private) for #177 regression tests: the PAR-keyed cache behavior is the fix.
-    func createSampleBuffer(from pixelBuffer: CVPixelBuffer, pts: CMTime) -> CMSampleBuffer? {
+    func createSampleBuffer(from pixelBuffer: CVPixelBuffer, pts: CMTime,
+                            duration: CMTime = .invalid) -> CMSampleBuffer? {
         // Cache hit avoids CMVideoFormatDescriptionCreateForImageBuffer allocation + CF refcount churn on every frame.
         let par = CVBufferCopyAttachment(pixelBuffer, kCVImageBufferPixelAspectRatioKey, nil) as? NSDictionary
         let key = FormatDescriptionKey(
@@ -468,7 +529,7 @@ final class SampleBufferRenderer: @unchecked Sendable {
         }
 
         var timing = CMSampleTimingInfo(
-            duration: .invalid,
+            duration: duration,
             presentationTimeStamp: pts,
             decodeTimeStamp: .invalid
         )

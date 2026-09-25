@@ -16,6 +16,7 @@ struct Issue311SoftwareFrameTimesTests {
     // MARK: - What gets reported
 
     @Test("every enqueued frame is reported, in ascending presentation order")
+    @MainActor
     func reportsEnqueuedFramesInOrder() {
         let renderer = SampleBufferRenderer()
         let seen = Collector()
@@ -36,6 +37,7 @@ struct Issue311SoftwareFrameTimesTests {
     }
 
     @Test("a frame refused at the unschedulable-PTS gate is never reported")
+    @MainActor
     func untimedFrameIsNotReported() {
         let renderer = SampleBufferRenderer()
         let seen = Collector()
@@ -49,6 +51,7 @@ struct Issue311SoftwareFrameTimesTests {
     }
 
     @Test("frames skipped after a seek are never reported")
+    @MainActor
     func skippedFramesAreNotReported() {
         let renderer = SampleBufferRenderer()
         let seen = Collector()
@@ -77,6 +80,7 @@ struct Issue311SoftwareFrameTimesTests {
     /// sequence, so a renderer in a parallel test legitimately consumes values in between. Ordering is
     /// the contract, consecutive values never were.
     @Test("a flush moves the generation, so pre-seek frames are distinguishable")
+    @MainActor
     func flushMovesTheGeneration() {
         let renderer = SampleBufferRenderer()
         let seen = Collector()
@@ -103,6 +107,7 @@ struct Issue311SoftwareFrameTimesTests {
     // MARK: - Installation
 
     @Test("removing the observer stops the reports")
+    @MainActor
     func observerCanBeRemoved() {
         let renderer = SampleBufferRenderer()
         let seen = Collector()

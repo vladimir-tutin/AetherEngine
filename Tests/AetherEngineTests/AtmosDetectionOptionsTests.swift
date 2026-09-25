@@ -75,6 +75,14 @@ struct AtmosDetectionOptionsTests {
         #expect(AetherEngine.atmosForeignPacketFuse(maxPackets: Int.max) == Int.max)
     }
 
+    @Test("the input byte budget covers interleaved UHD video and saturates instead of trapping")
+    func inputByteBudgetIsBoundedAndSaturates() {
+        #expect(AetherEngine.atmosInputByteBudget(maxBytes: 8 * 1024 * 1024) == 128 * 1024 * 1024)
+        #expect(AetherEngine.atmosInputByteBudget(maxBytes: 0) == 64 * 1024 * 1024)
+        #expect(AetherEngine.atmosInputByteBudget(maxBytes: -1) == 64 * 1024 * 1024)
+        #expect(AetherEngine.atmosInputByteBudget(maxBytes: .max) == .max)
+    }
+
     @Test("no default audio stream (-1) surfaces unchanged when no override is given")
     func noAudioStreamPropagatesAsNegativeOne() {
         let options = AtmosDetectionOptions()

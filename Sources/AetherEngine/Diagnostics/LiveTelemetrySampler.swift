@@ -58,6 +58,12 @@ struct NativeAVFReadings: Sendable {
     /// the tail the playhead jumps ahead of loaded media, so the clamped `forwardBufferSeconds` (>= 0)
     /// hides that the final segment has not arrived; the decision needs the true loaded end vs duration.
     var loadedRangeEndSeconds: Double? = nil
+    /// AE#520 round 2: how long this consumer can keep playing without being handed anything else, which
+    /// is the range the playhead is INSIDE and not the last one loaded. `forwardBufferSeconds` above
+    /// reads the last range's end, so on an item with a hole in front of the playhead it names content
+    /// the consumer cannot reach without stalling first. A decision that spends this depth needs the
+    /// half it can actually walk; nil when no loaded range contains the playhead at all.
+    var contiguousForwardBufferSeconds: Double? = nil
     /// Sum over all access-log events, for the [LagDiag] tick-over-tick drop delta.
     var droppedFramesLifetimeSum: Int = 0
     var currentTimeSeconds: Double = .nan
@@ -108,8 +114,17 @@ final class LiveTelemetrySampler {
     private var lastDemuxerBytes: Int64 = 0
     private var lastBridgeBytes: Int64 = 0
     private var lastFramesEnqueued: Int = 0
-    private var sessionStartTime: Date?
     private var sessionStartBytes: Int64 = 0
+
+    /// AE#514: wall-clock seconds this session spent in a phase that consumes media, accumulated one
+    /// tick at a time. The divisor of the lifetime average, in place of the wall clock since start.
+    /// Readable so a test can pin that the tick charges it, not only that the fold over it is right.
+    private(set) var activeSeconds: Double = 0
+
+    /// Timestamp of the previous tick, anchoring the delta charged above. nil until the first tick,
+    /// which therefore charges nothing: that is also the tick which seeds `sessionStartBytes`, so the
+    /// numerator and the divisor start counting at the same instant.
+    private var lastTickTime: Date?
 
     /// [LagDiag] tick-over-tick state (#93 post-recovery lag diagnosis).
     private var lagLastClock: Double?
@@ -141,7 +156,8 @@ final class LiveTelemetrySampler {
         lastDemuxerBytes = engine?.demuxerBytesFetched ?? 0
         lastBridgeBytes = engine?.audioBridgeOutputBytesLifetime ?? 0
         lastFramesEnqueued = 0
-        sessionStartTime = Date()
+        activeSeconds = 0
+        lastTickTime = nil
         sessionStartBytes = 0
         lagLastClock = nil
         lagLastDroppedSum = 0
@@ -180,8 +196,50 @@ final class LiveTelemetrySampler {
         return Double(windowBytes) * 8.0 / Double(activeSeconds) / 1_000_000.0
     }
 
+    /// AE#514: whether a tick's second belongs in the lifetime average's divisor.
+    ///
+    /// That average used to divide by wall-clock time since the session started, which made a pause
+    /// permanently wrong in one direction. `demuxerBytesFetched` stops advancing once the forward
+    /// buffer is full, the wall clock does not, so a 2.8 Mbps file left paused for three minutes
+    /// reported 0.4 Mbps and afterwards climbed back only asymptotically: the paused seconds never
+    /// left the divisor again. Same shape at the end of a source, where the sampler keeps ticking
+    /// until the host tears the session down.
+    ///
+    /// The line is drawn at "is the session consuming media", not at "is the picture moving". A seek
+    /// and a rebuffer are where the bytes arrive hardest, and a stalled reader is a real part of what
+    /// this session averaged, so charging their seconds is what keeps the quotient equal to the rate
+    /// the session pulled at. Only a pause and the three phases with no live session behind them
+    /// stand outside it.
+    static func chargesActiveTime(_ phase: PlaybackPhase) -> Bool {
+        switch phase {
+        case .paused, .idle, .ended, .error:
+            return false
+        case .loading, .playing, .seeking, .rebuffering, .stalled:
+            return true
+        }
+    }
+
+    /// Lifetime mean of the bytes the session fetched over the seconds it spent consuming them (AE#514).
+    ///
+    /// nil rather than zero until both halves are measurable, mirroring `observedTransferMbps`: a host
+    /// cannot tell a confident 0.00 Mbps from a session that has not fetched anything yet. The old
+    /// wall-clock form published exactly that on its first tick, where the lifetime delta is zero by
+    /// construction because the same tick seeds the baseline it then subtracts.
+    static func averageBitrateMbps(lifetimeBytes: Int64, activeSeconds: Double) -> Double? {
+        guard activeSeconds > 0, lifetimeBytes > 0 else { return nil }
+        return Double(lifetimeBytes) * 8.0 / activeSeconds / 1_000_000.0
+    }
+
     private func tick() async {
         guard let engine = engine else { return }
+
+        // AE#514: this tick's wall-clock second goes into the lifetime average's divisor only if the
+        // session was consuming media in it. See `chargesActiveTime` for where the line runs.
+        let tickTime = Date()
+        if let previous = lastTickTime, Self.chargesActiveTime(engine.playbackPhase) {
+            activeSeconds += tickTime.timeIntervalSince(previous)
+        }
+        lastTickTime = tickTime
 
         // Instant + average bitrate from demuxer byte counters (both native and SW paths)
         let demuxerBytes = engine.demuxerBytesFetched
@@ -204,14 +262,9 @@ final class LiveTelemetrySampler {
             activeSeconds: byteWindow.activeCount,
             samples: byteWindow.count)
 
-        let averageBitrateMbps: Double?
-        if let start = sessionStartTime {
-            let elapsed = max(0.5, Date().timeIntervalSince(start))
-            let lifetimeBytes = max(0, demuxerBytes - sessionStartBytes)
-            averageBitrateMbps = Double(lifetimeBytes) * 8.0 / elapsed / 1_000_000.0
-        } else {
-            averageBitrateMbps = nil
-        }
+        let averageBitrateMbps = Self.averageBitrateMbps(
+            lifetimeBytes: max(0, demuxerBytes - sessionStartBytes),
+            activeSeconds: activeSeconds)
 
         // Live audio-bridge output bitrate from the bridge's cumulative encoded-byte counter. 0 on the
         // stream-copy / AVPlayer-native / video-only paths (no bridge), which surfaces as nil.
@@ -247,23 +300,41 @@ final class LiveTelemetrySampler {
             accumulatedFrameDelaySeconds = nil
             avSyncGapMs = engine.lastAVGapMs  // HLSSegmentProducer audio-gate-open vs video-gate-open (native path only)
             if let player = engine.currentAVPlayer, let item = player.currentItem {
-                let readings = await readNativeOffMain(player: player, item: item)
+                var readings = await readNativeOffMain(player: player, item: item)
                 // stop() may have cancelled this tick, or a reload seam may have swapped the
                 // player/item, while the read was in flight; publishing now would leak a stale
                 // snapshot and yield-gate tick into the current session.
                 guard !Task.isCancelled,
                       engine.currentAVPlayer === player,
                       player.currentItem === item else { return }
+                engine.nativeHost?.recordItemCounters(
+                    ItemLogCounters(transferredBytes: readings.networkTransferredBytes,
+                                    droppedFrames: readings.droppedFrameCount), item: item)
+                // AE#443: the read above covers this item; the host carries what the items before it
+                // transferred. Read after the guard, so the two halves describe the same swap state.
+                readings.networkTransferredBytes = Self.foldRetired(
+                    readings.networkTransferredBytes, retired: engine.nativeHost?.retiredItemTransferredBytes ?? 0)
+                readings.droppedFrameCount = Self.foldRetired(
+                    readings.droppedFrameCount, retired: engine.nativeHost?.retiredItemDroppedFrames ?? 0)
+                readings.droppedFramesLifetimeSum = readings.droppedFrameCount ?? 0
                 nativeReadings = readings
                 droppedFrameCount = readings.droppedFrameCount
                 networkThroughputMbps = readings.networkThroughputMbps
                 networkTransferredBytes = readings.networkTransferredBytes
                 forwardBufferSeconds = readings.forwardBufferSeconds
+                // AE#520 round 2: the outage close spends the depth this consumer can still walk, and
+                // it is decided on a playlist-build thread that must not hop the main actor to ask.
+                engine.consumerContiguousBufferMirror.set(readings.contiguousForwardBufferSeconds)
             } else {
-                droppedFrameCount = nil
+                // AE#443: an item swap has a gap where the host holds no current item, and reporting
+                // nothing through it reads as "the counter is gone" rather than "nothing new since".
+                droppedFrameCount = Self.foldRetired(nil, retired: engine.nativeHost?.retiredItemDroppedFrames ?? 0)
                 networkThroughputMbps = nil
-                networkTransferredBytes = nil
+                networkTransferredBytes = Self.foldRetired(nil, retired: engine.nativeHost?.retiredItemTransferredBytes ?? 0)
                 forwardBufferSeconds = nil
+                // Between items there is no consumer to read a depth off, and reporting the last one
+                // would hand the close a figure about an item that is gone.
+                engine.consumerContiguousBufferMirror.set(nil)
             }
 
         case .software:
@@ -320,6 +391,7 @@ final class LiveTelemetrySampler {
             evaluateEndOfMediaPark(engine: engine, readings: readings)
         }
 
+        let softwareCache = engine.softwarePacketCacheSnapshot
         let snapshot = LiveTelemetry(
             instantBitrateMbps: instantBitrateMbps,
             averageBitrateMbps: averageBitrateMbps,
@@ -331,6 +403,9 @@ final class LiveTelemetrySampler {
             readerWindowAheadBytes: readerWindowAheadBytes,
             accumulatedFrameDelaySeconds: accumulatedFrameDelaySeconds,
             cachedBytes: engine.cachedBytes,
+            softwareCacheSeekHits: softwareCache?.cacheSeekHits,
+            softwareCacheSeekMisses: softwareCache?.cacheSeekMisses,
+            softwareCacheSourceEpoch: softwareCache?.sourceEpoch,
             networkThroughputMbps: networkThroughputMbps,
             networkTransferredBytes: networkTransferredBytes,
             avSyncGapMs: avSyncGapMs,
@@ -443,22 +518,51 @@ final class LiveTelemetrySampler {
         }
     }
 
+    /// AE#443: fold a per-entry access-log counter into the session total a reader takes it for.
+    ///
+    /// `AVPlayerItemAccessLogEvent` counts within its own entry, and AVFoundation opens a new one every
+    /// time the playback session changes under it. Measured on the live loopback harness across a rewind
+    /// and a return to the edge, one origin connection for the whole run and no producer restart at all:
+    /// `rx` went 3.4 MB -> 2.2 MB and `drop` 44 -> 0 while the session played on. A number that falls in
+    /// the middle of a healthy session invites exactly one reading, that something under it was replaced,
+    /// and the reporter of #443 spent two rounds on that reading before the logs refused it.
+    ///
+    /// Entries that report the field as unavailable (negative) are skipped rather than clamped, and the
+    /// result is nil when none of them carried it, so "not measurable" stays distinguishable from zero.
+    nonisolated static func sessionTotal<T: BinaryInteger>(perEntry values: [T]) -> T? {
+        let known = values.filter { $0 >= 0 }
+        return known.isEmpty ? nil : known.reduce(0, +)
+    }
+
+    /// AE#443: adds what the session's retired items carried to what the current one reports.
+    ///
+    /// nil + nothing retired stays nil, because "this path cannot report it" is not zero. nil with a
+    /// retired total is the swap gap, and the honest reading there is the total so far, not silence.
+    nonisolated static func foldRetired<T: BinaryInteger>(_ current: T?, retired: T) -> T? {
+        guard let current else { return retired > 0 ? retired : nil }
+        return current + retired
+    }
+
     /// The real batch, run on `readQueue`: one accessLog() shared by the snapshot fields and the
     /// LagDiag lifetime drop sum, one currentTime() shared by the forward-buffer math and the
     /// LagDiag clock (previously two of each per tick, all on the main actor).
     private nonisolated static func batchReadNativeAVF(player: AVPlayer, item: AVPlayerItem) -> NativeAVFReadings {
         var readings = NativeAVFReadings()
         let events = item.accessLog()?.events
+        // The rate is a `.last` read on purpose: it describes the link right now.
         if let event = events?.last {
-            readings.droppedFrameCount = event.numberOfDroppedVideoFrames >= 0
-                ? event.numberOfDroppedVideoFrames : nil
             let observed = event.observedBitrate
             readings.networkThroughputMbps = observed.isFinite && observed > 0
                 ? observed / 1_000_000.0 : nil
-            readings.networkTransferredBytes = event.numberOfBytesTransferred >= 0
-                ? Int64(event.numberOfBytesTransferred) : nil
         }
-        readings.droppedFramesLifetimeSum = events?.reduce(0) { $0 + max(0, $1.numberOfDroppedVideoFrames) } ?? 0
+        // AE#443: the counters are not. They are totals PER ENTRY, and AVFoundation opens a new entry
+        // whenever the playback session changes under it, so reading `.last` publishes a number that
+        // falls BACK mid-session, with nothing in the line to say it did.
+        if let events {
+            readings.networkTransferredBytes = Self.sessionTotal(perEntry: events.map(\.numberOfBytesTransferred))
+            readings.droppedFrameCount = Self.sessionTotal(perEntry: events.map(\.numberOfDroppedVideoFrames))
+        }
+        readings.droppedFramesLifetimeSum = readings.droppedFrameCount ?? 0
 
         let now = player.currentTime().seconds
         readings.currentTimeSeconds = now
@@ -469,6 +573,16 @@ final class LiveTelemetrySampler {
                 if now.isFinite {
                     readings.forwardBufferSeconds = max(0, end - now)
                 }
+            }
+        }
+        if now.isFinite {
+            for value in item.loadedTimeRanges {
+                let range = value.timeRangeValue
+                let start = range.start.seconds
+                let end = CMTimeGetSeconds(CMTimeAdd(range.start, range.duration))
+                guard start.isFinite, end.isFinite, start <= now, end > now else { continue }
+                readings.contiguousForwardBufferSeconds = end - now
+                break
             }
         }
 

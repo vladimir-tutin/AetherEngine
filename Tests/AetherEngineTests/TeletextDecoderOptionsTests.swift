@@ -1,6 +1,6 @@
 import Testing
 @testable import AetherEngine
-import Libavcodec
+import AetherLibavcodec
 
 struct TeletextDecoderOptionsTests {
     @Test("teletext gets txt_format=ass and auto page when no override")

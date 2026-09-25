@@ -1,4 +1,7 @@
 import Testing
+import Foundation
+import AetherLibavcodec
+import AetherLibavutil
 @testable import AetherEngine
 
 /// AE#187 part 2: the plain-HEVC CODECS string. The `.none` / `.profile82` branch hardcoded
@@ -112,5 +115,57 @@ struct HEVCCodecStringTests {
     @Test("Too-short buffer returns nil")
     func tooShortReturnsNil() {
         #expect(HLSVideoEngine.hevcCodecsString(fromConfigRecord: [1, 1, 0x60, 0, 0, 0]) == nil)
+    }
+
+    /// Audit HLS-3: 8-bit Main L3.1 as MPEG-TS carries it, a VPS and an SPS behind start codes with
+    /// the emulation-prevention bytes a real encoder writes into the zero runs of the PTL.
+    static let annexBMain8bit: [UInt8] = [
+        0x00, 0x00, 0x00, 0x01, 0x40, 0x01, 0x0c, 0x01, 0xff, 0xff, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00,
+        0x90, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00, 0x5d, 0x95, 0x94, 0x09,
+        0x00, 0x00, 0x00, 0x01, 0x42, 0x01, 0x01, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0x90, 0x00, 0x00,
+        0x03, 0x00, 0x00, 0x03, 0x00, 0x5d, 0xa0, 0x02, 0x80, 0x80, 0x2d, 0x16, 0x59, 0x59, 0xa4, 0x93,
+        0x2b, 0x80,
+    ]
+
+    @Test("Annex-B 8-bit Main SPS -> hvc1.1.6.L93.90, not the Main10 fallback")
+    func annexBMain8bitFromSPS() {
+        #expect(HLSVideoEngine.hevcCodecsString(fromAnnexBExtradata: Self.annexBMain8bit)
+            == "hvc1.1.6.L93.90")
+    }
+
+    @Test("Annex-B Main10 SPS keeps its own profile and level")
+    func annexBMain10FromSPS() {
+        let annexB: [UInt8] = [
+            0x00, 0x00, 0x01, 0x42, 0x01, 0x01, 0x02, 0x20, 0x00, 0x00, 0x03, 0x00, 0x90, 0x00, 0x00,
+            0x03, 0x00, 0x00, 0x03, 0x00, 0x78, 0xa0, 0x03, 0xc0, 0x80, 0x11, 0x07, 0xca,
+        ]
+        #expect(HLSVideoEngine.hevcCodecsString(fromAnnexBExtradata: annexB) == "hvc1.2.4.L120.90")
+    }
+
+    @Test("Annex-B extradata without an SPS returns nil")
+    func annexBWithoutSPS() {
+        #expect(HLSVideoEngine.hevcCodecsString(
+            fromAnnexBExtradata: [0x00, 0x00, 0x01, 0x40, 0x01, 0x0c, 0x01, 0xff]) == nil)
+    }
+
+    @Test("the plain HEVC route declares the Annex-B source's own profile in the master")
+    func plainRouteUsesAnnexBSPS() throws {
+        var codecpar: UnsafeMutablePointer<AVCodecParameters>? = try #require(avcodec_parameters_alloc())
+        defer { avcodec_parameters_free(&codecpar) }
+        let cp = codecpar!
+        cp.pointee.codec_type = AVMEDIA_TYPE_VIDEO
+        cp.pointee.codec_id = AV_CODEC_ID_HEVC
+        cp.pointee.level = 93
+        let bytes = Self.annexBMain8bit
+        let ed = try #require(av_mallocz(bytes.count + Int(AV_INPUT_BUFFER_PADDING_SIZE)))
+            .assumingMemoryBound(to: UInt8.self)
+        bytes.withUnsafeBufferPointer { ed.update(from: $0.baseAddress!, count: bytes.count) }
+        cp.pointee.extradata = ed
+        cp.pointee.extradata_size = Int32(bytes.count)
+
+        let engine = HLSVideoEngine(url: URL(fileURLWithPath: "/nonexistent/main8.ts"),
+                                    dvModeAvailable: false)
+        let route = try engine.resolveCodecRoute(codecpar: UnsafePointer(cp))
+        #expect(route.primaryCodecs == "hvc1.1.6.L93.90")
     }
 }

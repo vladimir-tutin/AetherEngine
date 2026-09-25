@@ -3,8 +3,10 @@ import AetherEngine
 
 // MARK: - serve
 
-func runServe(url: URL, dvModeAvailable: Bool, nativeSubsIndex: Int? = nil,
-              startPosition: Double? = nil) -> Never {
+func runServe(url: URL, dvModeAvailable: Bool, forceDVWithoutDisplay: Bool = false,
+              dolbyVisionHandling: DolbyVisionHandling = .automatic,
+              nativeSubsIndex: Int? = nil, startPosition: Double? = nil,
+              audioDelayMs: Int = 0) -> Never {
     EngineLog.handler = { line in
         let timestamp = ISO8601DateFormatter.string(
             from: Date(),
@@ -15,17 +17,28 @@ func runServe(url: URL, dvModeAvailable: Bool, nativeSubsIndex: Int? = nil,
     }
 
     var flagSuffix = dvModeAvailable ? "" : " [--no-dv]"
+    if forceDVWithoutDisplay { flagSuffix += " [--force-dv]" }
+    if dolbyVisionHandling == .baseLayerOnly { flagSuffix += " [--dv-base-layer]" }
     if let idx = nativeSubsIndex { flagSuffix += " [--native-subs \(idx)]" }
     if let pos = startPosition { flagSuffix += " [--start-position \(pos)]" }
+    if audioDelayMs != 0 { flagSuffix += " [--audio-delay \(audioDelayMs)]" }
     print("aetherctl serve: \(url.absoluteString)\(flagSuffix)")
     print("")
 
     let engine = HLSVideoEngine(
         url: url,
-        dvModeAvailable: dvModeAvailable
+        dvModeAvailable: dvModeAvailable,
+        forceDolbyVisionOnNonDVDisplay: forceDVWithoutDisplay,
+        dolbyVisionHandling: dolbyVisionHandling,
+        // AE#532: a session gates this on its own probe; the harness has none, so it asks the audit
+        // for the whole verdict. A source with nothing to correct never gets past the gate inside.
+        dolbyVisionRPUProfile: DolbyVisionRecordAudit.rpuCorrection(url: url)
     )
     // Resume anchor exactly like AetherEngine.loadNative's load(startPosition:) (#99 repro).
     engine.initialStartSeconds = startPosition
+    // AE#464: every muxer this session builds writes its audio timestamps with this offset. Set
+    // before start(), like the resume anchor above, because the first producer is built inside it.
+    engine.audioDelaySeconds = Double(audioDelayMs) / 1000.0
     // Enable native WebVTT subtitle renditions before start() so the master declares the SUBTITLES group (#55). Must precede start().
     if nativeSubsIndex != nil {
         engine.requestNativeSubtitleTrack()
@@ -70,7 +83,8 @@ func runServe(url: URL, dvModeAvailable: Bool, nativeSubsIndex: Int? = nil,
 
 // MARK: - validate
 
-func runValidate(url: URL, dvModeAvailable: Bool) -> Int32 {
+func runValidate(url: URL, dvModeAvailable: Bool, forceDVWithoutDisplay: Bool = false,
+                 dolbyVisionHandling: DolbyVisionHandling = .automatic) -> Int32 {
     EngineLog.handler = { line in
         let timestamp = ISO8601DateFormatter.string(
             from: Date(),
@@ -80,13 +94,18 @@ func runValidate(url: URL, dvModeAvailable: Bool) -> Int32 {
         print("[\(timestamp)] \(line)")
     }
 
-    let flagSuffix = dvModeAvailable ? "" : " [--no-dv]"
+    var flagSuffix = dvModeAvailable ? "" : " [--no-dv]"
+    if forceDVWithoutDisplay { flagSuffix += " [--force-dv]" }
+    if dolbyVisionHandling == .baseLayerOnly { flagSuffix += " [--dv-base-layer]" }
     print("aetherctl validate: \(url.absoluteString)\(flagSuffix)")
     print("")
 
     let engine = HLSVideoEngine(
         url: url,
-        dvModeAvailable: dvModeAvailable
+        dvModeAvailable: dvModeAvailable,
+        forceDolbyVisionOnNonDVDisplay: forceDVWithoutDisplay,
+        dolbyVisionHandling: dolbyVisionHandling,
+        dolbyVisionRPUProfile: DolbyVisionRecordAudit.rpuCorrection(url: url)
     )
     let playbackURL: URL
     do {

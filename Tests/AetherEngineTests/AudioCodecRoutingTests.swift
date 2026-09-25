@@ -1,5 +1,5 @@
 import Testing
-import Libavcodec
+import AetherLibavcodec
 @testable import AetherEngine
 
 @Suite("AVPlayer audio codec routing")

@@ -1,6 +1,6 @@
 import Testing
 import Foundation
-import Libavutil
+import AetherLibavutil
 @testable import AetherEngine
 
 /// The software path's container-SAR fallback exists for anamorphic sources whose ratio is not in

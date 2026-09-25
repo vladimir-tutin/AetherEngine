@@ -19,6 +19,8 @@ import AetherEngine
 @main
 struct DemoPlayerApp: App {
 
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
+
     /// Engine is created once for the app lifetime. AetherEngine is
     /// designed to be a long-lived instance: every dropped file calls
     /// `load(url:)` against this same engine instead of building a
@@ -40,6 +42,20 @@ struct DemoPlayerApp: App {
         .commands {
             CommandGroup(replacing: .newItem) {}
         }
+    }
+}
+
+/// `swift run` builds an executable with no bundle, and AppKit starts such a
+/// process as `.prohibited`: the window draws, but it never becomes key, so the
+/// space and escape keys are dead, and macOS does not engage EDR for it, so an
+/// HDR source is composited as SDR. Both are invisible until measured, which is
+/// what makes the source build a misleading place to reproduce an HDR report.
+/// The packaged `.app` already gets `.regular` from its Info.plist, so this is a
+/// no-op there.
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        NSApp.setActivationPolicy(.regular)
+        NSApp.activate()
     }
 }
 

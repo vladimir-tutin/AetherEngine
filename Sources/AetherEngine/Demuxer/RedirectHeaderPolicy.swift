@@ -28,6 +28,15 @@ enum RedirectHeaderPolicy {
         return extraHeaders.filter { !credentialHeaders.contains($0.key.lowercased()) }
     }
 
+    /// Audit NET-7: the headers a host handed over for `anchor` as they may be sent to `target`, a URI
+    /// some playlist named. A playlist can name any host and scheme, so it gets the rule a redirect
+    /// gets: credentials only to the same origin with no TLS downgrade, everything else as given.
+    static func scoped(_ headers: [String: String], grantedFor anchor: URL?, sentTo target: URL?)
+        -> [String: String]
+    {
+        headersToReplay(extraHeaders: headers, originalURL: anchor, redirectURL: target)
+    }
+
     /// Builds the request actually handed back to URLSession on redirect: re-applies the
     /// original Range (URLSession drops custom headers on cross-host redirect, and
     /// Range-dependent proxies 400 without it), replays the policy-filtered extra
@@ -59,7 +68,7 @@ enum RedirectHeaderPolicy {
     /// Same host and no TLS downgrade. Ports may differ only across an http -> https
     /// upgrade (Emby-style 8096 -> 8920); within the same scheme a port change is a
     /// different origin.
-    private static func credentialsAllowed(from original: URL?, to redirect: URL?) -> Bool {
+    static func credentialsAllowed(from original: URL?, to redirect: URL?) -> Bool {
         guard let original, let redirect,
               let fromHost = original.host?.lowercased(),
               let toHost = redirect.host?.lowercased(),

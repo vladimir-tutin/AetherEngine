@@ -1,6 +1,6 @@
 import Foundation
 import Testing
-import Libavcodec
+import AetherLibavcodec
 @testable import AetherEngine
 
 /// #145 (cmcpherson274), premise corrected after upstream review (FFmpeg PR 23852, jamrial):

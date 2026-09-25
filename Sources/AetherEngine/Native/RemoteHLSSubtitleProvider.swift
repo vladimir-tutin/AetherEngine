@@ -16,7 +16,11 @@ final class RemoteHLSSubtitleProvider: HLSSegmentProvider, @unchecked Sendable {
     }
 
     let tracks: [Track]
-    let staticMasterPlaylistBody: String?
+
+    /// Settable because the relay can only rewrite this once the server it is mounted on has a
+    /// port and a token, which is after the provider exists. Written once during build, before
+    /// the server has answered anything.
+    private(set) var staticMasterPlaylistBody: String?
 
     /// Total program seconds, summed from the origin's own variant playlist. TARGETDURATION and the
     /// single EXTINF of every subtitle rendition are built from it.
@@ -40,10 +44,22 @@ final class RemoteHLSSubtitleProvider: HLSSegmentProvider, @unchecked Sendable {
          vttFillWaitSeconds: TimeInterval = defaultVTTFillWaitSeconds) {
         self.tracks = tracks
         self.staticMasterPlaylistBody = masterBody
-        self.programDuration = max(1, programDuration)
+        // `RemoteHLSSubtitleProxy.sumSegmentDurations` already refuses a non-finite, negative or
+        // absurd EXTINF sum before it reaches here; this is the last stop before the value leaves
+        // the provider (`segmentDuration(at:)`) for `wholeSecondsCovering`'s `Int(Double)`, which
+        // traps on `+inf` (audit NAT-1). Bounded again here so a caller that builds this provider
+        // directly, bypassing the proxy, cannot reintroduce the trap.
+        let finiteDuration = programDuration.isFinite ? programDuration : 1
+        self.programDuration = min(max(1, finiteDuration), RemoteHLSSubtitleProxy.maxProgramDurationSeconds)
         self.defaultHeaders = defaultHeaders
         self.vttFillWaitSeconds = vttFillWaitSeconds
         self.stores = tracks.map { _ in NativeSubtitleCueStore() }
+    }
+
+    /// Replaces the served master. Only the relay calls this, to send the origin's variants back
+    /// through the engine once the server's address is known.
+    func setMasterPlaylistBody(_ body: String) {
+        staticMasterPlaylistBody = body
     }
 
     /// The renditions as the rewriter needs to declare them, in `subs_{ordinal}` order.
@@ -90,6 +106,14 @@ final class RemoteHLSSubtitleProvider: HLSSegmentProvider, @unchecked Sendable {
     /// cooperative pool, where the detached decode does not get a thread at all.
     func awaitFill() async {
         await currentFillTask()?.value
+    }
+
+    /// AE#616: every sidecar's decode has finished, so `allCueStarts()` is the whole program.
+    var isFillFinished: Bool { stores.allSatisfy(\.isFinished) }
+
+    /// AE#616: cue starts and texts across every injected rendition, on the axis the `.vtt` serves.
+    func allCueStarts() -> [(start: Double, text: String)] {
+        stores.flatMap { $0.allCues().map { (start: $0.start, text: $0.text) } }
     }
 
     /// Reading the handle stays synchronous: `NSLock` is unavailable from an async context.
@@ -149,8 +173,9 @@ final class RemoteHLSSubtitleProvider: HLSSegmentProvider, @unchecked Sendable {
     var nativeSubtitleRenditions: [(ordinal: Int, language: String?, name: String, isForced: Bool)] { [] }
 
     /// Whole-program WebVTT for one sidecar. Cue times are used verbatim: this bypass has no loopback
-    /// producer and therefore no playlist shift, and the origin's VOD timeline starts at zero, so the
-    /// sidecar's own absolute seconds already are the item axis.
+    /// producer and therefore no playlist shift, and AVPlayer places the cues by media timestamp, so
+    /// the sidecar's own absolute seconds line up with the frames. They do NOT line up with item time
+    /// where an origin's segments start before their playlist slot; AE#616 measures that gap off them.
     func nativeSubtitleVTT(ordinal: Int, segmentIndex: Int) -> String? {
         guard ordinal >= 0, ordinal < stores.count else { return nil }
         let store = stores[ordinal]

@@ -204,6 +204,48 @@ final class HLSPlaylistTests: XCTestCase {
         XCTAssertThrowsError(try HLSPlaylistParser.parse("#EXTM3U\n#EXT-X-TARGETDURATION:6\n"))
     }
 
+    // audit NET-2 / NAT-3: "\r\n" is one Character in Swift, so `split(separator: "\n")` read a
+    // whole CRLF playlist (Windows-hosted IPTV panels, some packagers) as a single line.
+    func testParsesCRLFMediaPlaylist() throws {
+        let text = "#EXTM3U\r\n#EXT-X-TARGETDURATION:6\r\n#EXT-X-MEDIA-SEQUENCE:147\r\n"
+        + "#EXTINF:6.000,\r\nseg147.ts\r\n"
+        guard case .media(let media) = try HLSPlaylistParser.parse(text) else {
+            return XCTFail("expected media playlist")
+        }
+        XCTAssertEqual(media.targetDuration, 6.0)
+        XCTAssertEqual(media.mediaSequence, 147)
+        XCTAssertEqual(media.segments.map(\.uri), ["seg147.ts"])
+    }
+
+    func testParsesCRLFMasterPlaylist() throws {
+        let text = "#EXTM3U\r\n#EXT-X-STREAM-INF:BANDWIDTH=1000\r\nv.m3u8\r\n"
+        guard case .master(let master) = try HLSPlaylistParser.parse(text) else {
+            return XCTFail("expected master playlist")
+        }
+        XCTAssertEqual(master.variants.map(\.uri), ["v.m3u8"])
+    }
+
+    // audit NET-3: a hostile or MITM MEDIA-SEQUENCE near Int.max used to reach
+    // `mediaSequence + segments.count` unchecked in HLSPlaylistTracker and trap.
+    func testRejectsMediaSequenceNearIntMax() {
+        let text = "#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXT-X-MEDIA-SEQUENCE:9223372036854775807\n"
+        + "#EXTINF:6.000,\nseg.ts\n"
+        XCTAssertThrowsError(try HLSPlaylistParser.parse(text)) { error in
+            guard case HLSIngestError.playlistInvalid = error else {
+                return XCTFail("expected playlistInvalid, got \(error)")
+            }
+        }
+    }
+
+    func testRejectsNegativeMediaSequence() {
+        let text = "#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXT-X-MEDIA-SEQUENCE:-1\n#EXTINF:6.000,\nseg.ts\n"
+        XCTAssertThrowsError(try HLSPlaylistParser.parse(text)) { error in
+            guard case HLSIngestError.playlistInvalid = error else {
+                return XCTFail("expected playlistInvalid, got \(error)")
+            }
+        }
+    }
+
     // AE#359: the master's SUBTITLES group was parsed away, so a live channel that offers WebVTT
     // renditions (every public German broadcaster does) had no subtitle track to select. Fixture is
     // MDR Sachsen's real master, trimmed to one variant and its rendition line.

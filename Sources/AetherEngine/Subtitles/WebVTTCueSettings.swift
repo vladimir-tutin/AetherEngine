@@ -1,6 +1,6 @@
 import CoreGraphics
 import Foundation
-import Libavcodec
+import AetherLibavcodec
 
 /// WebVTT cue settings (`line`, `position`, `align`, `size`, `vertical`) mapped onto
 /// `SubtitleTextPlacement` (#233).

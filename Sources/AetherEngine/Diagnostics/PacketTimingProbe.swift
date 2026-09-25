@@ -1,7 +1,7 @@
 import Foundation
-import Libavformat
-import Libavcodec
-import Libavutil
+import AetherLibavformat
+import AetherLibavcodec
+import AetherLibavutil
 
 /// Offline differential probe for the #93 post-recovery judder: opens the source with a chosen
 /// demuxer open profile, seeks, and reports raw video packet timing exactly as the demuxer

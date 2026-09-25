@@ -1,6 +1,6 @@
 import Foundation
 import Testing
-import Libavcodec
+import AetherLibavcodec
 @testable import AetherEngine
 
 /// #142: PGS carries no end time, a cue is closed by the start of its successor. When a display set

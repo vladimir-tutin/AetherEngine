@@ -33,10 +33,11 @@ final class DisplayCriteriaController {
     /// Has a criteria write ever demonstrably driven THIS display into HDR (headroom observed above 1.0)?
     ///
     /// Deliberately never cleared, not by `reset()` and not by a switch that ends at headroom 1.0. The
-    /// headroom is a transition artifact, so its absence proves nothing (see `panelPresentsHDR`) and any
-    /// invalidation rule built on it would re-arm the very false negative this exists to answer. A display
-    /// change cannot strand it either: `effectiveVideoFormat` clamps to `displayCapabilities` before
-    /// `apply()`, so an SDR route writes SDR criteria and never consults the proof.
+    /// headroom collapses while HDR video is on the screen (see `panelPresentsHDR`), so its absence at
+    /// exactly the moment a load asks proves nothing, and any invalidation rule built on it would re-arm
+    /// the very false negative this exists to answer. A display change cannot strand it either:
+    /// `effectiveVideoFormat` clamps to `displayCapabilities` before `apply()`, so an SDR route writes SDR
+    /// criteria and never consults the proof.
     private var panelProvenToEngageHDR: Bool = false
 
     #if os(tvOS)
@@ -195,16 +196,36 @@ final class DisplayCriteriaController {
 
     /// Will the panel present this session in HDR?
     ///
-    /// `UIScreen.currentEDRHeadroom` is not a readout of the panel's HDMI mode. It is raised around a
-    /// dynamic-range TRANSITION and decays back to 1.0 while the panel keeps presenting HDR (device trace,
-    /// HDR10+ panel, 2026-08-02: headroom fell 1.20 -> 1.00 thirteen seconds into a confirmed HDR10 session
-    /// with `isDisplayModeSwitchInProgress` false throughout). A replay that starts before the TV has dropped
-    /// back to SDR therefore makes no transition at all, the headroom never rises, and the single read taken
-    /// after `waitForSwitch` concluded "panel is SDR". On tvOS that one boolean IS the master-vs-media routing
-    /// gate (`resolveUseMasterPlaylist`, where `builtInPanelEngagesOnDemand` is false), so the session was
-    /// served media-direct with no HDR signaling and labelled SDR while the TV itself reported HDR.
+    /// `UIScreen.currentEDRHeadroom` is honest exactly when no video is on the screen, and dishonest for
+    /// seconds to tens of seconds after HDR video has been. Measured on an Apple TV 4K (3rd gen), HDR10+
+    /// panel, 2026-09-02, seven runs across four configurations:
     ///
-    /// So the reading is trusted only as a positive. Its absence is answered by what this display has already
+    ///     output fixed 4K HDR, nothing playing:      1.20, and again 1.20 fifty-five seconds later
+    ///     output fixed 4K HDR, SDR content playing:  1.20
+    ///     output fixed 4K SDR, either of the above:  1.00
+    ///     output fixed 4K HDR, 17s after HDR ended:  1.20
+    ///
+    /// So a panel parked in HDR does report itself, with no transition anywhere in sight, and it keeps
+    /// reporting itself: the value is stable rather than decaying, and a rate-only criteria write does not
+    /// collapse it either (measured with Match Frame Rate on, `SET: format=sdr rate=25.000 extensions=none`,
+    /// headroom 1.20 straight through). What DOES collapse it is HDR video on the screen: the 2026-08-02
+    /// trace has it falling 1.20 -> 1.00 thirteen seconds into a confirmed HDR10 session with
+    /// `isDisplayModeSwitchInProgress` false throughout, and the 2026-08-09 table below is the same effect.
+    /// It recovers once that video is gone.
+    ///
+    /// That is why a REPLAY was the failure shape: it starts while the previous HDR session has already
+    /// pulled the value down, the single read taken after `waitForSwitch` sees 1.0, and on tvOS that one
+    /// boolean IS the master-vs-media routing gate (`resolveUseMasterPlaylist`, where
+    /// `builtInPanelEngagesOnDemand` is false), so the session was served media-direct with no HDR signaling
+    /// and labelled SDR while the TV itself reported HDR.
+    ///
+    /// Do not read "the headroom is a transition artifact" into this. That was the model until 2026-09-02 and
+    /// it is wrong in the direction that costs a search: it predicts a parked panel can never prove itself,
+    /// which sends the next reader hunting for a way to force a transition. The engine's problem was never
+    /// that the panel had nothing to say, it was WHEN the question gets asked.
+    ///
+    /// The reading is still trusted only as a positive, because a 1.0 at the moment of asking cannot be told
+    /// apart from a panel that is genuinely SDR. Its absence is answered by what this display has already
     /// proven: once a criteria write has driven it into HDR, asking for HDR again puts it there. A panel that
     /// never engages (Match Frame Rate on, Match Dynamic Range off, which tvOS reports through the same
     /// combined toggle) never sets the proof and keeps the conservative answer, so it is still never offered a
@@ -218,7 +239,9 @@ final class DisplayCriteriaController {
     ///     4K HDR, t+20s:   current 1.00, potential 1.00
     ///     4K SDR, t+2.5s:  current 1.00, potential 1.00
     ///
-    /// The first row is the one that closes it: the panel was demonstrably in an HDR mode, and the value
+    /// Those three rows were taken DURING playback, which is why the second one reads 1.00; see the idle
+    /// table above for the same box with nothing on the screen. The first row is the one that closes it:
+    /// the panel was demonstrably in an HDR mode, and the value
     /// documented as the maximum the screen can display read *lower* than the live one at the same instant,
     /// from the same `UIScreen`. That is not a sampling-time problem, it is a property tvOS does not
     /// maintain. There is no mode read-back; do not go looking for one here again (Sodalite#49).
@@ -239,6 +262,77 @@ final class DisplayCriteriaController {
     nonisolated static func criteriaAttribution(didApply: Bool, lastCriteriaWasHDR: Bool) -> CriteriaAttribution {
         guard didApply else { return .hostDriven }
         return lastCriteriaWasHDR ? .engineHDR : .engineRateOnly
+    }
+
+    // MARK: - Late panel probe (#459)
+
+    /// How long after the first frames the panel is re-asked whether it is presenting HDR, and how often.
+    ///
+    /// Every reading `panelPresentsHDR` gets is taken around the criteria write. On a box that has just been
+    /// playing HDR, that is the one moment the value is still pulled down by the session being replaced, so a
+    /// panel parked in HDR can read SDR there and keep reading SDR for good (#459). The 2026-08-09 device
+    /// trace has the reading this window exists to catch, on an Apple TV whose output was fixed to 4K HDR:
+    /// headroom 1.20 at t+2.5s, back to 1.00 by t+20s, against a flat 1.00 for the same title with the output
+    /// fixed to 4K SDR.
+    ///
+    /// So the window opens wide enough to contain that rise and closes before the value decays into
+    /// meaninglessness. A window that closes with nothing seen is itself the measurement: it says this panel
+    /// never raises the headroom, which is the one thing no log line could say before.
+    ///
+    /// This probe is the instrument, not the last word on the cause. The 2026-09-02 runs (see
+    /// `panelPresentsHDR`) could not reproduce #459 on an HDR10+ panel in any configuration, including the
+    /// reporter's, because there the idle reading is honest and the load-time read inherits it. Whether the
+    /// reporter's panel raises the headroom at all is what this probe's own log line answers, and nothing
+    /// further should be built here before it has.
+    nonisolated static let playbackProbeWindowMs = 12_000
+    nonisolated static let playbackProbeIntervalMs = 250
+
+    /// Whether a session's label can still change by asking the panel again once frames are running.
+    ///
+    /// SDR sessions are excluded on both counts: SDR content composites no HDR, so the headroom cannot rise
+    /// for it, and there would be nothing to upgrade the label to if it did. A paused mount (#124) is
+    /// excluded for the first of those reasons alone: no frames, nothing composited, and a window that
+    /// closes on that would report the panel's silence as if it had been asked.
+    nonisolated static func shouldProbePanelDuringPlayback(
+        effectiveFormat: VideoFormat,
+        panelPresentedHDRAtLoad: Bool,
+        sessionIsPlaying: Bool
+    ) -> Bool {
+        effectiveFormat != .sdr && !panelPresentedHDRAtLoad && sessionIsPlaying
+    }
+
+    /// How long to let a served master settle before reading acceptance as proof.
+    ///
+    /// A display rejection is fast and arrives before the item is playable: measured on device at 54 to
+    /// 61 ms from serving the master to `item.status=failed` with zero `errorLog` events, because
+    /// AVFoundation decides at parse and eligibility time rather than after any network activity. Half a
+    /// second is an order of magnitude past that and still inside the probe window it delays.
+    nonisolated static let masterAcceptanceSettleMs = 500
+
+    /// AE#459: an accepted HDR master answers the panel question better than the headroom does.
+    ///
+    /// `UIScreen.currentEDRHeadroom` has been measured reading 1.00 on a panel that, in the same session,
+    /// accepted an HLG master which AVFoundation then reported as `ITU_R_2100_HLG`. A display that takes an
+    /// HDR master is presenting HDR; one that is not refuses with -11868 or -11848, which is exactly what
+    /// the same box does when its output is locked to SDR. So where the headroom is silent, acceptance is
+    /// not a weaker substitute for it, it is the stronger reading.
+    ///
+    /// This proves the LABEL only. It deliberately does not latch the panel proof or re-route the running
+    /// session: the route already reaches the master on its own through the attempt, and a diagnostic that
+    /// also decided routing would answer a different question than the one being asked.
+    ///
+    /// `fellBackToMedia` is what separates acceptance from mere service. The fallback withdraws the master
+    /// in place, so a session that is still serving it after the settle window was not refused.
+    nonisolated static func masterAcceptanceProvesPanel(
+        servingHDRMaster: Bool, fellBackToMedia: Bool, sessionIsPlaying: Bool
+    ) -> Bool {
+        servingHDRMaster && !fellBackToMedia && sessionIsPlaying
+    }
+
+    /// Whether the probe takes another sample. One reading above 1.0 is authoritative and latches the proof
+    /// for good, so the first hit ends the probe.
+    nonisolated static func playbackProbeContinues(elapsedMs: Int, observedHDR: Bool) -> Bool {
+        !observedHDR && elapsedMs < playbackProbeWindowMs
     }
 
     /// How the gate learned a switch was running. This is the one bit that separates "the panel was already
@@ -328,6 +422,187 @@ final class DisplayCriteriaController {
         headroomAboveOne && !switchInProgress
     }
 
+    /// How the cadence the panel is measurably running relates to the rate the criteria asked for (#449).
+    enum PanelRateRelation: Equatable {
+        /// The panel is running the requested rate.
+        case exact(panelRate: Double)
+        /// The panel is running an exact integer multiple of the requested rate. Every frame lands on a
+        /// whole number of refreshes, which is the mode tvOS itself picks for sub-50 content (a 25.000
+        /// request measured on a panel held at 50.002 Hz, #449), so nothing is wrong with it.
+        ///
+        /// Unlike an exact match this reading cannot rule out a switch to the requested rate still being
+        /// in flight, because both cadences satisfy the request. It settles only after `panelMultipleDwellMs`
+        /// of holding it unbroken; see `rateOnlySwitchIsSettled`.
+        case multiple(panelRate: Double, factor: Int)
+        /// Measured, and neither. A switch may still be running, or the panel ignored the criteria.
+        case different(panelRate: Double)
+        /// No fresh display-link tick, or no rate was requested. The panel is not presenting frames, which
+        /// is exactly what a blanked mid-handshake panel looks like from here.
+        case unmeasured
+
+        /// Whether two readings describe the same panel state. Deliberately not `==`: the per-tick figure
+        /// moves in the fourth decimal, so comparing the hertz would restart the dwell on nearly every
+        /// tick and no run could ever complete.
+        func describesSameStateAs(_ other: PanelRateRelation) -> Bool {
+            switch (self, other) {
+            case (.exact, .exact), (.different, .different), (.unmeasured, .unmeasured): true
+            case (.multiple(_, let a), .multiple(_, let b)): a == b
+            default: false
+            }
+        }
+
+        var logDescription: String {
+            switch self {
+            case .exact(let rate):
+                String(format: "panel %.3fHz, the requested rate", rate)
+            case .multiple(let rate, let factor):
+                String(format: "panel %.3fHz", rate) + ", an exact x\(factor) multiple of the requested rate"
+            case .different(let rate):
+                String(format: "panel %.3fHz, neither the requested rate nor a multiple of it", rate)
+            case .unmeasured:
+                "panel cadence unmeasured (no display-link tick within the freshness window)"
+            }
+        }
+    }
+
+    /// How far two refresh rates may differ and still be the same mode, as a fraction of the rate (#449).
+    ///
+    /// The binding pair is 23.976 against 24.000: 0.024 Hz apart, and they are genuinely different modes
+    /// (mixing them repeats a frame every ~42 s). At 24 Hz this tolerance is 0.012 Hz, half that gap.
+    /// The other direction is a panel that reports its mode slightly off nominal, which is the normal case:
+    /// the #449 reporter's 50 Hz panel reads 50.002 Hz.
+    nonisolated static let panelRateTolerance: Double = 0.0005
+
+    nonisolated static func panelRateRelation(requestedRate: Float?, panelNominalRate: Double?) -> PanelRateRelation {
+        guard let requested = requestedRate.map(Double.init), requested > 0, requested.isFinite,
+              let panel = panelNominalRate, panel > 0, panel.isFinite else { return .unmeasured }
+        if abs(panel - requested) <= requested * panelRateTolerance { return .exact(panelRate: panel) }
+        // Bounded before the Int conversion: the ratio is derived from a display-link duration, and an
+        // Int(_:) of a value outside Int's range traps.
+        let factor = (panel / requested).rounded()
+        if factor >= 2, factor <= 16, abs(panel - factor * requested) <= panel * panelRateTolerance {
+            return .multiple(panelRate: panel, factor: Int(factor))
+        }
+        return .different(panelRate: panel)
+    }
+
+    /// #449: a rate-only criteria write asks the panel to change exactly one thing, so once the panel is
+    /// measurably running the requested rate that change is done, whatever the notifications say.
+    ///
+    /// It has to be said that way round, because on the reporter's panel the notifications say nothing
+    /// usable: a `rate=50.000` write to a display already running 50.002 Hz still posts a mode-switch
+    /// start, never posts an end, and leaves `isDisplayModeSwitchInProgress` set for the whole cap. Eight
+    /// of nine gates in an 18 minute session spent the full 2 s that way, and with the #447 holdback down
+    /// to 6 s the manifest no longer hides it: the first frame reaches the panel a second earlier and then
+    /// sits there frozen, which reads worse than the longer join it replaced.
+    ///
+    /// Restricted to `engineRateOnly` on purpose. An HDR write asks for a dynamic range as well, and a
+    /// matching rate says nothing about that handshake; a switch nobody here initiated has no requested
+    /// rate to compare against at all. The residual case this does not cover, and which the 2 s cap does
+    /// not cover either, is a range transition started elsewhere (a preceding `reset()`, a sole-writer
+    /// host) that is still running under a rate the panel never had to change: real switches on this
+    /// hardware measure 2.8 s, so the cap was already releasing ~800 ms into them.
+    /// Round 2 (#449) adds the integer multiple, and it has to be earned rather than read once, which is
+    /// the whole difference between the two cases.
+    ///
+    /// An exact match settles on sight because the requested state and the observed state are the same,
+    /// so a pending switch, if there is one, is a switch to what is already on screen. A multiple cannot
+    /// argue that: a 25.000 request is satisfied by the 50.002 Hz the panel already runs AND by a 25 Hz
+    /// mode it might still be switching to. What separates them is time. A real switch on this hardware
+    /// takes ~2.8 s and blanks the panel while it runs, so a display link that keeps delivering ticks at
+    /// an unbroken cadence is a panel that is presenting, not one mid-handshake. `panelMultipleDwellMs`
+    /// of that is the evidence, and any tick that reads a different cadence or none at all restarts it.
+    ///
+    /// What this does NOT claim is that no switch will begin later. Nothing here could: the 2 s cap never
+    /// covered that either, since a 2.8 s switch outlives it and the gate was already releasing ~800 ms
+    /// into one. The choice is between releasing into a hypothetical blank and holding a frame still for
+    /// two seconds on every 25 fps join, which the reporter measured at 2.05 s and 2.02 s of visibly
+    /// frozen picture on a panel that was demonstrably presenting throughout. The `mode check (native)`
+    /// line a few seconds later is the witness for the residue: it reads the panel again, so a switch
+    /// that did arrive late is visible in the same capture rather than assumed away.
+    nonisolated static func rateOnlySwitchIsSettled(attribution: CriteriaAttribution,
+                                                    relation: PanelRateRelation,
+                                                    heldForMs: Int) -> Bool {
+        guard attribution == .engineRateOnly else { return false }
+        switch relation {
+        case .exact: return true
+        case .multiple: return heldForMs >= panelMultipleDwellMs
+        case .different, .unmeasured: return false
+        }
+    }
+
+    /// How long the panel must hold an integer multiple of the requested rate before that reading is
+    /// allowed to settle a rate-only write (#449).
+    ///
+    /// Six Stage 2 polls, and more than seven frame intervals at the slowest mode tvOS switches to
+    /// (23.976 Hz, 41.7 ms), so a blank cannot hide inside it. Against the 2 s cap it returns 85% of the
+    /// wait; against a switch that begins after it, nothing was protecting that case anyway.
+    nonisolated static let panelMultipleDwellMs = 300
+
+    /// An unbroken run of the same panel reading, in Stage 2 milliseconds.
+    struct PanelCadenceRun: Equatable {
+        let relation: PanelRateRelation
+        let startedAtMs: Int
+
+        func heldMs(atMs: Int) -> Int { max(0, atMs - startedAtMs) }
+    }
+
+    /// Carry a run forward, or start a new one where the reading changed. A panel that blanks mid-dwell
+    /// reads `.unmeasured` for those ticks, which is a different state and therefore a new run: that is
+    /// the case the dwell exists to catch.
+    nonisolated static func extendCadenceRun(_ run: PanelCadenceRun?,
+                                             relation: PanelRateRelation,
+                                             nowMs: Int) -> PanelCadenceRun {
+        if let run, run.relation.describesSameStateAs(relation) { return run }
+        return PanelCadenceRun(relation: relation, startedAtMs: nowMs)
+    }
+
+    /// What the dwell did across a whole Stage 2, so a reading that never settled can say why (#449).
+    ///
+    /// The reporter's caution, from the same capture that confirmed the fix: `mode check (native)` read
+    /// cadences well away from nominal on 4 of 12 reads (35.456 Hz against a nominal 50.002), and a tick
+    /// like that landing inside the dwell restarts the run. It cannot reach the gate's reading, because
+    /// the two measure different things: `mode check` reports THROUGHPUT averaged over its whole sample
+    /// (`tickCount / span`, which missed ticks drag down), while the gate reads the mode interval of a
+    /// single tick (`targetTimestamp - timestamp`), which is why `nominal` stayed at 50.002 in every one
+    /// of those four lines. What CAN break the run is the freshness guard, if the missed ticks arrive in
+    /// one block longer than `panelCadenceFreshnessMs`. That outcome is safe (the cap stands, as before
+    /// the fix), so this is not a guard, it is the evidence: a cap line that names the breaks and the
+    /// longest run turns "I would look here first" into a reading.
+    struct PanelCadenceHistory: Equatable {
+        var run: PanelCadenceRun?
+        /// How many times a tick reported something other than what the run held.
+        var restarts: Int = 0
+        /// The longest unbroken run this Stage 2 achieved, in milliseconds.
+        var longestHeldMs: Int = 0
+
+        var logDescription: String {
+            "the cadence run broke \(restarts) time\(restarts == 1 ? "" : "s"), "
+            + "longest unbroken \(longestHeldMs)ms of the \(panelMultipleDwellMs)ms a multiple needs"
+        }
+    }
+
+    /// Fold one Stage 2 tick into the history above. Pure, because the case it describes is the one a
+    /// device run does not produce on demand.
+    nonisolated static func extendCadenceHistory(_ history: PanelCadenceHistory,
+                                                 relation: PanelRateRelation,
+                                                 nowMs: Int) -> PanelCadenceHistory {
+        var next = history
+        let run = extendCadenceRun(history.run, relation: relation, nowMs: nowMs)
+        if let previous = history.run, previous.startedAtMs != run.startedAtMs {
+            next.restarts += 1
+            next.longestHeldMs = max(next.longestHeldMs, previous.heldMs(atMs: nowMs))
+        }
+        next.run = run
+        next.longestHeldMs = max(next.longestHeldMs, run.heldMs(atMs: nowMs))
+        return next
+    }
+
+    /// How stale a display-link tick may be and still describe the panel's current cadence (#449). Three
+    /// frame intervals at the slowest mode tvOS switches to (23.976 Hz), so a panel that is merely running
+    /// slowly is not mistaken for one that has stopped presenting.
+    nonisolated static let panelCadenceFreshnessMs = 125
+
     /// Whether a recorded switch belongs to the load whose gate is asking (#339).
     ///
     /// The record survives between loads, so a gate that runs without a preceding arm must not read it: an
@@ -385,6 +660,46 @@ final class DisplayCriteriaController {
         elapsedMs(fromNanos: start.uptimeNanoseconds, toNanos: DispatchTime.now().uptimeNanoseconds)
     }
 
+    /// AE#459: one line carrying everything the system will say about the display, in a fixed shape so a
+    /// reporter can be asked to grep for it.
+    ///
+    /// Built pure because the values come from four different objects and the line is the instrument: a
+    /// diagnostic whose format drifts cannot be compared against the one a reporter posted last month.
+    ///
+    /// `headroomLimit` is `UITraitCollection.hdrHeadroomUsageLimit` (tvOS 26), which the header describes
+    /// as whether HDR headroom should be used for the current UI configuration, disabled for instance while
+    /// an app's windows are in the background. It is not a panel readout, and that is exactly why it belongs
+    /// next to one: a limit that is ACTIVE caps what the headroom properties are allowed to report, so a
+    /// 1.00 under it is a statement about this app's UI state and not about the display. Without it, that
+    /// case is indistinguishable from a panel that genuinely presents SDR. The reporter's own hypothesis for
+    /// the tvOS 27 silence is that the system UI is now mastered in HDR, which is precisely the kind of
+    /// change that would move when these limits apply.
+    ///
+    /// `potentialEDR` is in here at DrHurt's suggestion and against my own measurement, which is the point.
+    /// It read a flat 1.00 on an Apple TV 4K 3rd gen on tvOS 26.5 while `currentEDR` read 1.20 on the same
+    /// `UIScreen` in the same moment, so it looked like a property tvOS does not maintain. That was one box
+    /// on one OS, and the box this issue is about answers differently on the other property, so the honest
+    /// move is to print both and let a second panel decide rather than to carry my own result as a rule.
+    nonisolated static func panelReadoutLine(
+        phase: String,
+        currentEDR: CGFloat,
+        potentialEDR: CGFloat,
+        switching: Bool,
+        matching: Bool,
+        hdrEligible: Bool,
+        proven: Bool,
+        headroomLimit: String
+    ) -> String {
+        "[DisplayCriteria] panel readout \(phase): "
+        + "currentEDR=\(String(format: "%.2f", currentEDR)) "
+        + "potentialEDR=\(String(format: "%.2f", potentialEDR)) "
+        + "headroomLimit=\(headroomLimit) "
+        + "switching=\(switching ? "yes" : "no") "
+        + "matching=\(matching ? "on" : "off") "
+        + "hdrEligible=\(hdrEligible ? "yes" : "no") "
+        + "provenHDR=\(proven ? "yes" : "no")"
+    }
+
     init() {}
 
     /// Program AVDisplayCriteria before the session starts. `.sdr` programs a rate-only criteria so Match Frame Rate still engages. `codecTag` nil derives from format (`'dvh1'` for DV, `'hvc1'` otherwise). `omitColorExtensions` skips BT.2020 extensions for diagnostic builds. Returns `.willSwitch` when a dynamic-range switch is expected (caller should call waitForSwitch), `.applied` for an SDR rate-only write, or `.unchanged` when the criteria are already active and nothing was written (#133).
@@ -394,10 +709,6 @@ final class DisplayCriteriaController {
         // Reset up front so a skipped apply (Match Content off, no window)
         // can't leave a prior HDR session's flag for waitForSwitch to read.
         lastCriteriaWasHDR = false
-        guard #available(tvOS 17.0, *) else {
-            EngineLog.emit("[DisplayCriteria] skipped: tvOS < 17", category: .engine)
-            return .applied
-        }
 
         guard let window = resolveWindow() else {
             EngineLog.emit("[DisplayCriteria] skipped: no window", category: .engine)
@@ -405,6 +716,9 @@ final class DisplayCriteriaController {
         }
 
         let displayManager = window.avDisplayManager
+        // AE#459: before the guard below, not after. A box with Match Content off is exactly the
+        // configuration whose panel state nothing else in this log describes.
+        logPanelReadout("before apply", window: window)
 
         // isDisplayCriteriaMatchingEnabled covers both Match Dynamic Range and Match Frame Rate; tvOS picks the applicable dimension internally.
         guard displayManager.isDisplayCriteriaMatchingEnabled else {
@@ -553,6 +867,18 @@ final class DisplayCriteriaController {
             return
         }
 
+        // #449: what the panel is actually doing while the gate holds play(). Started here rather than at
+        // the criteria write so its lifetime is the gate's, and read per tick rather than averaged, because
+        // the question is which mode the panel is in *now*. Stage 1 gives it the ticks Stage 2 reads.
+        let cadence = DisplayLinkSampler()
+        cadence.start(screen: screen)
+        defer { cadence.invalidate() }
+        func panelRelation() -> PanelRateRelation {
+            Self.panelRateRelation(
+                requestedRate: lastApplied?.effectiveRate,
+                panelNominalRate: cadence.nominalRateNow(freshWithinMs: Self.panelCadenceFreshnessMs))
+        }
+
         // Fast exit: panel already in HDR (headroom already raised, e.g. a prior
         // HDR/DV session left it there) and not currently switching.
         if Self.entryHeadroomIsSettled(headroomAboveOne: observeHeadroom(screen),
@@ -664,10 +990,31 @@ final class DisplayCriteriaController {
                                      totalMs: Self.elapsedMs(since: entry),
                                      startBeforeGateMs: preGateStartMs, switchMs: switchMs)
         }
+        // #449 round 2: the unbroken run of the same panel reading, so a cadence that only settles a
+        // multiple after a dwell can be asked how long it has actually held it.
+        var cadenceHistory = PanelCadenceHistory()
         while !Self.isBudgetSpent(elapsedMs: Self.elapsedMs(since: stage2Entry), budgetMs: capMs) {
             try? await Task.sleep(for: .milliseconds(50))
+            let stage2Ms = Self.elapsedMs(since: stage2Entry)
+            let relation = panelRelation()
+            cadenceHistory = Self.extendCadenceHistory(cadenceHistory, relation: relation, nowMs: stage2Ms)
+            let heldMs = cadenceHistory.run?.heldMs(atMs: stage2Ms) ?? 0
             if observation.hasNewEnd(since: gateSnapshot) {
-                EngineLog.emit("[DisplayCriteria] switch settled via modeSwitchEnd (\(timing()))", category: .engine)
+                EngineLog.emit("[DisplayCriteria] switch settled via modeSwitchEnd (\(timing()), \(relation.logDescription))", category: .engine)
+                return
+            }
+            // #449: the panel is measurably running the rate this rate-only write asked for, so the switch
+            // the notifications never finish reporting has nothing left to do. Named with the cap it did
+            // not spend, because that is the number the fix has to be verified against, and with the dwell
+            // where one was required, because a multiple settles on having HELD the reading.
+            if Self.rateOnlySwitchIsSettled(
+                attribution: Self.criteriaAttribution(didApply: didApply, lastCriteriaWasHDR: lastCriteriaWasHDR),
+                relation: relation, heldForMs: heldMs) {
+                let dwell: String = {
+                    guard case .multiple = relation else { return "" }
+                    return ", held unbroken for \(heldMs)ms"
+                }()
+                EngineLog.emit("[DisplayCriteria] rate-only criteria already satisfied (\(timing()), \(relation.logDescription)\(dwell); released \(capMs - Self.elapsedMs(since: stage2Entry))ms before the \(capMs)ms cap)", category: .engine)
                 return
             }
             // Only meaningful when this load recorded no start: the headroom rises with the transition, so
@@ -682,7 +1029,7 @@ final class DisplayCriteriaController {
                 switch Self.criteriaAttribution(didApply: didApply, lastCriteriaWasHDR: lastCriteriaWasHDR) {
                 case .engineRateOnly:
                     // SDR rate-only criteria: refresh-rate switch settled, panel correctly stayed SDR.
-                    EngineLog.emit("[DisplayCriteria] rate-only switch settled (\(timing()), SDR, EDR headroom 1.0 as expected)", category: .engine)
+                    EngineLog.emit("[DisplayCriteria] rate-only switch settled (\(timing()), SDR, \(relation.logDescription), EDR headroom 1.0 as expected)", category: .engine)
                 case .engineHDR:
                     // Headroom 1.0 after an HDR write is NOT evidence of a refusal. The value is only raised
                     // by a dynamic-range transition, so a panel that was already in HDR reads identically to
@@ -707,9 +1054,14 @@ final class DisplayCriteriaController {
         // its own event (Sodalite#49). Two of the reporter's three second-round runs landed here, both
         // rate-only SDR, so this is the common outcome on that panel rather than an edge case.
         let headroom = String(format: "%.2f", screen.currentEDRHeadroom)
+        let capRelation = panelRelation()
         switch Self.criteriaAttribution(didApply: didApply, lastCriteriaWasHDR: lastCriteriaWasHDR) {
         case .engineRateOnly:
-            EngineLog.emit("[DisplayCriteria] proceed after cap (\(timing()); engine rate-only criteria, switch never reported end, panel may still be mid-switch; EDR headroom \(headroom))", category: .engine)
+            // #449: the cadence is the part that says whether this was a switch in flight or a write the
+            // panel had nothing to do about. Reaching here on a `.multiple` means the reading never held
+            // for `panelMultipleDwellMs` unbroken, so the panel kept changing what it reported or stopped
+            // reporting; a `.different` reading is a panel in neither mode.
+            EngineLog.emit("[DisplayCriteria] proceed after cap (\(timing()); engine rate-only criteria, switch never reported end, panel may still be mid-switch; \(capRelation.logDescription); \(cadenceHistory.logDescription); EDR headroom \(headroom))", category: .engine)
         case .engineHDR:
             // "Unobservable DV panel" was the blanket reading here, but a panel that was already in HDR
             // when the criteria were re-written produces the same silence: no transition, so no headroom
@@ -747,7 +1099,8 @@ final class DisplayCriteriaController {
 
     /// Whether the panel presents this session in HDR, read after apply() + waitForSwitch() settle. A live
     /// headroom above 1.0 answers it; a decayed one is answered by `panelPresentsHDR` from what this display
-    /// has already proven, because the headroom is a transition artifact and its absence proves nothing.
+    /// has already proven, because HDR video on the screen pulls the value down and a replay asks while the
+    /// previous session was still doing that.
     func currentPanelIsHDR() -> Bool {
         #if os(tvOS)
         guard let window = resolveWindow() else { return false }
@@ -756,6 +1109,52 @@ final class DisplayCriteriaController {
             attribution: Self.criteriaAttribution(didApply: didApply, lastCriteriaWasHDR: lastCriteriaWasHDR),
             panelProvenToEngageHDR: panelProvenToEngageHDR
         )
+        #else
+        return false
+        #endif
+    }
+
+    /// Re-ask the panel whether it is presenting HDR, now that the session's frames are on screen.
+    ///
+    /// The load-time read cannot answer for a panel already parked in HDR: it is taken around the criteria
+    /// write, and that panel makes no dynamic-range transition to raise the headroom (#459). This one is
+    /// taken while HDR content composites, which is when Vincent's device trace shows the value rising, and
+    /// it goes through `observeHeadroom` so a hit latches the proof for every later load in the process.
+    ///
+    /// Returns whether the panel answered HDR. Bounded by `playbackProbeWindowMs`, and a window that closes
+    /// with nothing seen is logged as the measurement it is.
+    func probePanelDuringPlayback() async -> Bool {
+        #if os(tvOS)
+        guard let window = resolveWindow() else { return false }
+        let started = DispatchTime.now()
+        var samples = 0
+        var maxHeadroom = 0.0
+        var observedHDR = false
+        while !Task.isCancelled,
+              Self.playbackProbeContinues(elapsedMs: Self.elapsedMs(since: started),
+                                          observedHDR: observedHDR) {
+            samples += 1
+            maxHeadroom = max(maxHeadroom, Double(window.screen.currentEDRHeadroom))
+            observedHDR = observeHeadroom(window.screen)
+            if !observedHDR {
+                try? await Task.sleep(for: .milliseconds(Self.playbackProbeIntervalMs))
+            }
+        }
+        guard !Task.isCancelled else { return false }
+        let headroom = String(format: "%.2f", maxHeadroom)
+        if observedHDR {
+            EngineLog.emit(
+                "[DisplayCriteria] playback probe: panel reports HDR after "
+                + "\(Self.elapsedMs(since: started))ms (headroom \(headroom), \(samples) samples)",
+                category: .engine)
+        } else {
+            EngineLog.emit(
+                "[DisplayCriteria] playback probe: no HDR reading in \(Self.elapsedMs(since: started))ms "
+                + "(max headroom \(headroom), \(samples) samples); this panel does not raise the EDR "
+                + "headroom for HDR content, so the session keeps its SDR label",
+                category: .engine)
+        }
+        return observedHDR
         #else
         return false
         #endif
@@ -783,6 +1182,7 @@ final class DisplayCriteriaController {
             lastApplied = nil
             return
         }
+        logPanelReadout("before reset", window: window)
         window.avDisplayManager.preferredDisplayCriteria = nil
         didApply = false
         lastApplied = nil   // #133: a RESET returns the panel to default; the next apply must re-establish it.
@@ -793,6 +1193,37 @@ final class DisplayCriteriaController {
     // MARK: - Window resolution
 
     #if os(tvOS)
+    /// Emit the readout for one phase. Called before the engine writes or clears criteria, because a write
+    /// is what makes a later reading unattributable: the whole of #459 is a value read at the one moment it
+    /// has nothing to say. Deliberately NOT routed through `observeHeadroom`: a diagnostic that also latches
+    /// the HDR proof would change routing, and this round is meant to measure, not to decide.
+    private func logPanelReadout(_ phase: String, window: UIWindow) {
+        let manager = window.avDisplayManager
+        EngineLog.emit(
+            Self.panelReadoutLine(
+                phase: phase,
+                currentEDR: window.screen.currentEDRHeadroom,
+                potentialEDR: window.screen.potentialEDRHeadroom,
+                switching: manager.isDisplayModeSwitchInProgress,
+                matching: manager.isDisplayCriteriaMatchingEnabled,
+                hdrEligible: AVPlayer.eligibleForHDRPlayback,
+                proven: panelProvenToEngageHDR,
+                headroomLimit: Self.headroomLimitLabel(window.traitCollection)),
+            category: .engine)
+    }
+
+    /// The trait's own three states, spelled out rather than mapped to a Bool: "unspecified" is a real
+    /// answer here and folding it into either of the others would invent a claim.
+    private static func headroomLimitLabel(_ traits: UITraitCollection) -> String {
+        guard #available(tvOS 26.0, *) else { return "n/a" }
+        switch traits.hdrHeadroomUsageLimit {
+        case .active: return "active"
+        case .inactive: return "inactive"
+        case .unspecified: return "unspecified"
+        @unknown default: return "unknown"
+        }
+    }
+
     private func resolveWindow() -> UIWindow? {
         if let provider = Self.windowProvider, let win = provider() as? UIWindow {
             return win
@@ -921,6 +1352,7 @@ private final class DisplayLinkSampler: NSObject {
     private var firstTimestamp: CFTimeInterval = 0
     private var lastTimestamp: CFTimeInterval = 0
     private var nominalDuration: CFTimeInterval = 0
+    private var lastTickNanos: UInt64 = 0
     private(set) var tickCount = 0
 
     func start(screen: UIScreen) {
@@ -933,12 +1365,32 @@ private final class DisplayLinkSampler: NSObject {
         nominalDuration = link.targetTimestamp - link.timestamp
         if tickCount == 0 { firstTimestamp = link.timestamp }
         lastTimestamp = link.timestamp
+        lastTickNanos = DispatchTime.now().uptimeNanoseconds
         tickCount += 1
     }
 
-    func finish() -> (measured: Double, nominal: Double)? {
+    /// The rate of the mode the panel is running *now*, or nil when no tick has landed within
+    /// `freshWithinMs` (#449).
+    ///
+    /// Taken from a single tick's `targetTimestamp - timestamp` rather than averaged over a window, because
+    /// a window spanning a mode switch reports neither of the two rates it straddles. Staleness is not a
+    /// measurement failure here, it is the reading: a panel that is not putting frames on screen is what a
+    /// blanked HDMI re-sync looks like from inside the app, and the gate is supposed to keep waiting for it.
+    func nominalRateNow(freshWithinMs: Int) -> Double? {
+        guard tickCount > 0, nominalDuration > 0 else { return nil }
+        let age = DisplayCriteriaController.elapsedMs(
+            fromNanos: lastTickNanos, toNanos: DispatchTime.now().uptimeNanoseconds)
+        guard age <= freshWithinMs else { return nil }
+        return 1.0 / nominalDuration
+    }
+
+    func invalidate() {
         link?.invalidate()
         link = nil
+    }
+
+    func finish() -> (measured: Double, nominal: Double)? {
+        invalidate()
         guard tickCount >= 2, lastTimestamp > firstTimestamp else { return nil }
         return (
             measured: Double(tickCount - 1) / (lastTimestamp - firstTimestamp),

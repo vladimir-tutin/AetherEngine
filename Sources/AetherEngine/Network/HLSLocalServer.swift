@@ -18,7 +18,15 @@ protocol HLSSegmentProvider: AnyObject {
     func mediaSegment(at index: Int, onSlow: (@Sendable () -> Void)?) -> Data?
 
     /// Optional file URL for disk-backed segments (cache adopt path). Server streams file -> socket bypassing Foundation Data; sendfile(2) was tried but SIGSYS'd on tvOS sandbox.
+    /// Must name a file that exists: the server stats and opens it afterwards, and a URL whose file
+    /// has gone is answered with an error response rather than the bytes the bookkeeping promised.
     func mediaSegmentURL(at index: Int) -> URL?
+
+    /// AE#418 round 7: what became of a media-segment request. `delivered` is true once the whole
+    /// response went out; false when it was refused or the write failed on a client that hung up.
+    /// The axis is a statement about bytes in AVPlayer's timeline, so a placement composed from a
+    /// request needs to know whether that request was answered. Default ignores it.
+    func didServeMediaSegment(index: Int, delivered: Bool)
 
     var segmentCount: Int { get }
     func segmentDuration(at index: Int) -> Double
@@ -67,6 +75,11 @@ protocol HLSSegmentProvider: AnyObject {
     var masterHDCPLevel: String? { get }
     var masterClosedCaptions: String? { get }
 
+    /// AE#458: the muxed audio track's language (ISO 639-2/T) and display NAME for the master's
+    /// EXT-X-MEDIA:TYPE=AUDIO tag. Nil leaves the master without an audio group, which is what an
+    /// untagged source gets. A muxed rendition carries no URI: the audio is inside the variant.
+    var masterAudioRendition: (language: String, name: String)? { get }
+
     /// Native subtitle renditions (#15): one per text track, for the master EXT-X-MEDIA:TYPE=SUBTITLES tags
     /// and the /subs_{N} endpoints. Empty unless prepareNativeSubtitles is on and the cue stores are threaded.
     /// NAMEs must be unique within the group (duplicates collapse AVFoundation's legible options).
@@ -97,6 +110,24 @@ protocol HLSSegmentProvider: AnyObject {
     /// Same rationale as the live gate - AVPlayer treats an empty first playlist as a broken asset.
     func waitForSequentialStartupSegments(timeout: TimeInterval) -> Bool
 
+    /// AE#446 round 2: the live source has stopped and the consumer still has resident segments ahead
+    /// of it, so the served window is a finite asset until the source comes back. See
+    /// `VideoSegmentProvider.liveOutageEndlist` for why nothing short of ENDLIST keeps AVPlayer fetching.
+    var liveOutageEndlist: Bool { get }
+
+    /// AE#454: which segment a rejoin wants the NEXT item to start on, and how far into it. nil on
+    /// every build except the ones between an in-place rejoin swap and the item it placed running.
+    var liveRejoinStart: (segmentIndex: Int, secondsIntoSegment: Double)? { get }
+
+    /// AE#454 round 2: tell the provider what this build actually served for that placement, and from
+    /// which first segment, so the item's axis is a statement rather than a later reconstruction.
+    func noteServedLiveRejoinPlacement(timeOffset: Double, firstVisible: Int)
+
+    /// AE#446 round 5: tell the provider which segment this build listed first, so the item loading it
+    /// gets its axis from the manifest that placed it rather than from a later reconstruction. Every
+    /// live build, not only the ones that also carry a rejoin placement.
+    func noteServedLiveItemAxis(firstVisible: Int)
+
     /// Upper bound on how long a blocking reload may hold before the 503. Production providers derive
     /// it from the sealed TARGETDURATION (3 x TD, the HOLD-BACK depth) so a fastZap session (TD=2)
     /// times out in 6 s instead of 18 s — a hold that outlives AVPlayer's forward buffer guarantees
@@ -107,6 +138,7 @@ protocol HLSSegmentProvider: AnyObject {
 extension HLSSegmentProvider {
     func mediaSegment(at index: Int, onSlow: (@Sendable () -> Void)?) -> Data? { mediaSegment(at: index) }
     func mediaSegmentURL(at index: Int) -> URL? { nil }
+    func didServeMediaSegment(index: Int, delivered: Bool) {}
     var staticMasterPlaylistBody: String? { nil }
     var firstVisibleSegmentIndex: Int { 0 }
     func segmentIsDiscontinuous(at index: Int) -> Bool { false }
@@ -121,11 +153,15 @@ extension HLSSegmentProvider {
     var masterAverageBandwidth: Int? { nil }
     var masterHDCPLevel: String? { nil }
     var masterClosedCaptions: String? { nil }
+    var masterAudioRendition: (language: String, name: String)? { nil }
     var nativeSubtitleRenditions: [(ordinal: Int, language: String?, name: String, isForced: Bool)] { [] }
     var nativeSubtitleDefaultOrdinal: Int { 0 }
     var nativeSubtitleWholeProgram: Bool { false }
     func nativeSubtitleVTT(ordinal: Int, segmentIndex: Int) -> String? { nil }
     var liveTargetSegmentDuration: Double? { nil }
+    var liveRejoinStart: (segmentIndex: Int, secondsIntoSegment: Double)? { nil }
+    func noteServedLiveRejoinPlacement(timeOffset: Double, firstVisible: Int) {}
+    func noteServedLiveItemAxis(firstVisible: Int) {}
     var liveBlockingReloadEnabled: Bool { true }
     var liveTargetDurationFloorSeconds: Double? { nil }
     func liveTargetDurationSeconds(maxSegmentDuration: Double) -> Int {
@@ -139,6 +175,7 @@ extension HLSSegmentProvider {
     func waitForLiveSegment(index: Int, timeout: TimeInterval) -> Bool { true }
     func waitForSequentialStartupSegments(timeout: TimeInterval) -> Bool { true }
     var liveBlockingReloadHoldSeconds: TimeInterval { 18.0 }
+    var liveOutageEndlist: Bool { false }
     func notePlaylistBuild() -> (visibleCount: Int, firstVisible: Int, refreshCounter: Int, endlistAdded: Bool, discontinuitySequence: Int) {
         return (visibleCount: segmentCount, firstVisible: 0, refreshCounter: 0, endlistAdded: false, discontinuitySequence: 0)
     }
@@ -181,6 +218,29 @@ final class HLSLocalServer: @unchecked Sendable {
 
     // MARK: - Public state
 
+    /// Per-session capability token, first component of every path this server answers.
+    /// The listener binds 0.0.0.0 so an AirPlay receiver can reach it over the LAN (#86), which
+    /// also puts it in front of every other host on that network. The endpoint names are fixed,
+    /// so without this the ephemeral port is the only thing between a stranger's port scan and
+    /// the stream. It costs nothing to carry: playlist URIs are relative, so they resolve under
+    /// the prefix on their own, and only the three entry-point accessors below have to name it.
+    let pathToken: String = {
+        var bytes = [UInt8](repeating: 0, count: 16)
+        var generator = SystemRandomNumberGenerator()
+        for i in bytes.indices { bytes[i] = UInt8.random(in: UInt8.min...UInt8.max, using: &generator) }
+        return bytes.map { String(format: "%02x", $0) }.joined()
+    }()
+
+    /// The request path with the session token removed, or nil when the request does not carry it.
+    /// Static and internal so the check is unit-testable without a live socket.
+    static func pathAfterToken(_ token: String, in path: String) -> String? {
+        let prefix = "/" + token
+        guard path.hasPrefix(prefix) else { return nil }
+        let rest = String(path.dropFirst(prefix.count))
+        guard rest.hasPrefix("/") else { return nil }
+        return rest
+    }
+
     /// Kernel-assigned ephemeral port. Zero until start() succeeds.
     private(set) var port: UInt16 = 0
 
@@ -193,7 +253,7 @@ final class HLSLocalServer: @unchecked Sendable {
         // is still the playlist AVPlayer must open, or the injected renditions never reach media selection.
         let hasMaster = provider?.masterCodecs != nil || provider?.staticMasterPlaylistBody != nil
         let path = hasMaster ? "master.m3u8" : "media.m3u8"
-        return URL(string: "http://127.0.0.1:\(port)/\(path)")
+        return URL(string: "http://127.0.0.1:\(port)/\(pathToken)/\(path)")
     }
 
     /// Direct media.m3u8 URL, bypassing master-playlist variant selection (used when the DV/HDR handshake is unavailable so AVPlayer doesn't try to match a dvh1 master on an SDR panel).
@@ -201,7 +261,7 @@ final class HLSLocalServer: @unchecked Sendable {
         stateLock.lock()
         defer { stateLock.unlock() }
         guard port > 0 else { return nil }
-        return URL(string: "http://127.0.0.1:\(port)/media.m3u8")
+        return URL(string: "http://127.0.0.1:\(port)/\(pathToken)/media.m3u8")
     }
 
     /// HDR-preserving reduced master (#98): source VIDEO-RANGE kept, no SUPPLEMENTAL-CODECS
@@ -210,7 +270,7 @@ final class HLSLocalServer: @unchecked Sendable {
         stateLock.lock()
         defer { stateLock.unlock() }
         guard port > 0, provider?.masterCodecs != nil else { return nil }
-        return URL(string: "http://127.0.0.1:\(port)/master_hdr.m3u8")
+        return URL(string: "http://127.0.0.1:\(port)/\(pathToken)/master_hdr.m3u8")
     }
 
     /// Numeric address of the peer on an accepted connection, or nil if the socket is already gone (#227 diag).
@@ -336,24 +396,73 @@ final class HLSLocalServer: @unchecked Sendable {
 
     private let stateLock = NSLock()  // guards all mutable fields; never held across blocking syscalls
 
-    private let acceptQueue = DispatchQueue(
-        label: "com.aetherengine.hls.accept",
-        qos: .userInitiated
-    )
-    private let workQueue = DispatchQueue(
-        label: "com.aetherengine.hls.work",
-        qos: .userInitiated,
-        attributes: .concurrent
-    )
+    /// The accept loop and every connection handler run on threads this server owns, not on
+    /// dispatch queues. Both block by design: accept sits in a syscall for the server's whole life,
+    /// and a handler blocks in `UpstreamPump` while the origin feeds it. A queue hands that work a
+    /// GLOBAL POOL worker, and the pool hands out a worker only once one is free, so a process
+    /// whose pool workers are all in a blocking wait leaves a connection unserved for as long as
+    /// that lasts: the client then reads a dead server. Measured with 192 pool workers blocked, a
+    /// `DispatchQueue.global().async` block had not started after 35 s while a detached thread ran
+    /// in 3 ms. Same reason the pump owns its thread since AE#286.
+    static let maxConcurrentConnections = 32
+    private var liveConnectionThreads = 0
+
+    /// Audit NET-6: the listener has to answer the LAN while an AirPlay receiver fetches from it
+    /// (#86), and the session token is only read once a whole request head has arrived. So a peer
+    /// that is not loopback may hold at most this many of the slots, and the rest stay free for
+    /// the local player however many connections a LAN host opens.
+    static let maxNonLoopbackConnections = 24
+    private var liveNonLoopbackConnections = 0
+
+    /// Audit NET-6: a connection that has not yet presented this session's token has this long,
+    /// from accept, to deliver a whole request head. Without it a trickling or idle LAN peer holds
+    /// its slot for as long as it keeps sending a byte inside the per-recv timeout.
+    static let unauthenticatedHeadSeconds: TimeInterval = 10
+    /// Once a request's first byte has arrived, the rest of its head must follow within this long,
+    /// on a connection that already authenticated too. The idle wait before that byte stays at
+    /// `keepAliveIdleSeconds`, which AVPlayer's keep-alive gaps need.
+    static let requestHeadSeconds: TimeInterval = 10
+    static let keepAliveIdleSeconds: TimeInterval = 60
+
+    /// Audit NET-13: one line per failed accept, when the process is out of descriptors, is a busy
+    /// loop that floods the host's log ring. Failures back off and their line is rate limited.
+    private static let acceptFailureBackoffMicroseconds: useconds_t = 100_000
+    private var acceptFailureLog = LogThrottle(interval: 5)
+    private var refusalLog = LogThrottle(interval: 5)
 
     // MARK: - Init
 
     /// When set (e.g. `aether-engine://engine/`), segment URIs in the playlist are absolute custom-scheme URLs routed through AVAssetResourceLoader. Nil emits relative URIs for the aetherctl HTTP workflow.
     private let subResourceBaseURL: URL?
 
-    init(provider: HLSSegmentProvider, subResourceBaseURL: URL? = nil) {
+    /// AE#495: fetches a remote origin on this server's behalf. Mounted when a host has set
+    /// `EngineTLS.serverTrustEvaluator`, so the https handshake happens where that answer is
+    /// read instead of inside AVPlayer's own networking.
+    let relay: HLSOriginRelay?
+
+    /// A relay-only server has no provider: nothing here produces segments, every byte comes
+    /// from the origin, and the master is whatever the origin served.
+    init(provider: HLSSegmentProvider? = nil, subResourceBaseURL: URL? = nil,
+         relay: HLSOriginRelay? = nil,
+         unauthenticatedHeadSeconds: TimeInterval = HLSLocalServer.unauthenticatedHeadSeconds) {
         self.provider = provider
         self.subResourceBaseURL = subResourceBaseURL
+        self.relay = relay
+        self.unauthenticatedHeadDeadline = unauthenticatedHeadSeconds
+    }
+
+    private let unauthenticatedHeadDeadline: TimeInterval
+
+    /// Admits `origin` to the relay and returns the address standing in for it, for a player
+    /// pointed at the relay rather than at a provider's playlists. Nil before `start()` or with
+    /// no relay mounted.
+    func relayURL(for origin: URL) -> URL? {
+        guard let relay, relay.admit(origin) != nil else { return nil }
+        stateLock.lock()
+        let listeningPort = port
+        stateLock.unlock()
+        guard listeningPort > 0 else { return nil }
+        return relay.localURL(for: origin, port: listeningPort, token: pathToken)
     }
 
     // MARK: - Lifecycle
@@ -383,6 +492,10 @@ final class HLSLocalServer: @unchecked Sendable {
         // Bind all interfaces (not just loopback) so an AirPlay receiver can reach the stream over the LAN
         // via the device's WiFi IP (#86, DrHurt). Local playback still uses 127.0.0.1; the URL host is only
         // swapped to the LAN IP while external playback is active. Ephemeral port, serves the current stream only.
+        // Audit NET-6 kept this rather than binding loopback until AirPlay engages: the wireless edge reloads
+        // onto a new server, but a readiness-gate swap (`airPlayHostSwapped`) and a held edge re-read after a
+        // reload hand the LAN URL to the server already listening. LAN exposure is bounded instead by the
+        // head deadlines and the loopback reserve in the accept loop.
         addr.sin_addr.s_addr = inet_addr("0.0.0.0")
 
         let bindResult = withUnsafePointer(to: &addr) { ptr -> Int32 in
@@ -427,9 +540,10 @@ final class HLSLocalServer: @unchecked Sendable {
         EngineLog.emit("[HLSLocalServer] Listening on port \(assignedPort)",
                        category: .hlsServer)
 
-        acceptQueue.async { [weak self] in
-            self?.acceptLoop()
-        }
+        let accepter = Thread { [weak self] in self?.acceptLoop() }
+        accepter.name = "com.aetherengine.hls.accept"
+        accepter.qualityOfService = .userInitiated
+        accepter.start()
     }
 
     func stop() {
@@ -437,6 +551,7 @@ final class HLSLocalServer: @unchecked Sendable {
         shouldStop = true
         let fdToClose = listenFd
         listenFd = -1
+        let closingPort = port
         port = 0
         loggedMasterPlaylist = false
         loggedReducedMasterPlaylist = false
@@ -445,6 +560,11 @@ final class HLSLocalServer: @unchecked Sendable {
         let clients = clientFds
         clientFds.removeAll()
         stateLock.unlock()
+        // AE#597: the one line that says a listener went away. Without it a log cannot tell a
+        // server that was released from one that outlived its session on a port of its own.
+        EngineLog.emit(
+            "[HLSLocalServer] stop: port \(closingPort) released, \(clients.count) connection(s) "
+            + "shut down", category: .hlsServer)
 
         // shutdown() BEFORE close() on the listen fd: close releases the fd number while the accept loop may have captured it; a new session could recycle that number and the dying loop would accept on the new session's socket. shutdown() wakes the blocked accept without releasing the number.
         if fdToClose >= 0 {
@@ -487,38 +607,78 @@ final class HLSLocalServer: @unchecked Sendable {
                 if err == EINTR || err == EAGAIN || err == ECONNABORTED {
                     continue
                 }
-                EngineLog.emit("[HLSLocalServer] accept failed errno=\(err)",
-                               category: .hlsServer)
+                // EMFILE / ENFILE leave the connection in the backlog, so the next accept fails at
+                // once; without the pause this thread spins.
+                stateLock.lock()
+                let logLine = acceptFailureLog.admit(now: Self.uptimeSeconds())
+                stateLock.unlock()
+                if let suppressed = logLine {
+                    EngineLog.emit("[HLSLocalServer] accept failed errno=\(err)"
+                                   + (suppressed > 0 ? " (\(suppressed) more since the last line)" : "")
+                                   + ", backing off", category: .hlsServer)
+                }
+                usleep(Self.acceptFailureBackoffMicroseconds)
                 continue
             }
+            let isLoopbackPeer = clientAddr.sin_family == sa_family_t(AF_INET)
+                && (UInt32(bigEndian: clientAddr.sin_addr.s_addr) >> 24) == 127
 
             // SO_NOSIGPIPE on the accepted socket too, otherwise a
             // closed-peer send still raises SIGPIPE on iOS.
             var on: Int32 = 1
             _ = setsockopt(clientFd, SOL_SOCKET, SO_NOSIGPIPE, &on,
                            socklen_t(MemoryLayout<Int32>.size))
-            // 60s idle timeout. AVPlayer's typical inter-request gap
-            // is single-digit seconds; 60s is comfortable headroom.
-            var timeout = timeval(tv_sec: 60, tv_usec: 0)
-            _ = setsockopt(clientFd, SOL_SOCKET, SO_RCVTIMEO, &timeout,
-                           socklen_t(MemoryLayout<timeval>.size))
+            let acceptedAt = Self.uptimeSeconds()
 
             stateLock.lock()
-            clientFds.insert(clientFd)
+            // A thread per connection has no ceiling of its own, where the pool's 64 workers were
+            // one. AVPlayer keeps a handful open, so anything near this number is a client that
+            // has stopped making sense and gets the socket closed rather than a thread.
+            let atCapacity = liveConnectionThreads >= Self.maxConcurrentConnections
+                || (!isLoopbackPeer && liveNonLoopbackConnections >= Self.maxNonLoopbackConnections)
+            var refusalLine: Int?
+            if !atCapacity {
+                liveConnectionThreads += 1
+                if !isLoopbackPeer { liveNonLoopbackConnections += 1 }
+                clientFds.insert(clientFd)
+            } else {
+                refusalLine = refusalLog.admit(now: acceptedAt)
+            }
             stateLock.unlock()
+
+            if atCapacity {
+                if let suppressed = refusalLine {
+                    EngineLog.emit(
+                        "[HLSLocalServer] refusing fd=\(clientFd) (\(isLoopbackPeer ? "loopback" : "LAN") peer): "
+                        + "connection slots full"
+                        + (suppressed > 0 ? " (\(suppressed) more refused since the last line)" : ""),
+                        category: .hlsServer)
+                }
+                close(clientFd)
+                continue
+            }
 
             EngineLog.emit("[HLSLocalServer] conn opened fd=\(clientFd)",
                            category: .hlsServer, level: .verbose)
 
-            workQueue.async { [weak self] in
-                self?.handleConnection(clientFd)
+            let worker = Thread { [weak self] in
+                defer {
+                    self?.stateLock.lock()
+                    self?.liveConnectionThreads -= 1
+                    if !isLoopbackPeer { self?.liveNonLoopbackConnections -= 1 }
+                    self?.stateLock.unlock()
+                }
+                self?.handleConnection(clientFd, acceptedAt: acceptedAt)
             }
+            worker.name = "com.aetherengine.hls.conn.\(clientFd)"
+            worker.qualityOfService = .userInitiated
+            worker.start()
         }
     }
 
     // MARK: - Per-connection handler
 
-    private func handleConnection(_ fd: Int32) {
+    private func handleConnection(_ fd: Int32, acceptedAt: TimeInterval) {
         defer {
             stateLock.lock()
             clientFds.remove(fd)
@@ -529,23 +689,47 @@ final class HLSLocalServer: @unchecked Sendable {
         }
 
         // HTTP/1.1 keep-alive loop: AVPlayer reuses connections across segment fetches. Connection:close per-request tried 2026-05-20; Instruments showed it shifted the leak from libnetwork into a 570 MiB Malloc heap bucket instead (strictly worse; reverted).
+        // Every request that comes back true passed the session token check in `processRequest`,
+        // so after the first one the connection has shown it was handed a URL by this engine.
+        var authenticated = false
         while true {
             stateLock.lock()
             let stopping = shouldStop
             stateLock.unlock()
             if stopping { return }
-            guard let request = readHTTPRequest(fd) else { return }
+            let firstByteDeadline = authenticated
+                ? Self.uptimeSeconds() + Self.keepAliveIdleSeconds
+                : acceptedAt + unauthenticatedHeadDeadline
+            guard let request = readHTTPRequest(
+                fd, firstByteDeadline: firstByteDeadline, authenticated: authenticated) else { return }
             guard processRequest(request, on: fd) else { return }
+            authenticated = true
         }
     }
 
     /// Read until end of HTTP headers (`\r\n\r\n`). Returns the raw
     /// request bytes (headers only, no body, since we only accept
-    /// GET). Returns nil on EOF, error, or oversize.
-    private func readHTTPRequest(_ fd: Int32) -> Data? {
+    /// GET). Returns nil on EOF, error, oversize, or a missed deadline.
+    ///
+    /// The deadlines are totals rather than per-recv timeouts (audit NET-6): the first byte must
+    /// arrive by `firstByteDeadline`, and the whole head within `requestHeadSeconds` of it, and an
+    /// unauthenticated connection also by `firstByteDeadline`. A peer sending one byte a minute
+    /// used to keep a slot for as long as the head had room.
+    private func readHTTPRequest(_ fd: Int32, firstByteDeadline: TimeInterval,
+                                 authenticated: Bool) -> Data? {
         var buffer = Data()
         var chunk = [UInt8](repeating: 0, count: 4096)
+        var deadline = firstByteDeadline
         while true {
+            let remaining = deadline - Self.uptimeSeconds()
+            guard remaining > 0, Self.setReceiveTimeout(fd, seconds: remaining) else {
+                // A stranger that never finished a head is expected noise on a LAN listener, and
+                // one line each would let it scroll the host's log ring.
+                EngineLog.emit("[HLSLocalServer] request head deadline passed fd=\(fd) bytes=\(buffer.count)"
+                               + (authenticated ? "" : " (connection never authenticated)"),
+                               category: .hlsServer, level: authenticated ? .info : .verbose)
+                return nil
+            }
             let n = chunk.withUnsafeMutableBufferPointer { ptr -> Int in
                 recv(fd, ptr.baseAddress, ptr.count, 0)
             }
@@ -560,12 +744,15 @@ final class HLSLocalServer: @unchecked Sendable {
                 if err == EINTR { continue }
                 if err == EAGAIN || err == EWOULDBLOCK {
                     EngineLog.emit("[HLSLocalServer] recv timeout fd=\(fd)",
-                                   category: .hlsServer)
+                                   category: .hlsServer, level: authenticated ? .info : .verbose)
                     return nil
                 }
                 EngineLog.emit("[HLSLocalServer] recv error fd=\(fd) errno=\(err)",
                                category: .hlsServer)
                 return nil
+            }
+            if buffer.isEmpty {
+                deadline = min(deadline, Self.uptimeSeconds() + Self.requestHeadSeconds)
             }
             buffer.append(chunk, count: n)
             if let end = findHeadersTerminator(buffer) {
@@ -577,6 +764,18 @@ final class HLSLocalServer: @unchecked Sendable {
                 return nil
             }
         }
+    }
+
+    private static func setReceiveTimeout(_ fd: Int32, seconds: TimeInterval) -> Bool {
+        let whole = Int(seconds)
+        var timeout = timeval(
+            tv_sec: whole, tv_usec: Int32(max(1, (seconds - Double(whole)) * 1_000_000)))
+        return setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout,
+                          socklen_t(MemoryLayout<timeval>.size)) == 0
+    }
+
+    private static func uptimeSeconds() -> TimeInterval {
+        Double(clock_gettime_nsec_np(CLOCK_UPTIME_RAW)) / 1_000_000_000
     }
 
     private func findHeadersTerminator(_ buf: Data) -> Int? {
@@ -622,10 +821,22 @@ final class HLSLocalServer: @unchecked Sendable {
             path = rawTarget
             query = ""
         }
-        let normalizedPath = (path == "/audio.m3u8") ? "/media.m3u8" : path
+        // Reject anything that does not carry this session's token before it reaches the router.
+        // The listener is reachable from the whole LAN, so an unprefixed request is a scan or a
+        // stale URL, never AVPlayer following a playlist we handed out.
+        guard let routePath = Self.pathAfterToken(pathToken, in: path) else {
+            EngineLog.emit("[HLSLocalServer] rejected request without a valid session token: \(firstLine)",
+                           category: .hlsServer)
+            _ = send404(fd: fd, path: path, reason: "bad session token")
+            return false
+        }
+        let normalizedPath = (routePath == "/audio.m3u8") ? "/media.m3u8" : routePath
 
         // #50 diag: promoted to .info so the host mirror names the failing path without a verbose build. Revert once #50 is root-caused.
-        EngineLog.emit("[HLSLocalServer] \(firstLine)", category: .hlsServer)
+        // AE#446: the fd is what says whether a blocking-reload hold is parking the connection the
+        // next segment request needs. Same fd on both, and the segment could not be read until the
+        // hold returned; different fds, and the client chose not to fetch.
+        EngineLog.emit("[HLSLocalServer] \(firstLine) fd=\(fd)", category: .hlsServer)
         // #227 diag: name each distinct client once, so an AirPlay session shows whether the receiver fetches
         // for itself (its own LAN address appears) or the sender pulls everything (only 127.0.0.1 / own IP).
         if let peer = Self.peerAddress(of: fd) {
@@ -648,6 +859,49 @@ final class HLSLocalServer: @unchecked Sendable {
             // Range / capability header that explains the 404. Revert with the
             // arrival-line promotion above once #50 is root-caused.
             EngineLog.emit("[HLSLocalServer] first request headers fd=\(fd): \(headers)", category: .hlsServer)  // #50 diag: .info, revert post-root-cause
+        }
+
+        if normalizedPath == HLSOriginRelay.route {
+            guard let relay else {
+                return send404(fd: fd, path: normalizedPath, reason: "no relay mounted")
+            }
+            stateLock.lock()
+            let listeningPort = port
+            stateLock.unlock()
+            let headerLines = Array(text.components(separatedBy: "\r\n").dropFirst())
+            // The media body is written from here as it arrives rather than after it has all
+            // landed: buffering a segment puts its whole download in front of the player's first
+            // byte and hands AVPlayer's throughput estimate a loopback burst to pick the next
+            // rendition from.
+            let sink = HLSOriginRelay.Sink(
+                head: { [weak self] status, contentType, contentRange, contentLength in
+                    guard let self else { return false }
+                    let header = Self.relayResponseHeader(
+                        status: status, contentType: contentType, contentRange: contentRange,
+                        contentLength: contentLength)
+                    EngineLog.emit(
+                        "[HLSLocalServer] -> \(status) relay stream bytes=\(contentLength) "
+                            + "type=\(contentType)", category: .hlsServer, level: .verbose)
+                    return self.writeAll(fd: fd, data: Data(header.utf8),
+                                         path: "\(normalizedPath) [header]")
+                },
+                body: { [weak self] chunk in
+                    guard let self else { return false }
+                    return self.writeAll(fd: fd, data: chunk, path: normalizedPath)
+                })
+            switch relay.respond(
+                query: query,
+                host: Self.requestHeader(named: "host", in: headerLines),
+                range: Self.requestHeader(named: "range", in: headerLines),
+                port: listeningPort, token: pathToken, sink: sink)
+            {
+            case nil:
+                return send404(fd: fd, path: normalizedPath, reason: "relay names no origin")
+            case .answer(let answer):
+                return sendRelay(fd: fd, path: normalizedPath, answer: answer)
+            case .streamed(let ok):
+                return ok
+            }
         }
 
         switch normalizedPath {
@@ -785,11 +1039,29 @@ final class HLSLocalServer: @unchecked Sendable {
                 stateLock.lock(); servedMediaBytes = true; stateLock.unlock()
                 let indexStr = normalizedPath.dropFirst(4).dropLast(4)
                 if let index = Int(indexStr), index >= 0 {
+                    // AE#418 round 7: every exit from this branch says what became of the request, so
+                    // a placement composed from it can tell "not delivered yet" from "never arriving".
+                    func delivered(_ ok: Bool) -> Bool {
+                        provider?.didServeMediaSegment(index: index, delivered: ok)
+                        return ok
+                    }
+                    func refused(_ responseWritten: Bool) -> Bool {
+                        provider?.didServeMediaSegment(index: index, delivered: false)
+                        return responseWritten
+                    }
                     // File-backed fast path: stream page cache -> socket without Data materialization.
                     if let url = provider?.mediaSegmentURL(at: index) {
-                        return send200File(fd: fd, path: normalizedPath,
-                                            fileURL: url,
-                                            contentType: "video/mp4")
+                        let outcome = send200File(fd: fd, path: normalizedPath,
+                                                  fileURL: url,
+                                                  contentType: "video/mp4",
+                                                  segmentIndex: index)
+                        // A cache entry can outlive its file, and that answer is a retriable 503: the
+                        // request is not answered yet, so it says nothing about the placement.
+                        switch outcome.body {
+                        case .segment: return delivered(outcome.writeSucceeded)
+                        case .refusal: return refused(outcome.writeSucceeded)
+                        case .retry: return outcome.writeSucceeded
+                        }
                     }
                     // #93 round 3: a serve outliving the provider's slow threshold (wedge-window
                     // restart, 25-50 s worst case) emits response headers NOW as a chunked
@@ -814,13 +1086,13 @@ final class HLSLocalServer: @unchecked Sendable {
                                 "[HLSLocalServer] seg\(index): early-header serve missed; "
                                 + "closing connection for AVPlayer retry",
                                 category: .hlsServer)
-                            return false
+                            return refused(false)
                         }
-                        return sendChunkedBody(fd: fd, path: normalizedPath, data: data)
+                        return delivered(sendChunkedBody(fd: fd, path: normalizedPath, data: data))
                     }
                     if let data, !data.isEmpty {
-                        return send200(fd: fd, path: normalizedPath, data: data,
-                                       contentType: "video/mp4")
+                        return delivered(send200(fd: fd, path: normalizedPath, data: data,
+                                                 contentType: "video/mp4"))
                     }
                     let providerCount = provider?.segmentCount ?? -1
                     let reason = "segment[\(index)] empty (segmentCount=\(providerCount))"
@@ -828,11 +1100,13 @@ final class HLSLocalServer: @unchecked Sendable {
                         index: index, segmentCount: providerCount, hasData: false) {
                     case .serve:
                         // Unreachable: hasData is false here.
-                        return send404(fd: fd, path: normalizedPath, reason: reason)
+                        return refused(send404(fd: fd, path: normalizedPath, reason: reason))
                     case .retryLater:
+                        // A 503 is retriable, so the request is not answered yet; the placement waits
+                        // for the retry rather than concluding from it.
                         return send503(fd: fd, path: normalizedPath, reason: reason)
                     case .notFound:
-                        return send404(fd: fd, path: normalizedPath, reason: reason)
+                        return refused(send404(fd: fd, path: normalizedPath, reason: reason))
                     }
                 }
                 return send404(fd: fd, path: normalizedPath,
@@ -924,11 +1198,28 @@ final class HLSLocalServer: @unchecked Sendable {
         return writeAll(fd: fd, data: data, path: path)
     }
 
-    private func send200File(fd: Int32, path: String, fileURL: URL, contentType: String) -> Bool {
+    /// What a file-backed serve answered with, alongside whether the write went through. AE#418
+    /// round 7 needs the two apart: a 503 for a cache entry whose file is gone is a request still
+    /// waiting for its retry, and a write that succeeded on it delivered no segment.
+    enum FileServeBody { case segment, refusal, retry }
+
+    private func send200File(fd: Int32, path: String, fileURL: URL, contentType: String,
+                             segmentIndex: Int? = nil) -> (body: FileServeBody, writeSucceeded: Bool) {
         let fsAttrs = try? FileManager.default.attributesOfItem(atPath: fileURL.path)
         let fileSize = (fsAttrs?[.size] as? Int) ?? 0
         if fileSize == 0 {
-            return send404(fd: fd, path: path, reason: "file \(fileURL.lastPathComponent) missing or empty")
+            let reason = "file \(fileURL.lastPathComponent) missing or empty"
+            // #50 / AE#451: the in-range-is-never-404 rule belongs to the index, not to the path
+            // that answers it. A cache entry can outlive its file (a sibling session's stale-dir
+            // sweep, the OS reclaiming tmp), and a 404 on an in-range VOD segment is terminal for
+            // AVPlayer, where a 503 lets the producer make it again.
+            if let segmentIndex,
+               Self.classifySegmentResponse(index: segmentIndex,
+                                            segmentCount: provider?.segmentCount ?? -1,
+                                            hasData: false) == .retryLater {
+                return (.retry, send503(fd: fd, path: path, reason: reason))
+            }
+            return (.refusal, send404(fd: fd, path: path, reason: reason))
         }
 
         let headerData = Self.responseHeader(status: "200 OK", contentLength: fileSize, contentType: contentType)
@@ -937,10 +1228,76 @@ final class HLSLocalServer: @unchecked Sendable {
                        category: .hlsServer, level: .verbose)
 
         guard writeAll(fd: fd, data: headerData, path: "\(path) [header]") else {
+            return (.segment, false)
+        }
+        return (.segment, streamFileToSocket(fileURL: fileURL, socketFd: fd, path: path,
+                                             expectedLength: fileSize))
+    }
+
+    static func requestHeader(named name: String, in lines: [String]) -> String? {
+        let wanted = name.lowercased() + ":"
+        for line in lines where line.lowercased().hasPrefix(wanted) {
+            return line.dropFirst(wanted.count).trimmingCharacters(in: .whitespaces)
+        }
+        return nil
+    }
+
+    /// Writes a relayed answer. Separate from `send200` because this is the only path that
+    /// passes a status through from somewhere else and the only one that answers 206, which
+    /// a ranged segment fetch upstream comes back as.
+    private func sendRelay(fd: Int32, path: String, answer: HLSOriginRelay.Response) -> Bool {
+        let header = Self.relayResponseHeader(
+            status: answer.status, contentType: answer.contentType,
+            contentRange: answer.contentRange, contentLength: answer.body.count)
+
+        EngineLog.emit(
+            "[HLSLocalServer] -> \(answer.status) relay bytes=\(answer.body.count) "
+                + "type=\(answer.contentType)", category: .hlsServer, level: .verbose)
+        guard writeAll(fd: fd, data: Data(header.utf8), path: "\(path) [header]") else {
             return false
         }
-        return streamFileToSocket(fileURL: fileURL, socketFd: fd, path: path,
-                           expectedLength: fileSize)
+        return answer.body.isEmpty ? true : writeAll(fd: fd, data: answer.body, path: path)
+    }
+
+    /// The response head for a relayed answer, whether it is written whole or streamed. One writer,
+    /// because a streamed answer states its length before the body exists and the two framings have
+    /// to agree.
+    static func relayResponseHeader(status: Int, contentType: String, contentRange: String?,
+                                    contentLength: Int) -> String {
+        var header = "HTTP/1.1 \(status) \(reasonPhrase(status))\r\n"
+        header += "Content-Length: \(contentLength)\r\n"
+        header += "Content-Type: \(headerValue(contentType))\r\n"
+        if let contentRange {
+            header += "Content-Range: \(headerValue(contentRange))\r\n"
+        }
+        header += "Accept-Ranges: bytes\r\n"
+        header += "Cache-Control: no-cache\r\n"
+        header += "Connection: keep-alive\r\n\r\n"
+        return header
+    }
+
+    /// A header value written from somewhere else, made safe to concatenate into a response.
+    ///
+    /// Every other writer here builds its values itself; the relay mirrors what an origin sent.
+    /// A CR or LF inside one of those ends the header early and the rest of the value is read as
+    /// the next header, or as the start of the body, so an origin could write a second response
+    /// into this one. Control characters go, and the value is bounded.
+    static func headerValue(_ raw: String) -> String {
+        let cleaned = raw.unicodeScalars.filter { $0.value >= 0x20 && $0.value != 0x7F }
+        return String(String.UnicodeScalarView(cleaned.prefix(512)))
+    }
+
+    static func reasonPhrase(_ status: Int) -> String {
+        switch status {
+        case 200: return "OK"
+        case 206: return "Partial Content"
+        case 400: return "Bad Request"
+        case 403: return "Forbidden"
+        case 404: return "Not Found"
+        case 416: return "Range Not Satisfiable"
+        case 502: return "Bad Gateway"
+        default: return "Status \(status)"
+        }
     }
 
     private func send404(fd: Int32, path: String, reason: String) -> Bool {
@@ -1147,9 +1504,26 @@ final class HLSLocalServer: @unchecked Sendable {
         if let hdcp = provider.masterHDCPLevel {
             streamInfAttrs.append("HDCP-LEVEL=\(hdcp)")
         }
+        // AE#458: the audio is muxed into the variant, so its rendition carries no URI (RFC 8216 4.3.4.2.1).
+        // That tag is the ONLY place AVFoundation reads an audio language from on an HLS asset: measured on
+        // macOS 26, an fMP4 whose mdhd reads "deu" still reports languageCode=nil and builds no audible
+        // selection group at all, so every UI over that group (AVKit's audio menu) shows "Not Specified".
+        // MP4SegmentMuxer writes the mdhd too, but that is not what fixes the label.
+        let audioRendition = provider.masterAudioRendition
+        if audioRendition != nil {
+            streamInfAttrs.append("AUDIO=\"aud\"")
+        }
         if let cc = provider.masterClosedCaptions {
             streamInfAttrs.append("CLOSED-CAPTIONS=\(cc)")
         }
+        if let audio = audioRendition {
+            let audioAttrs = [
+                "TYPE=AUDIO", "GROUP-ID=\"aud\"", "NAME=\"\(audio.name)\"",
+                "LANGUAGE=\"\(audio.language)\"", "DEFAULT=YES", "AUTOSELECT=YES",
+            ]
+            lines.append("#EXT-X-MEDIA:\(audioAttrs.joined(separator: ","))")
+        }
+
         // #15: native WebVTT subtitle renditions (separate from the A/V variant; in-band timed text is
         // non-conformant for HLS). Orthogonal to the video VIDEO-RANGE/CODECS attributes.
         // Sodalite#32: DEFAULT=NO,AUTOSELECT=NO so AVKit never auto-selects a subtitle rendition in fullscreen
@@ -1200,7 +1574,9 @@ final class HLSLocalServer: @unchecked Sendable {
             var total = 0.0
             for i in firstVisible..<count { total += provider.segmentDuration(at: i) }
             var lines: [String] = ["#EXTM3U", "#EXT-X-VERSION:7"]
-            lines.append("#EXT-X-TARGETDURATION:\(max(1, Int(ceil(total))))")
+            let wholeProgramTarget = LiveEdgePolicy.targetDurationSeconds(
+                maxSegmentDuration: total, cutTargetSeconds: nil, cadenceFloorSeconds: nil)
+            lines.append("#EXT-X-TARGETDURATION:\(wholeProgramTarget)")
             lines.append("#EXT-X-MEDIA-SEQUENCE:0")
             lines.append("#EXT-X-PLAYLIST-TYPE:VOD")
             // No trailing comma on EXTINF: the proven-working whole-file sideload omits it ("seems to break it"
@@ -1211,19 +1587,27 @@ final class HLSLocalServer: @unchecked Sendable {
             return lines.joined(separator: "\n") + "\n"
         }
         let typeIsEvent = (provider.playlistType == .event && !snapshot.endlistAdded)
-        let typeIsLive = (provider.playlistType == .live && !snapshot.endlistAdded)
+        // AE#446 round 2: a rendition has to end with the video playlist it belongs to, or AVPlayer
+        // keeps reloading a live subtitle track beside a finished asset.
+        let liveOutage = (provider.playlistType == .live && !snapshot.endlistAdded
+                          && provider.liveOutageEndlist)
+        let typeIsLive = (provider.playlistType == .live && !snapshot.endlistAdded && !liveOutage)
 
         var maxDuration: Double = 0
         for i in firstVisible..<count {
             maxDuration = max(maxDuration, provider.segmentDuration(at: i))
         }
-        var targetDuration = Int(ceil(max(1.0, maxDuration)))
-        if typeIsLive, let liveTarget = provider.liveTargetSegmentDuration {
-            targetDuration = max(targetDuration, Int(ceil(liveTarget * 1.5)))
-        }
-        if typeIsLive, let cadenceFloor = provider.liveTargetDurationFloorSeconds {
-            targetDuration = max(targetDuration, Int(ceil(cadenceFloor)))
-        }
+        // AE#447 follow-up: the SEALED value, the same one the video playlist carries. This rebuilt the
+        // derivation by hand instead, so it read the live cadence floor on every render and could hand a
+        // subtitle rendition a TARGETDURATION that grew mid-session. RFC 8216 forbids that in any Media
+        // Playlist, and AE#209 measured the cost on the video one: an item that reached readyToPlay,
+        // showed a first frame, and then sat at `waitingToPlay` at time zero for the rest of the session.
+        // A rendition is a Media Playlist like any other, and it is built from this provider's own
+        // segments, so the two values are the same number and may as well come from the same place.
+        let targetDuration = (typeIsLive || liveOutage)
+            ? provider.liveTargetDurationSeconds(maxSegmentDuration: maxDuration)
+            : LiveEdgePolicy.targetDurationSeconds(maxSegmentDuration: maxDuration,
+                                                   cutTargetSeconds: nil, cadenceFloorSeconds: nil)
 
         var lines: [String] = []
         lines.append("#EXTM3U")
@@ -1245,7 +1629,7 @@ final class HLSLocalServer: @unchecked Sendable {
             lines.append("#EXTINF:\(String(format: "%.3f", dur)),")
             lines.append("subs_\(ordinal)_\(i).vtt")
         }
-        if !typeIsLive && (snapshot.endlistAdded || !typeIsEvent) {
+        if !typeIsLive && (snapshot.endlistAdded || !typeIsEvent || liveOutage) {
             lines.append("#EXT-X-ENDLIST")
         }
         return lines.joined(separator: "\n") + "\n"
@@ -1274,8 +1658,14 @@ final class HLSLocalServer: @unchecked Sendable {
         let count = snapshot.visibleCount
         let firstVisible = min(snapshot.firstVisible, count)
         let typeIsEvent = (provider.playlistType == .event && !snapshot.endlistAdded)
+        // AE#446 round 2: a live source that has stopped delivering, with a consumer still holding
+        // resident segments ahead of it. The window is then a finite asset and is served as one:
+        // ENDLIST is the only thing measured to keep AVPlayer fetching a playlist whose tail has
+        // stopped moving (a changed byte does not, and neither does a changed MEDIA-SEQUENCE).
+        let liveOutage = (provider.playlistType == .live && !snapshot.endlistAdded
+                          && provider.liveOutageEndlist)
         // Sliding live: no PLAYLIST-TYPE tag and no ENDLIST (EVENT forbids removal; VOD implies finished asset).
-        let typeIsLive = (provider.playlistType == .live && !snapshot.endlistAdded)
+        let typeIsLive = (provider.playlistType == .live && !snapshot.endlistAdded && !liveOutage)
 
         // TARGETDURATION must be >= every EXTINF (HLS spec). For live it is also floored by ceil(1.5 x cut
         // target) (widens AVPlayer's unchanged-playlist patience, anti -12888: (1) empty first manifest,
@@ -1286,7 +1676,7 @@ final class HLSLocalServer: @unchecked Sendable {
         for i in firstVisible..<count {
             maxDuration = max(maxDuration, provider.segmentDuration(at: i))
         }
-        let targetDuration = typeIsLive
+        let targetDuration = (typeIsLive || liveOutage)
             ? provider.liveTargetDurationSeconds(maxSegmentDuration: maxDuration)
             : LiveEdgePolicy.targetDurationSeconds(
                 maxSegmentDuration: maxDuration,
@@ -1314,16 +1704,56 @@ final class HLSLocalServer: @unchecked Sendable {
         }
         lines.append("#EXT-X-TARGETDURATION:\(targetDuration)")
         lines.append("#EXT-X-MEDIA-SEQUENCE:\(firstVisible)")
-        if typeIsLive {
+        // AE#446 round 5: the axis this build places the item on, stated where it is known exactly.
+        // MEDIA-SEQUENCE above is the same fact addressed by index; this records the seconds it stands
+        // for, and only an item's FIRST playlist decides (the latch is armed once per item attach).
+        if typeIsLive || liveOutage {
+            provider.noteServedLiveItemAxis(firstVisible: firstVisible)
+        }
+        if typeIsLive || liveOutage {
             // RFC 8216 §6.2.2: EXT-X-DISCONTINUITY-SEQUENCE must advance when discontinuity-tagged segments slide out of the window; omitting it shifts AVPlayer's discontinuity numbering one window after each program boundary.
             lines.append("#EXT-X-DISCONTINUITY-SEQUENCE:\(snapshot.discontinuitySequence)")
         }
+        // AE#454: a rejoin's placement, in the manifest the fresh item loads rather than as a seek
+        // 150 ms after it already started playing somewhere else. Recomputed on every build, so a
+        // window that slid between arming and this fetch still names the same content.
+        if typeIsLive, let rejoin = provider.liveRejoinStart,
+           let offset = LiveEdgePolicy.rejoinStartTimeOffset(
+               segmentIndex: rejoin.segmentIndex,
+               secondsIntoSegment: rejoin.secondsIntoSegment,
+               firstVisible: firstVisible,
+               visibleCount: count,
+               targetDuration: targetDuration,
+               segmentDuration: { provider.segmentDuration(at: $0) }) {
+            let tag = "#EXT-X-START:TIME-OFFSET=\(String(format: "%.3f", offset)),PRECISE=YES"
+            lines.append(tag)
+            // The served value, so a field log can say whether the placement was actually offered and
+            // at what depth. Bounded by the arm: this is off on every build except the ones between a
+            // rejoin swap and the item it placed running.
+            EngineLog.emit(
+                "[HLSLocalServer] #454 serving \(tag) for segment \(rejoin.segmentIndex) + "
+                + "\(String(format: "%.2f", rejoin.secondsIntoSegment))s, \(count - firstVisible) "
+                + "segment(s) listed from seg\(firstVisible)",
+                category: .session)
+            // AE#454 round 2: the same build knows the axis it just placed the item on, which is where
+            // the playlist it served begins. Stating it is the whole fix; measuring it afterwards is
+            // what put a correctly placed item through a correcting seek.
+            provider.noteServedLiveRejoinPlacement(timeOffset: offset, firstVisible: firstVisible)
+        }
         if typeIsLive {
-            // Refresh counter keeps consecutive polls distinct so AVPlayer's unchanged-playlist patience (-12888) doesn't fire on a quiet window.
+            // Refresh counter keeps consecutive polls byte-distinct, which is worth having against any
+            // cache in the path. It is NOT what keeps AVPlayer's unchanged-playlist patience (-12888)
+            // from firing, though it was added believing so: measured on the harness, two polls 4 s
+            // apart differing in this line alone still drew -12888 on every reload, because the
+            // unchanged test reads the parsed playlist and skips a tag AVPlayer does not know. The
+            // window is what it reads; see VideoSegmentProvider.stalledWindowFirstVisible (AE#446).
             lines.append("#EXT-X-SODALITE-REFRESH:\(snapshot.refreshCounter)")
         } else if typeIsEvent {
             lines.append("#EXT-X-PLAYLIST-TYPE:EVENT")
             lines.append("#EXT-X-SODALITE-REFRESH:\(snapshot.refreshCounter)")
+        } else if liveOutage {
+            // No PLAYLIST-TYPE: the session may still come back, and VOD is a claim about the asset
+            // rather than about this window. ENDLIST alone is what stops the reload loop.
         } else {
             // EXT-X-PLAYLIST-TYPE:VOD lets AVPlayer prune fetched segments past the buffer-behind window; without it RSS grows linearly with segment count for the whole playback.
             lines.append("#EXT-X-PLAYLIST-TYPE:VOD")
@@ -1364,8 +1794,9 @@ final class HLSLocalServer: @unchecked Sendable {
             lines.append("#EXTINF:\(String(format: "%.3f", dur)),")
             lines.append(segURI(i))
         }
-        // ENDLIST for VOD/completed EVENT; never for a sliding live playlist (AVPlayer must keep re-polling).
-        if !typeIsLive && (snapshot.endlistAdded || !typeIsEvent) {
+        // ENDLIST for VOD/completed EVENT, and for a live window whose source has stopped (AE#446);
+        // never for a sliding live playlist that is still gaining segments (AVPlayer must keep re-polling).
+        if !typeIsLive && (snapshot.endlistAdded || !typeIsEvent || liveOutage) {
             lines.append("#EXT-X-ENDLIST")
         }
         return lines.joined(separator: "\n") + "\n"
@@ -1390,4 +1821,29 @@ enum HLSLocalServerError: Error, CustomStringConvertible, LocalizedError {
     }
 
     var errorDescription: String? { description }
+}
+
+/// Lets one line through per `interval` and counts the ones it held back, so a condition that
+/// repeats per connection or per accept costs the log one line with a tally instead of one each.
+/// Not thread safe; the owner serializes it.
+struct LogThrottle {
+    let interval: TimeInterval
+    private var lastEmitted: TimeInterval?
+    private var suppressed = 0
+
+    init(interval: TimeInterval) {
+        self.interval = interval
+    }
+
+    /// The number of lines suppressed since the last one that went out, when this one may go
+    /// out; nil when it is to be dropped.
+    mutating func admit(now: TimeInterval) -> Int? {
+        if let lastEmitted, now - lastEmitted < interval {
+            suppressed += 1
+            return nil
+        }
+        lastEmitted = now
+        defer { suppressed = 0 }
+        return suppressed
+    }
 }

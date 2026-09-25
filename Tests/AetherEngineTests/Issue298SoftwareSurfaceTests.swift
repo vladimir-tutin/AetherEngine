@@ -48,6 +48,7 @@ struct Issue298SoftwareSurfaceTests {
     }
 
     @Test("untimed frames never reach the display queue and are counted")
+    @MainActor
     func untimedFramesDropped() throws {
         let renderer = SampleBufferRenderer()
         let pixelBuffer = try Self.makePixelBuffer()
@@ -62,6 +63,7 @@ struct Issue298SoftwareSurfaceTests {
     }
 
     @Test("timed frames still reach the display queue")
+    @MainActor
     func timedFramesPass() throws {
         let renderer = SampleBufferRenderer()
         let pixelBuffer = try Self.makePixelBuffer()
@@ -80,6 +82,7 @@ struct Issue298SoftwareSurfaceTests {
     /// comparison against NaN is false, so an untimed frame used to be appended past frames it
     /// should have preceded, reordering its neighbours as well.
     @Test("ordering of timed frames survives untimed ones in the same run")
+    @MainActor
     func orderingSurvivesUntimedFrames() throws {
         let renderer = SampleBufferRenderer()
         let pixelBuffer = try Self.makePixelBuffer()

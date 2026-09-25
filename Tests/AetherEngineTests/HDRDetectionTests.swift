@@ -1,5 +1,5 @@
 import Testing
-import Libavutil
+import AetherLibavutil
 @testable import AetherEngine
 
 struct HDRDetectionTests {

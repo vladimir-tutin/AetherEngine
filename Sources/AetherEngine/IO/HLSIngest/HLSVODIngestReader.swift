@@ -64,7 +64,9 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
             configuration.timeoutIntervalForResource = 45
             configuration.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
             configuration.urlCache = nil
-            self.session = URLSession(configuration: configuration)
+            self.session = URLSession(
+                configuration: configuration, delegate: EngineTLS.sessionDelegate,
+                delegateQueue: nil)
             ownsSession = true
         }
     }
@@ -497,22 +499,24 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
         )
     }
 
-    private func makeRequest(_ url: URL) -> URLRequest {
+    /// Credentials only where the host's playlist is (audit NET-7).
+    func makeRequest(_ url: URL) -> URLRequest {
         var request = URLRequest(url: url)
-        for (field, value) in httpHeaders {
+        for (field, value) in RedirectHeaderPolicy.scoped(
+            httpHeaders, grantedFor: playlistURL, sentTo: url) {
             request.setValue(value, forHTTPHeaderField: field)
         }
         return request
     }
 
     private func fetchPlaylist(_ url: URL) async throws -> (HLSPlaylist, URL) {
-        let (data, response) = try await session.data(for: makeRequest(url))
+        let (data, response) = try await BoundedPlaylistFetch.data(
+            for: makeRequest(url), session: session, limit: Self.maximumPlaylistBytes)
         let status = (response as? HTTPURLResponse)?.statusCode ?? -1
         guard (200..<300).contains(status) else {
             throw HLSIngestError.playlistUnreachable(status: status)
         }
-        guard data.count <= Self.maximumPlaylistBytes,
-              let text = String(data: data, encoding: .utf8) else {
+        guard let text = String(data: data, encoding: .utf8) else {
             throw HLSIngestError.playlistInvalid(reason: "playlist is not bounded UTF-8")
         }
         return (try HLSPlaylistParser.parse(text), response.url ?? url)
@@ -532,7 +536,7 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
     private func probeCarriage(_ url: URL) async throws -> MPEGTransportStreamCodecProbe.Verdict {
         try await HLSCarriageProbe.classifySegmentHead(
             url: url,
-            httpHeaders: httpHeaders,
+            httpHeaders: RedirectHeaderPolicy.scoped(httpHeaders, grantedFor: playlistURL, sentTo: url),
             session: session
         )
     }

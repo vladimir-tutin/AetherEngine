@@ -2,8 +2,8 @@ import Foundation
 
 // Phase D: selection-armed worker feeding a bitmap track's native WebVTT rendition with
 // OCR-recognized text cues, so PGS/DVB/DVD subtitles survive PiP / AirPlay / external display
-// on the native path. Packet source is the session SubtitlePacketStore (#112 harvest); decode
-// runs on the MainActor tick (overlay-drainer cost class), Vision runs in the detached task.
+// on the native path. Packet source is the session SubtitlePacketStore (#112 harvest); the tick
+// plans and resolves on the MainActor, decodes off it (AE#628), and Vision runs on a dedicated thread.
 extension AetherEngine {
 
     /// Arm for the selected embedded bitmap track. The per-ordinal cursor survives re-arming.
@@ -17,19 +17,37 @@ extension AetherEngine {
         subtitleOCRWorkerTask = Task.detached(priority: .utility) { [weak self] in
             while !Task.isCancelled {
                 guard let self else { return }
+                // AE#628: plan on the MainActor, decode here, off it, then resolve ends back on it.
+                // The decode is the bitmap blit, the heaviest frame of the report's profile.
+                let planned = await MainActor.run { [weak self] () -> SubtitleOCRTickPlan? in
+                    guard !Task.isCancelled, let self else { return nil }
+                    return self.subtitleOCRPlanTick(ordinal: ordinal, streamIndex: streamIndex)
+                }
+                let decoded = planned?.decodeHandoff.decode().first ?? []
                 let batch = await MainActor.run { [weak self] in
-                    self?.subtitleOCRCollectTick(ordinal: ordinal, streamIndex: streamIndex) ?? []
+                    guard !Task.isCancelled, let self, let planned else { return [SubtitleCue]() }
+                    let batch = self.subtitleOCRFinishTick(planned, events: decoded)
+                    self.subtitleOCRBatchInFlight = !batch.isEmpty
+                    return batch
                 }
                 if !batch.isEmpty {
-                    SubtitleImageOCR.appendRecognized(cues: batch, language: language, to: store)
+                    await SubtitleImageOCR.appendRecognized(cues: batch, language: language, to: store)
+                    await MainActor.run {
+                        if !Task.isCancelled { self.subtitleOCRBatchInFlight = false }
+                    }
                 }
                 try? await Task.sleep(nanoseconds: AetherEngine.subtitleDrainTickNanoseconds)
             }
         }
     }
 
-    /// Track switch / deselect / teardown. Cursors and pending stay (see load/stop reset).
+    /// Completed coverage survives a re-arm; an abandoned batch must be collected again.
     func cancelSubtitleOCRWorker() {
+        if subtitleOCRBatchInFlight, let ordinal = subtitleOCRArmedOrdinal {
+            subtitleOCRCursors.removeValue(forKey: ordinal)
+            subtitleOCRPendingStates.removeValue(forKey: ordinal)
+        }
+        subtitleOCRBatchInFlight = false
         subtitleOCRArmedOrdinal = nil
         subtitleOCRWorkerTask?.cancel()
         subtitleOCRWorkerTask = nil
@@ -46,17 +64,12 @@ extension AetherEngine {
         subtitleOCRPendingStates.removeAll()
     }
 
-    /// MainActor tick: plan the window (drainer pacing, larger lead), decode the stored packets
-    /// (bounded per tick), resolve composition ends, return CLOSED cues for off-main OCR.
-    private func subtitleOCRCollectTick(ordinal: Int, streamIndex: Int32) -> [SubtitleCue] {
-        guard let packetStore = activeSubtitlePacketStore else { return [] }
+    /// MainActor half before the decode: plan the window (drainer pacing, larger lead) and pick the
+    /// stored packets (bounded per tick). The decode runs off the MainActor (AE#628) and
+    /// `subtitleOCRFinishTick` resolves composition ends into CLOSED cues for off-main OCR.
+    fileprivate func subtitleOCRPlanTick(ordinal: Int, streamIndex: Int32) -> SubtitleOCRTickPlan? {
+        guard let packetStore = activeSubtitlePacketStore else { return nil }
         let playhead = sourceTime
-        var pending = subtitleOCRPendingStates[ordinal] ?? SubtitleOCRPendingState()
-        var closed: [SubtitleCue] = []
-        defer {
-            closed.append(contentsOf: pending.expired(asOf: playhead))
-            subtitleOCRPendingStates[ordinal] = pending
-        }
         // #271: same rule as the overlay drainer, a tick that ran long is not a seek.
         let tickUptime = Double(DispatchTime.now().uptimeNanoseconds) / 1_000_000_000
         let elapsed = subtitleOCRLastTickUptime.map { tickUptime - $0 } ?? 0
@@ -71,18 +84,21 @@ extension AetherEngine {
         switch plan {
         case .idle:
             subtitleOCRCursors[ordinal]?.lastPlayhead = playhead
-            return closed
+            return SubtitleOCRTickPlan(ordinal: ordinal, playhead: playhead, plan: plan,
+                                       window: (playhead, playhead), decoder: nil, batch: [])
         case .decode(let from, let through):
             window = (from, through)
         case .resetAndDecode(let from, let through):
             subtitleOCRDecoder = nil
-            pending = SubtitleOCRPendingState()
             window = (from, through)
         }
         if subtitleOCRDecoder == nil {
             subtitleOCRDecoder = makeSubtitleDrainDecoder(streamIndex: streamIndex)
         }
-        guard let decoder = subtitleOCRDecoder else { return closed }
+        guard let decoder = subtitleOCRDecoder else {
+            return SubtitleOCRTickPlan(ordinal: ordinal, playhead: playhead, plan: .idle,
+                                       window: window, decoder: nil, batch: [])
+        }
         let entries = packetStore.entries(streamIndex: streamIndex,
                                           from: window.from, through: window.through)
         // #271: the cap has to fall on a PTS boundary. The cursor is a bare PTS advanced by
@@ -93,20 +109,38 @@ extension AetherEngine {
         let batchEnd = SubtitleOverlayDrainer.batchEnd(
             count: entries.count, cap: Self.subtitleOCRMaxPacketsPerTick,
             ptsAt: { entries[$0].ptsSeconds })
-        let batch = entries[..<batchEnd]
+        return SubtitleOCRTickPlan(ordinal: ordinal, playhead: playhead, plan: plan, window: window,
+                                   decoder: decoder, batch: entries[..<batchEnd])
+    }
+
+    /// MainActor half after the decode: resolve composition ends and return the CLOSED cues. A
+    /// batch whose decoder was replaced while it decoded (seek, re-arm) is dropped with its cursor
+    /// unmoved, so the next tick plans that window again.
+    fileprivate func subtitleOCRFinishTick(_ tick: SubtitleOCRTickPlan,
+                                           events: [EmbeddedSubtitleDecoder.SubtitleEvent?]) -> [SubtitleCue] {
+        let ordinal = tick.ordinal
+        var pending = subtitleOCRPendingStates[ordinal] ?? SubtitleOCRPendingState()
+        var closed: [SubtitleCue] = []
+        defer {
+            closed.append(contentsOf: pending.expired(asOf: tick.playhead))
+            subtitleOCRPendingStates[ordinal] = pending
+        }
+        guard let decoder = tick.decoder else { return closed }
+        guard subtitleOCRArmedOrdinal == ordinal, subtitleOCRDecoder === decoder else { return closed }
+        if case .resetAndDecode = tick.plan { pending = SubtitleOCRPendingState() }
         var lastDecoded = subtitleOCRCursors[ordinal]?.lastDecodedPts
-        for entry in batch {
-            if let event = Self.decodeStoredSubtitlePacket(entry, with: decoder) {
+        for (entry, decoded) in zip(tick.batch, events) {
+            if let event = decoded {
                 closed.append(contentsOf: pending.consume(
                     eventPts: entry.ptsSeconds, cues: event.cues, trimAt: event.pgsTrimAt))
             }
             lastDecoded = entry.ptsSeconds
         }
-        if case .resetAndDecode = plan, batch.isEmpty {
-            lastDecoded = window.from
+        if case .resetAndDecode = tick.plan, tick.batch.isEmpty {
+            lastDecoded = tick.window.from
         }
         subtitleOCRCursors[ordinal] = SubtitleDrainCursor(
-            lastDecodedPts: lastDecoded ?? window.from, lastPlayhead: playhead)
+            lastDecodedPts: lastDecoded ?? tick.window.from, lastPlayhead: tick.playhead)
         return closed
     }
 
@@ -123,8 +157,23 @@ extension AetherEngine {
         subtitleOCRSidecarFillTask?.cancel()
         EngineLog.emit("[SubtitleOCR] sidecar fill starting: track=\(id) cues=\(cues.count)", category: .engine)
         subtitleOCRSidecarFillTask = Task.detached(priority: .utility) {
-            SubtitleImageOCR.appendRecognized(cues: cues, language: language, to: store)
+            await SubtitleImageOCR.appendRecognized(cues: cues, language: language, to: store)
             if !Task.isCancelled { store.markFinished() }
         }
+    }
+}
+
+/// AE#628: one OCR worker tick between its MainActor halves. `decoder` is nil for a tick that
+/// decodes nothing (idle, or no decoder could be built), which still expires pending cues.
+fileprivate struct SubtitleOCRTickPlan: @unchecked Sendable {
+    let ordinal: Int
+    let playhead: Double
+    let plan: SubtitleDrainPlan
+    let window: (from: Double, through: Double)
+    let decoder: EmbeddedSubtitleDecoder?
+    let batch: ArraySlice<StoredSubtitlePacket>
+
+    var decodeHandoff: SubtitleDrainDecodeHandoff {
+        SubtitleDrainDecodeHandoff(jobs: decoder.map { [($0, batch)] } ?? [])
     }
 }

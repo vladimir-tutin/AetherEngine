@@ -1,7 +1,7 @@
 import Foundation
-import Libavcodec
-import Libavutil
-import Libswresample
+import AetherLibavcodec
+import AetherLibavutil
+import AetherLibswresample
 
 /// Transcoding bridge for the HLS-fMP4 pipeline's audio sidecar. Decodes a source stream (TrueHD, DTS, DTS-HD MA,
 /// Vorbis, PCM, MP2) to PCM, resamples, re-encodes in one of two modes, emits packets HLSSegmentProducer writes
@@ -34,6 +34,88 @@ final class AudioBridge: @unchecked Sendable {
 
     typealias Mode = AudioBridgeMode
 
+    // MARK: - Encoder shape
+
+    /// The encoder a mode opens for a given source. `.lossless` is FLAC unconditionally;
+    /// `.surroundCompat` is EAC3 only where there is surround to carry.
+    ///
+    /// A mode is not an encoder. `.surroundCompat` exists so that multichannel survives a route that
+    /// cannot take multichannel LPCM, and on a source of two channels or fewer it has nothing to carry:
+    /// its EAC3 output is then lossy where the FLAC the same build already ships is lossless, and it is
+    /// a Dolby bitstream on every route that can only pass one through rather than decode it. AE#395 is
+    /// what that costs in the field: on an AirPlay 2 optical adapter the stream-copied AC3 5.1 of one
+    /// MPEG-TS program played and the bridged EAC3 stereo from the same program was silent, so which
+    /// track `av_find_best_stream` happened to pick decided whether the viewer heard anything.
+    ///
+    /// The input is the SOURCE's channel count, never the current output route. Route-dependent bridging
+    /// was measured wrong in #34 (AVPlayer downmixes EAC3+JOC natively over A2DP) and removed; this is a
+    /// static property of the source, so a route change cannot make it disagree with itself mid-session.
+    static func bridgeEncoder(for mode: Mode, sourceChannels: Int32) -> AVCodecID {
+        switch mode {
+        case .lossless:       return AV_CODEC_ID_FLAC
+        case .surroundCompat: return sourceChannels > 2 ? AV_CODEC_ID_EAC3 : AV_CODEC_ID_FLAC
+        }
+    }
+
+    /// The other encoder a build can carry, for the #165 cascade when the resolved one is absent.
+    static func alternateEncoder(to missing: AVCodecID) -> AVCodecID {
+        missing == AV_CODEC_ID_EAC3 ? AV_CODEC_ID_FLAC : AV_CODEC_ID_EAC3
+    }
+
+    /// Channel ceiling per bridge encoder. EAC3 sits at 6 because FFmpeg's encoder caps there until the
+    /// dependent-substream patch lands upstream (a 7.1 source is folded to 5.1); FLAC carries 7.1 whole,
+    /// and 8 is also Apple's HDMI LPCM ceiling.
+    ///
+    /// Pure and named rather than inline, because docs/formats.md quotes both numbers and
+    /// `DocumentedConstantsTests` pins them: a cap that moves without the sentence moving with it
+    /// is a doc that lies in a paragraph that still reads perfectly.
+    static func maxEncodedChannels(for encoder: AVCodecID) -> Int32 {
+        encoder == AV_CODEC_ID_EAC3 ? 6 : 8
+    }
+
+    /// EAC3 scales at 128 kbps per resolved channel (Dolby's transparent reference profile): 256
+    /// kbps stereo, 768 kbps 5.1, and 1024 kbps if the cap above ever reaches 8. FLAC is VBR, so
+    /// its rate is 0 (unlimited) rather than a number.
+    static func encoderBitRate(for encoder: AVCodecID, channels: Int32) -> Int64 {
+        encoder == AV_CODEC_ID_EAC3 ? Int64(channels) * 128_000 : 0
+    }
+
+    /// The sample rates an encoder in THIS build accepts, as libavcodec itself reports them. Empty means
+    /// unconstrained (the codec advertises no list), which is the answer for FLAC.
+    ///
+    /// Asked of the codec rather than tabled here, because a table is a second source of truth that no
+    /// FFmpeg bump updates: E-AC-3 is 32 / 44.1 / 48 kHz today and the encoder is where that would change.
+    static func supportedSampleRates(for encoder: AVCodecID) -> [Int32] {
+        guard let codec = avcodec_find_encoder(encoder) else { return [] }
+        var configs: UnsafeRawPointer?
+        var count: Int32 = 0
+        let ret = avcodec_get_supported_config(nil, codec, AV_CODEC_CONFIG_SAMPLE_RATE, 0, &configs, &count)
+        guard ret >= 0, let list = configs, count > 0 else { return [] }
+        let rates = list.assumingMemoryBound(to: Int32.self)
+        return (0..<Int(count)).map { rates[$0] }
+    }
+
+    /// #548: the rate the bridge encoder is OPENED at, which is not the source's. E-AC-3 exists at 32 /
+    /// 44.1 / 48 kHz only, so a 96 kHz TrueHD track made `avcodec_open2` refuse the context and the whole
+    /// session fell to silent video-only. The resampler sits between the decoder and the encoder on every
+    /// bridged path and is configured from the encoder's rate anyway, so converting costs nothing that was
+    /// not already being paid.
+    ///
+    /// Exact match first; above the list the HIGHEST supported rate (never invent bandwidth the source
+    /// does not have, and 48 kHz carries more of a 96 kHz master than 44.1 does); below it the lowest, so
+    /// an 8 kHz oddity still plays. An empty list is an unconstrained encoder (FLAC), which keeps the
+    /// source rate and stays bit-perfect.
+    static func encoderSampleRate(supported: [Int32], source: Int32) -> Int32 {
+        // A source whose rate nobody resolved (TrueHD reports 0 pre-frame) asks for the same 48 kHz
+        // default the bridge has always fallen back to, then goes through the rules like any other.
+        let wanted: Int32 = source > 0 ? source : 48_000
+        let usable = supported.filter { $0 > 0 }.sorted()
+        guard !usable.isEmpty else { return wanted }
+        if usable.contains(wanted) { return wanted }
+        if let below = usable.last(where: { $0 < wanted }) { return below }
+        return usable[0]
+    }
+
     // MARK: - Errors
 
     enum AudioBridgeError: Error, CustomStringConvertible, LocalizedError {
@@ -41,7 +123,7 @@ final class AudioBridge: @unchecked Sendable {
         case decoderAllocFailed
         case decoderParametersFailed(code: Int32)
         case decoderOpenFailed(code: Int32)
-        case encoderNotFound
+        case encoderNotFound(codecID: AVCodecID)
         case encoderAllocFailed
         case encoderOpenFailed(code: Int32)
         case codecparAllocFailed
@@ -56,7 +138,9 @@ final class AudioBridge: @unchecked Sendable {
             case .decoderAllocFailed:            return "AudioBridge: avcodec_alloc_context3 (decoder) failed"
             case .decoderParametersFailed(let c): return "AudioBridge: avcodec_parameters_to_context returned \(c)"
             case .decoderOpenFailed(let c):      return "AudioBridge: source decoder open failed (\(c))"
-            case .encoderNotFound:               return "AudioBridge: bridge encoder not registered (FFmpeg build missing --enable-encoder=flac / --enable-encoder=eac3?)"
+            case .encoderNotFound(let id):
+                let name = avcodec_get_name(id).map { String(cString: $0) } ?? "id \(id.rawValue)"
+                return "AudioBridge: bridge encoder \(name) not registered (FFmpeg build missing --enable-encoder=\(name)?)"
             case .encoderAllocFailed:            return "AudioBridge: avcodec_alloc_context3 (encoder) failed"
             case .encoderOpenFailed(let c):      return "AudioBridge: encoder open failed (\(c))"
             case .codecparAllocFailed:           return "AudioBridge: avcodec_parameters_alloc failed"
@@ -85,6 +169,7 @@ final class AudioBridge: @unchecked Sendable {
     /// before overwrite and in cleanup.
     private var swrInFmt: AVSampleFormat = AV_SAMPLE_FMT_NONE
     private var swrInRate: Int32 = 0
+    private var swrReconfigureFailures = 0
     private var swrInLayout = AVChannelLayout()
     /// FIFO buffering resampled PCM until >= encoderCtx.frame_size samples. FLAC's wrapper has
     /// AV_CODEC_CAP_SMALL_LAST_FRAME but not VARIABLE_FRAME_SIZE, so non-final frames must hit frame_size exactly
@@ -103,9 +188,16 @@ final class AudioBridge: @unchecked Sendable {
     /// PCM intermediate format end-to-end (resampler -> FIFO -> encoder). S16 for lossy sources (EAC3/AC3);
     /// S32 @ bits_per_raw_sample=24 for lossless sources (TrueHD, DTS-HD MA, FLAC, ALAC, raw 24/32-bit PCM) so
     /// FLAC output stays bit-perfect (S16 would dither away the bottom 8 bits, audible in quiet passages).
-    private let pcmSampleFmt: AVSampleFormat
-    private let pcmBytesPerSample: Int32
-    private let pcmBitsPerRawSample: Int32
+    private var pcmSampleFmt: AVSampleFormat = AV_SAMPLE_FMT_FLTP
+    private var pcmBytesPerSample: Int32 = 4
+    private var pcmBitsPerRawSample: Int32 = 32
+
+    /// The encoder this bridge actually opened, resolved from the mode AND the source's channel count.
+    /// The route reads it for the master playlist's CODECS attribute and the pipeline label, and
+    /// `rebuildEncoderAfterEOFDrain` reopens exactly this one: re-deriving from the mode a second time
+    /// would name EAC3 for a stereo source the bridge encoded as FLAC. Assigned once during init, before
+    /// the encoder context exists.
+    private(set) var outputCodecID: AVCodecID = AV_CODEC_ID_NONE
 
     /// AVCodecParameters for the encoder output stream; caller hands to HLSSegmentProducer.AudioConfig.codecpar.
     /// Owned by the bridge, freed in close().
@@ -142,14 +234,23 @@ final class AudioBridge: @unchecked Sendable {
 
     // MARK: - Lifecycle
 
-    /// Opens source decoder + bridge encoder (eagerly, so encoderCodecpar is ready for muxer init). Encoder by mode:
-    /// `.surroundCompat` EAC3 128 kbps/ch, max 6 ch, FLTP; `.lossless` FLAC, max 8 ch, S16 (lossy src) or S32@24
-    /// (lossless src). Incomplete source codecpar (TrueHD sometimes reports sample_rate=0 pre-frame) falls back to
-    /// 48 kHz stereo, which the resampler reconfigures on the first decoded frame if it differs.
+    /// Opens source decoder + bridge encoder (eagerly, so encoderCodecpar is ready for muxer init). The encoder
+    /// comes from `bridgeEncoder(for:sourceChannels:)`, so it is settled only after the decoder is open and the
+    /// source's channel count is resolved: EAC3 128 kbps/ch, max 6 ch, FLTP for a surround source in
+    /// `.surroundCompat`, FLAC max 8 ch, S16 (lossy src) or S32@24 (lossless src) otherwise. `forcedEncoder`
+    /// overrides that resolution and exists for the route's #165 cascade, which retries the other encoder when
+    /// the resolved one is absent from the build. Incomplete source codecpar (TrueHD sometimes reports
+    /// sample_rate=0 pre-frame) falls back to 48 kHz stereo, which the resampler reconfigures on the first
+    /// decoded frame if it differs.
+    ///
+    /// The encoder opens at `encoderSampleRate(supported:source:)`, not at the source's rate: E-AC-3 has no
+    /// rate above 48 kHz, so a 96 kHz source used to fail `avcodec_open2` and take the session to silent
+    /// video-only (#548). swr converts into it either way.
     init(
         srcCodecpar: UnsafeMutablePointer<AVCodecParameters>,
         srcTimeBase: AVRational,
-        mode: Mode = .surroundCompat
+        mode: Mode = .surroundCompat,
+        forcedEncoder: AVCodecID? = nil
     ) throws {
         self.srcTimeBase = srcTimeBase
         self.mode = mode
@@ -157,7 +258,8 @@ final class AudioBridge: @unchecked Sendable {
         // 1. Source decoder
         let srcCodecID = srcCodecpar.pointee.codec_id
 
-        // PCM intermediate format by mode: EAC3 needs FLTP; FLAC takes S16 (lossy src) or S32@24 (lossless src).
+        // PCM intermediate format follows the ENCODER (resolved below, after the channel count): EAC3 needs
+        // FLTP; FLAC takes S16 (lossy src) or S32@24 (lossless src).
         let isLosslessSource: Bool
         switch srcCodecID {
         case AV_CODEC_ID_TRUEHD,
@@ -172,22 +274,6 @@ final class AudioBridge: @unchecked Sendable {
             isLosslessSource = true
         default:
             isLosslessSource = false
-        }
-        switch mode {
-        case .surroundCompat:
-            pcmSampleFmt = AV_SAMPLE_FMT_FLTP
-            pcmBytesPerSample = 4
-            pcmBitsPerRawSample = 32
-        case .lossless:
-            if isLosslessSource {
-                pcmSampleFmt = AV_SAMPLE_FMT_S32
-                pcmBytesPerSample = 4
-                pcmBitsPerRawSample = 24
-            } else {
-                pcmSampleFmt = AV_SAMPLE_FMT_S16
-                pcmBytesPerSample = 2
-                pcmBitsPerRawSample = 16
-            }
         }
         guard let srcCodec = avcodec_find_decoder(srcCodecID) else {
             throw AudioBridgeError.decoderNotFound(codecID: srcCodecID.rawValue)
@@ -216,30 +302,9 @@ final class AudioBridge: @unchecked Sendable {
             throw AudioBridgeError.decoderOpenFailed(code: openRet)
         }
 
-        // 2. Bridge encoder by mode: .surroundCompat -> EAC3 128 kbps/ch max 6; .lossless -> FLAC VBR max 8.
-        // bit_rate set below after channel count resolves (EAC3 scales 128 kbps x nChannels per DrHurt on
-        // AetherEngine#4: 256 stereo, 768 5.1, scales if the cap is bumped per Nomis101's PR 21668). FLAC = 0 (VBR).
-        let encoderCodecID: AVCodecID
-        let maxEncodedChannels: Int32
-        switch mode {
-        case .surroundCompat:
-            encoderCodecID = AV_CODEC_ID_EAC3
-            maxEncodedChannels = 6
-        case .lossless:
-            encoderCodecID = AV_CODEC_ID_FLAC
-            maxEncodedChannels = 8
-        }
-        guard let encCodec = avcodec_find_encoder(encoderCodecID) else {
-            cleanup()
-            throw AudioBridgeError.encoderNotFound
-        }
-        guard let enc = avcodec_alloc_context3(encCodec) else {
-            cleanup()
-            throw AudioBridgeError.encoderAllocFailed
-        }
-        encoderCtx = enc
-
-        let sampleRate: Int32 = srcCodecpar.pointee.sample_rate > 0
+        // 2. Source shape. The encoder cannot be chosen before this: `.surroundCompat` resolves to EAC3 only
+        // for a source that HAS surround to carry, and the channel count is not final until the decoder is open.
+        let sourceSampleRate: Int32 = srcCodecpar.pointee.sample_rate > 0
             ? srcCodecpar.pointee.sample_rate
             : 48000
 
@@ -269,15 +334,57 @@ final class AudioBridge: @unchecked Sendable {
                 category: .session
             )
         }
+        // 3. Bridge encoder, resolved from the mode AND the source: EAC3 128 kbps/ch max 6 for surround in
+        // `.surroundCompat`, FLAC VBR max 8 otherwise. bit_rate is set below once the channel count is capped
+        // (EAC3 scales 128 kbps x nChannels per DrHurt on AetherEngine#4: 256 stereo, 768 5.1, and scales
+        // further if the cap is bumped per Nomis101's PR 21668). FLAC = 0 (VBR).
+        let encoderCodecID = forcedEncoder
+            ?? Self.bridgeEncoder(for: mode, sourceChannels: resolvedChannels)
+        outputCodecID = encoderCodecID
+        if encoderCodecID == AV_CODEC_ID_EAC3 {
+            pcmSampleFmt = AV_SAMPLE_FMT_FLTP
+            pcmBytesPerSample = 4
+            pcmBitsPerRawSample = 32
+        } else if isLosslessSource {
+            pcmSampleFmt = AV_SAMPLE_FMT_S32
+            pcmBytesPerSample = 4
+            pcmBitsPerRawSample = 24
+        } else {
+            pcmSampleFmt = AV_SAMPLE_FMT_S16
+            pcmBytesPerSample = 2
+            pcmBitsPerRawSample = 16
+        }
+        guard let encCodec = avcodec_find_encoder(encoderCodecID) else {
+            cleanup()
+            throw AudioBridgeError.encoderNotFound(codecID: encoderCodecID)
+        }
+        guard let enc = avcodec_alloc_context3(encCodec) else {
+            cleanup()
+            throw AudioBridgeError.encoderAllocFailed
+        }
+        encoderCtx = enc
+
+        // The rate the ENCODER accepts, which is not necessarily the source's (#548). swr already converts
+        // into the encoder's format on every bridged packet, so a rate change is free here and refusing the
+        // session was not: E-AC-3 stops at 48 kHz and a 96 kHz TrueHD track used to fall to video-only.
+        let sampleRate = Self.encoderSampleRate(
+            supported: Self.supportedSampleRates(for: encoderCodecID),
+            source: sourceSampleRate
+        )
+
         // Cap to encoder max (EAC3 5.1, FLAC 7.1). Above-cap downmix happens automatically inside swr_convert
         // when source layout exceeds the encoder's; the resampler picks Apple-compatible ordering.
-        let nChannels: Int32 = min(resolvedChannels, maxEncodedChannels)
-        let logBitRate: String = mode == .surroundCompat
+        let nChannels: Int32 = min(resolvedChannels, Self.maxEncodedChannels(for: encoderCodecID))
+        let encoderName = avcodec_get_name(encoderCodecID).map { String(cString: $0) } ?? "?"
+        let logBitRate: String = encoderCodecID == AV_CODEC_ID_EAC3
             ? "\(Int64(nChannels) * 128) kbps"
             : "VBR"
         EngineLog.emit(
-            "[AudioBridge] init: mode=\(mode.rawValue) "
-            + "srcCodec=\(srcCodecID.rawValue) sampleRate=\(sampleRate) "
+            "[AudioBridge] init: mode=\(mode.rawValue) encoder=\(encoderName)"
+            + (forcedEncoder != nil ? " (forced)" : "")
+            + " srcCodec=\(srcCodecID.rawValue) sampleRate=\(sampleRate)"
+            + (sampleRate != sourceSampleRate ? " (resampled from \(sourceSampleRate), encoder has no such rate)" : "")
+            + " "
             + "sourceChannels=\(resolvedChannels) "
             + "encoderChannels=\(nChannels) bitRate=\(logBitRate) "
             + "(source=\(resolvedSource), container=\(containerChannels), decoder=\(decoderChannels))",
@@ -288,13 +395,7 @@ final class AudioBridge: @unchecked Sendable {
         enc.pointee.sample_fmt = pcmSampleFmt
         enc.pointee.bits_per_raw_sample = pcmBitsPerRawSample
         // EAC3 per-channel bitrate 128 kbps (Dolby reference transparent profile); FLAC stays 0 = unlimited VBR.
-        let resolvedBitRate: Int64
-        switch mode {
-        case .surroundCompat:
-            resolvedBitRate = Int64(nChannels) * 128_000
-        case .lossless:
-            resolvedBitRate = 0
-        }
+        let resolvedBitRate = Self.encoderBitRate(for: encoderCodecID, channels: nChannels)
         enc.pointee.bit_rate = resolvedBitRate
         enc.pointee.time_base = AVRational(num: 1, den: sampleRate)
         var encLayout = AVChannelLayout()
@@ -311,7 +412,7 @@ final class AudioBridge: @unchecked Sendable {
         }
         encoderTimeBase = AVRational(num: 1, den: sampleRate)
 
-        // 3. Codecpar describing the FLAC output for the muxer.
+        // 4. Codecpar describing the encoder output for the muxer.
         guard let cp = avcodec_parameters_alloc() else {
             cleanup()
             throw AudioBridgeError.codecparAllocFailed
@@ -323,14 +424,14 @@ final class AudioBridge: @unchecked Sendable {
             throw AudioBridgeError.encoderOpenFailed(code: fillRet)
         }
 
-        // 4. Resampler input format: seed from the decoder ctx if avformat_find_stream_info already resolved it
+        // 5. Resampler input format: seed from the decoder ctx if avformat_find_stream_info already resolved it
         //    (most VOD sources - the probe decoded a frame and wrote the real sample_fmt back into codecpar),
         //    else fall back to FLTP + codecpar rate for codecs that defer until the first frame (TrueHD) or a
         //    bailed probe. This is only a seed: resampleAndPushIntoFIFO re-derives the input config from each
         //    decoded frame, so a wrong seed self-corrects on the first frame.
         let inFmtRaw = dec.pointee.sample_fmt.rawValue
         let inFmt = inFmtRaw >= 0 ? dec.pointee.sample_fmt : AV_SAMPLE_FMT_FLTP
-        let inRate = dec.pointee.sample_rate > 0 ? dec.pointee.sample_rate : sampleRate
+        let inRate = dec.pointee.sample_rate > 0 ? dec.pointee.sample_rate : sourceSampleRate
         var inLayout = AVChannelLayout()
         if dec.pointee.ch_layout.nb_channels > 0 {
             av_channel_layout_copy(&inLayout, &dec.pointee.ch_layout)
@@ -366,7 +467,7 @@ final class AudioBridge: @unchecked Sendable {
             throw AudioBridgeError.resamplerInitFailed(code: initRet)
         }
 
-        // 5. Audio FIFO: ~1s of PCM (FFmpeg grows on demand), chunks resampler output into encoder-sized frames.
+        // 6. Audio FIFO: ~1s of PCM (FFmpeg grows on demand), chunks resampler output into encoder-sized frames.
         guard let fifoPtr = av_audio_fifo_alloc(
             pcmSampleFmt,
             nChannels,
@@ -400,6 +501,103 @@ final class AudioBridge: @unchecked Sendable {
     /// bitrate (FLAC is lossless VBR, so a measured rate is the only honest reading). Written only under `opLock`
     /// on the pump thread; read lock-free for diagnostics, mirroring `liveBytes`.
     private(set) var outputBytesLifetime: Int64 = 0
+
+    /// AE#396: what the bridge has actually done with what it was handed.
+    ///
+    /// Every step between a source packet and an encoded frame can fail per packet, and each of those
+    /// arms ends in a `return` or in a loop that stops on a negative code: a packet the decoder
+    /// rejects, a decoder that answers nothing, a resample that converts to zero samples, an encoder
+    /// that keeps its output. Per packet that is the right behaviour, one bad frame must not end a
+    /// session. In aggregate it is the worst failure this class has, because a bridge that emits
+    /// NOTHING for a whole first segment surfaces as movenc's -22: the mp4 muxer is asked for an
+    /// AC-3/E-AC-3 sample entry it can only build from a packet that was never written, the cut
+    /// fails, the revive re-reads the same bytes twice more, and the session ends on "Source audio
+    /// cannot be muxed". Neither that sentence nor any line before it mentions audio decoding, so the
+    /// only subsystem that is definitely innocent is the one everybody reads about.
+    ///
+    /// These counters exist to name the arm. Written under `opLock` on the pump thread, read
+    /// lock-free for diagnostics, exactly like `outputBytesLifetime`.
+    struct FeedStats: Sendable, Equatable {
+        var packetsFed = 0
+        /// Source packets `avcodec_send_packet` rejected and `feed` skipped (`invalidData`, `einval`).
+        var packetsRejected = 0
+        var framesDecoded = 0
+        /// `avcodec_receive_frame` answers that were neither a frame nor EAGAIN/EOF.
+        var decodeErrors = 0
+        var lastDecodeErrorCode: Int32 = 0
+        /// Decoded frames that never reached the FIFO: no samples, a null plane, or a resample that
+        /// produced nothing.
+        var framesDroppedBeforeFIFO = 0
+        var samplesEnqueued: Int64 = 0
+        /// Source packets fed since the FIFO last accepted a sample, reset by every accepted write.
+        /// The decoder arm of `silenceIsStructural` is counted on this rather than on `packetsFed`,
+        /// so a decoder that answers for a while and then stops is the same shape as one that never
+        /// answered at all, and neither has to be told apart from a bridge that is merely young.
+        var packetsFedSinceLastEnqueue = 0
+        var packetsEmitted = 0
+        /// `avcodec_receive_packet` answers that were neither a packet nor EAGAIN/EOF.
+        var encodeErrors = 0
+        var lastEncodeErrorCode: Int32 = 0
+
+        /// Fed real source, answered with nothing at all.
+        var isSilent: Bool { packetsFed > 0 && packetsEmitted == 0 }
+
+        /// The DECODER is the arm that failed, which no rebuild can change: a producer restart opens a
+        /// fresh encoder (#99 failure mode B) but hands the same decoder the same bytes. That is the
+        /// line between a muxer revive that can heal and three attempts that read identically.
+        var decodedNothing: Bool { packetsFed > 0 && framesDecoded == 0 }
+
+        var summary: String {
+            var parts = ["fed=\(packetsFed)", "decoded=\(framesDecoded)",
+                         "enqueued=\(samplesEnqueued)", "emitted=\(packetsEmitted)"]
+            if packetsRejected > 0 { parts.append("rejected=\(packetsRejected)") }
+            if framesDroppedBeforeFIFO > 0 {
+                parts.append("droppedBeforeFIFO=\(framesDroppedBeforeFIFO)")
+            }
+            if decodeErrors > 0 {
+                parts.append("decodeErrors=\(decodeErrors)")
+                parts.append("lastDecodeError=\(FFmpegErr.text(for: lastDecodeErrorCode))")
+            } else if packetsRejected > 0, lastDecodeErrorCode != 0 {
+                parts.append("lastDecodeError=\(FFmpegErr.text(for: lastDecodeErrorCode))")
+            }
+            if encodeErrors > 0 {
+                parts.append("encodeErrors=\(encodeErrors)")
+                parts.append("lastEncodeError=\(FFmpegErr.text(for: lastEncodeErrorCode))")
+            }
+            return parts.joined(separator: " ")
+        }
+    }
+
+    private var stats = FeedStats()
+
+    /// Snapshot for the producer and the engine. The pump thread is the only writer, and both readers
+    /// run on it (the deferred-cut log site and the pump-finished handler).
+    var feedStats: FeedStats { stats }
+
+    /// One-shot: a bridge that stays silent for an hour costs one line, not one per packet.
+    private(set) var silentFeedReported = false
+
+    /// AE#474: the DECODER arm's unit, and only its unit. Source went in and the FIFO got nothing
+    /// back, so there is no sample count to bound anything with and packets are all there is.
+    private static let silentFeedPacketThreshold = 64
+
+    /// AE#474: the ENCODER arm's unit. `drainFIFOIntoEncoder(requireFull: true)` cannot encode below
+    /// `frame_size`, so nothing can be emitted until that many samples have been enqueued, and the
+    /// figure is not a constant of the bridge: 1536 on E-AC-3, 4608 on FLAC. A source packet is not
+    /// a constant either, 1536 samples on E-AC-3 down to 40 on a TrueHD access unit, so the ratio
+    /// between the two spans a factor of 100 across arms this bridge already builds and no packet
+    /// count can express one encoder frame. The old 64-packet threshold was derived from the lossy
+    /// pair alone (1536 against 512) and fired at 2560 of FLAC's 4608 samples on TrueHD, announcing
+    /// a failure on sessions that then played to the end. Four frames rather than one: the first is
+    /// when output becomes POSSIBLE, the second covers an encoder that holds it, and four is still
+    /// inside the first half second of source audio on every arm (128 ms on E-AC-3, 384 ms on FLAC
+    /// at 48 kHz), which is sooner in wall-clock than the packet threshold it replaces.
+    private static let silentFeedEncoderFrameMultiple: Int64 = 4
+
+    /// What to assume for `frame_size` before the encoder has resolved one. Shared with
+    /// `drainFIFOIntoEncoder`, which chunks the FIFO by the same figure: a gate that used a
+    /// different fallback than the drain it is judging would be judging a boundary nobody uses.
+    private static let assumedEncoderFrameSize: Int32 = 4096
 
     /// Snapshot of bytes live in the bridge's growable buffers, for the engine memory probe. Both fields grow on
     /// the FFmpeg side (FIFO reallocs upward, swr delay buffer reallocates on rate/layout shift), so a
@@ -554,7 +752,7 @@ final class AudioBridge: @unchecked Sendable {
     /// silently emitting nothing. Runs under opLock (callers hold it).
     private func rebuildEncoderAfterEOFDrain() {
         guard let oldEnc = encoderCtx else { return }
-        let encoderCodecID: AVCodecID = mode == .surroundCompat ? AV_CODEC_ID_EAC3 : AV_CODEC_ID_FLAC
+        let encoderCodecID: AVCodecID = outputCodecID
         guard let encCodec = avcodec_find_encoder(encoderCodecID),
               let enc = avcodec_alloc_context3(encCodec) else {
             EngineLog.emit(
@@ -629,6 +827,9 @@ final class AudioBridge: @unchecked Sendable {
             return []
         }
 
+        stats.packetsFed += 1
+        stats.packetsFedSinceLastEnqueue += 1
+
         var results: [UnsafeMutablePointer<AVPacket>] = []
 
         // Capture packet.pts for the encoder-PTS rebase, NOT the decoded frame's pts. Issue #7: for codecs with
@@ -646,9 +847,37 @@ final class AudioBridge: @unchecked Sendable {
         // Drain every decodable frame into the FIFO. The PTS rebase fires on the first frame after a segment
         // boundary so FLAC timestamps track the source rather than drifting on FIFO leftover (uses packetPts, not sf.pts).
         func receiveDecodedFrames() throws {
-            while avcodec_receive_frame(dec, sf) >= 0 {
+            while true {
+                // AE#396: the loop used to be `while avcodec_receive_frame(...) >= 0`, which reads
+                // "drain what is there" and behaves as "drop the reason there is nothing". A decoder
+                // that rejects every frame of a stream is then indistinguishable from one that has
+                // simply caught up, for the whole session.
+                let receiveRet = avcodec_receive_frame(dec, sf)
+                if receiveRet < 0 {
+                    if receiveRet != FFmpegErr.eagain, receiveRet != FFmpegErr.eof {
+                        stats.decodeErrors += 1
+                        stats.lastDecodeErrorCode = receiveRet
+                    }
+                    break
+                }
+                stats.framesDecoded += 1
                 if rebaseFromNextSourcePTS, packetPts != Self.avNoPTS {
+                    // AE#561 follow-up: this counter stamps the FRAME handed to the encoder, and an
+                    // encoder that declares `initial_padding` stamps its first PACKET a padding BELOW
+                    // that frame (256 samples on the AC-3 family, 0 on FLAC), so that a consumer which
+                    // discards the priming lands back on the source position. Nothing discards it
+                    // here: the muxer writes no edit list on purpose, since the init segment has to
+                    // stay restart-invariant, so the priming plays as the silence it is. Without the
+                    // offset the published timeline therefore STARTS a padding below the source, and
+                    // at source 0 that is a negative `baseMediaDecodeTime`, a field that is
+                    // `unsigned int(64)`: -256 went out as 2^64 - 256 and AVPlayer placed the whole
+                    // first audio fragment 584 thousand years out, losing its ~190 ms of audio. The
+                    // offset costs the content the padding's 5.3 ms instead, which is what an
+                    // unsignalled priming is worth and two orders below the lip-sync threshold. It is
+                    // applied on every rebase, not only near zero, so a restart mid-file inherits the
+                    // same relationship instead of stepping by a padding.
                     nextEncoderPTS = av_rescale_q(packetPts, srcTimeBase, encoderTimeBase)
+                        &+ Int64(enc.pointee.initial_padding)
                     rebaseFromNextSourcePTS = false
                 }
                 try resampleAndPushIntoFIFO(srcFrame: sf, enc: enc, swr: swr, fifo: fifoPtr)
@@ -664,6 +893,8 @@ final class AudioBridge: @unchecked Sendable {
                 sendRet = avcodec_send_packet(dec, pkt)
             }
             if sendRet == FFmpegErr.invalidData || sendRet == FFmpegErr.einval {
+                stats.packetsRejected += 1
+                stats.lastDecodeErrorCode = sendRet
                 // Skippable single-packet rejections, decoder stays usable for the next packet:
                 //   invalidData = corrupt source packet (glitchy live MPEG-TS, broken mp2 header);
                 //   einval (-22) = a DTS-HD MA XLL frame that residual-codes channels without a usable core
@@ -697,7 +928,44 @@ final class AudioBridge: @unchecked Sendable {
             throw error
         }
 
+        noteSilentFeedIfNeeded(encoderFrameSize: enc.pointee.frame_size)
         return results
+    }
+
+    /// AE#396 / AE#474: is this silence structural, or has the bridge simply not been asked yet?
+    /// The two ways a bridge stays quiet end at different subsystems and are bounded by different
+    /// quantities, so each arm is counted in the unit that actually bounds it and neither is
+    /// expressed in the other's (see `silentFeedPacketThreshold` and the frame multiple above).
+    ///
+    /// Pure and static so the boundary can be pinned against the frame sizes this bridge really
+    /// opens instead of against whichever one the fixtures happen to reach.
+    static func silenceIsStructural(stats: FeedStats, encoderFrameSize: Int32) -> Bool {
+        guard stats.isSilent else { return false }
+        let frame = Int64(encoderFrameSize > 0 ? encoderFrameSize : assumedEncoderFrameSize)
+        // The encoder arm: enough PCM to build several frames went in and none came back.
+        if stats.samplesEnqueued >= frame * silentFeedEncoderFrameMultiple { return true }
+        // The decoder arm: the FIFO has stood still for longer than any source explains.
+        return stats.packetsFedSinceLastEnqueue >= silentFeedPacketThreshold
+    }
+
+    /// AE#396: say it once, the moment the silence is structural. Without this the only downstream
+    /// evidence is movenc's -22 on a moov it cannot build, which names the muxer and the source and
+    /// never the bridge. `EngineLog` has no error level, so the `ERROR:` prefix carries it, as in
+    /// the #165 cascade line.
+    private func noteSilentFeedIfNeeded(encoderFrameSize: Int32) {
+        guard !silentFeedReported,
+              Self.silenceIsStructural(stats: stats, encoderFrameSize: encoderFrameSize)
+        else { return }
+        silentFeedReported = true
+        let encoder = avcodec_get_name(outputCodecID).map { String(cString: $0) } ?? "the encoder"
+        let frame = encoderFrameSize > 0 ? encoderFrameSize : Self.assumedEncoderFrameSize
+        EngineLog.emit(
+            "[AudioBridge] ERROR: AE#396 the bridge has produced no encoded audio at all "
+            + "(mode=\(mode.rawValue), encoder=\(encoder), frame=\(frame)): \(stats.summary). "
+            + "The mp4 muxer can only build a \(encoder) sample entry from a packet that was "
+            + "written, so this session will fail its first segment cut unless output starts.",
+            category: .session
+        )
     }
 
     /// Align swr's INPUT side to the frame the decoder actually produced. libswresample reads `extended_data`
@@ -707,24 +975,30 @@ final class AudioBridge: @unchecked Sendable {
     /// probe), and reading S32 integers as FLTP floats is noise. Re-derive the input from the frame, keeping
     /// the output side pinned to the encoder, exactly as AudioDecoder configures its resampler from the frame.
     /// No-op in the common case where find_stream_info already resolved the format (frame == seed), so working
-    /// paths are untouched; only a wrong seed or a genuine mid-stream format change rebuilds. swr_alloc_set_opts2
-    /// reuses the context pointer on success and frees it on failure (the caller re-binds swrCtx); swr_init drops
+    /// paths are untouched; only a wrong seed or a genuine mid-stream format change rebuilds. A rebuild drops
     /// the sub-frame resampler delay, as startSegment already does. Runs under feed()'s opLock (never re-lock).
+    ///
+    /// Audit DEC-6: built on a scratch context and swapped in only once it initialised. Rebuilding the
+    /// live one lost it for good on a rejected format (set-opts frees it), after which every feed
+    /// returned early, the bridge stayed mute, and not even the AE#396 detector could see it. A frame
+    /// the resampler cannot take is now dropped and counted, and the old context keeps serving the
+    /// format it was built for. Returns false when this frame must not reach `swr_convert`.
     private func reconfigureSwrInputIfNeeded(
         forFrame sf: UnsafeMutablePointer<AVFrame>,
         enc: UnsafeMutablePointer<AVCodecContext>
-    ) {
+    ) -> Bool {
         let frameFmtRaw = sf.pointee.format
         let frameRate = sf.pointee.sample_rate
-        guard frameFmtRaw >= 0, frameRate > 0, sf.pointee.ch_layout.nb_channels > 0 else { return }
+        guard frameFmtRaw >= 0, frameRate > 0, sf.pointee.ch_layout.nb_channels > 0 else { return true }
         let matchesCurrent = frameFmtRaw == swrInFmt.rawValue
             && frameRate == swrInRate
             && av_channel_layout_compare(&swrInLayout, &sf.pointee.ch_layout) == 0
-        guard !matchesCurrent else { return }
+        guard !matchesCurrent else { return true }
 
         let frameFmt = AVSampleFormat(rawValue: frameFmtRaw)
+        var scratch: OpaquePointer?
         let setRet = swr_alloc_set_opts2(
-            &swrCtx,
+            &scratch,
             &enc.pointee.ch_layout,
             pcmSampleFmt,
             enc.pointee.sample_rate,
@@ -734,7 +1008,22 @@ final class AudioBridge: @unchecked Sendable {
             0,
             nil
         )
-        guard setRet >= 0, swrCtx != nil, swr_init(swrCtx) >= 0 else { return }
+        let initRet = setRet >= 0 && scratch != nil ? swr_init(scratch) : setRet
+        guard initRet >= 0 else {
+            swr_free(&scratch)
+            swrReconfigureFailures += 1
+            if swrReconfigureFailures == 1 || swrReconfigureFailures % 500 == 0 {
+                EngineLog.emit(
+                    "[AudioBridge] ERROR: resampler rejected decoded \(frameRate)Hz/"
+                    + "\(sf.pointee.ch_layout.nb_channels)ch fmt=\(frameFmtRaw) (ret=\(initRet)); "
+                    + "\(swrReconfigureFailures) frame(s) dropped",
+                    category: .session
+                )
+            }
+            return false
+        }
+        swr_free(&swrCtx)
+        swrCtx = scratch
 
         av_channel_layout_uninit(&swrInLayout)
         av_channel_layout_copy(&swrInLayout, &sf.pointee.ch_layout)
@@ -756,6 +1045,7 @@ final class AudioBridge: @unchecked Sendable {
                 category: .session
             )
         }
+        return true
     }
 
     /// Resample sf (decoded source frame) to encoder format and push into the FIFO (swr_convert may produce
@@ -773,17 +1063,24 @@ final class AudioBridge: @unchecked Sendable {
         // EXC_BAD_ACCESS at 0x0. Skip such frames (the video path tolerates the same corruption).
         guard sf.pointee.nb_samples > 0,
               let ext = sf.pointee.extended_data,
-              ext.pointee != nil else { return }
+              ext.pointee != nil else {
+            stats.framesDroppedBeforeFIFO += 1
+            return
+        }
 
         // Align swr's INPUT to the frame the decoder actually produced before converting. No-op once the seed
         // matched (the usual case); only a wrong init seed or a genuine mid-stream format change rebuilds swr.
-        reconfigureSwrInputIfNeeded(forFrame: sf, enc: enc)
-        // The rebuild reuses the context pointer on success, but swr_alloc_set_opts2 frees it on a set-opts
-        // failure (swr_free(ps) -> swrCtx == nil), which would dangle the caller's `swr`. Re-bind to the live one.
-        guard let swr = swrCtx else { return }
+        // A successful rebuild replaces the context, which would dangle the caller's `swr`. Re-bind to the live one.
+        guard reconfigureSwrInputIfNeeded(forFrame: sf, enc: enc), let swr = swrCtx else {
+            stats.framesDroppedBeforeFIFO += 1
+            return
+        }
 
         let outNbSamples = swr_get_out_samples(swr, sf.pointee.nb_samples)
-        guard outNbSamples > 0 else { return }
+        guard outNbSamples > 0 else {
+            stats.framesDroppedBeforeFIFO += 1
+            return
+        }
 
         let nChannels = enc.pointee.ch_layout.nb_channels
         let isPlanar = av_sample_fmt_is_planar(pcmSampleFmt) != 0
@@ -815,15 +1112,22 @@ final class AudioBridge: @unchecked Sendable {
                 )
             }
         }
-        guard producedSamples > 0 else { return }
+        guard producedSamples > 0 else {
+            stats.framesDroppedBeforeFIFO += 1
+            return
+        }
 
         // av_audio_fifo_write takes void **data; the same array works for both layouts (FIFO knows the format).
-        _ = outPtrs.withUnsafeMutableBufferPointer { fifoBuf in
+        let written = outPtrs.withUnsafeMutableBufferPointer { fifoBuf in
             fifoBuf.baseAddress!.withMemoryRebound(
                 to: UnsafeMutableRawPointer?.self, capacity: bufferCount
             ) { rebound in
                 av_audio_fifo_write(fifo, rebound, producedSamples)
             }
+        }
+        if written > 0 {
+            stats.samplesEnqueued += Int64(written)
+            stats.packetsFedSinceLastEnqueue = 0
         }
     }
 
@@ -835,7 +1139,7 @@ final class AudioBridge: @unchecked Sendable {
         requireFull: Bool,
         results: inout [UnsafeMutablePointer<AVPacket>]
     ) throws {
-        let frameSize = enc.pointee.frame_size > 0 ? enc.pointee.frame_size : 4096
+        let frameSize = enc.pointee.frame_size > 0 ? enc.pointee.frame_size : Self.assumedEncoderFrameSize
         let nChannels = enc.pointee.ch_layout.nb_channels
 
         while true {
@@ -892,11 +1196,14 @@ final class AudioBridge: @unchecked Sendable {
                     break
                 }
                 if recvRet < 0 {
+                    stats.encodeErrors += 1
+                    stats.lastEncodeErrorCode = recvRet
                     var p: UnsafeMutablePointer<AVPacket>? = outPkt
                     trackedPacketFree(&p)
                     break
                 }
                 outputBytesLifetime += Int64(outPkt.pointee.size)
+                stats.packetsEmitted += 1
                 results.append(outPkt)
             }
         }

@@ -1,8 +1,8 @@
 import Foundation
 import Testing
-import Libavcodec
-import Libavformat
-import Libavutil
+import AetherLibavcodec
+import AetherLibavformat
+import AetherLibavutil
 @testable import AetherEngine
 
 /// The other half of #234, found while fixing it and not a regression: `runNativeSubtitleReaders`

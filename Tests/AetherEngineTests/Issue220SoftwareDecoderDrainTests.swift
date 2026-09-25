@@ -1,7 +1,7 @@
 import Foundation
 import Testing
-import Libavcodec
-import Libavutil
+import AetherLibavcodec
+import AetherLibavutil
 @testable import AetherEngine
 
 /// #220 (rrgomes): `SoftwareVideoDecoder.decode` returned on any negative `avcodec_send_packet`

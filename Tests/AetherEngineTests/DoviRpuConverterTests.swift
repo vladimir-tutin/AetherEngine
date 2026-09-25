@@ -1,5 +1,5 @@
 import Testing
-import Libavcodec
+import AetherLibavcodec
 @testable import AetherEngine
 
 /// Deterministic NAL-walk checks for the DV P7 -> P8.1 converter (#132/#135).

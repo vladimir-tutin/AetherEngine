@@ -10,7 +10,7 @@
 // exactly the one-in-five aligned case.
 import Foundation
 import Testing
-import Libavutil
+import AetherLibavutil
 @testable import AetherEngine
 
 @Suite("Segment plan from source-declared boundaries (AE#268)")

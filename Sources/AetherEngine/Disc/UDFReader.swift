@@ -97,15 +97,18 @@ final class UDFReader {
         let avdp = try readSector(256)
         guard tagID(avdp) == 2 else { throw DiscError.notUDF }
         let vdsLen = u32(avdp, 16), vdsLoc = u32(avdp, 20)
-        let vdsSectors = max(1, vdsLen / ss)
+        // A real Volume Descriptor Sequence is 16 sectors (ECMA-167); vdsLen is an untrusted u32
+        // from the anchor, and an unclamped one can drive millions of sector reads before parsing
+        // ever fails (audit NET-11).
+        let vdsSectors = min(max(1, vdsLen / ss), 256)
 
         var lvd: [UInt8]? = nil
-        for i in 0..<vdsSectors {
+        volumeDescriptorSequence: for i in 0..<vdsSectors {
             let d = try readSector(vdsLoc + i)
             switch tagID(d) {
             case 5: physPartStart[u16(d, 22)] = u32(d, 188)  // Partition Descriptor
             case 6: lvd = d                                   // LVD
-            case 8: break                                     // Terminating
+            case 8: break volumeDescriptorSequence            // Terminating (bare `break` only exits the switch, audit NET-11)
             default: break
             }
         }
@@ -119,10 +122,14 @@ final class UDFReader {
             guard off + 2 <= lvd.count else { break }
             let type = Int(lvd[off]); let len = Int(lvd[off+1])
             guard len > 0, off + len <= lvd.count else { break }
-            if type == 1 {
+            // `off + len <= lvd.count` only bounds the map's OWN declared length; type 1 and type 2
+            // maps read fixed fields past that length (off+4, off+38..43), so a short len with a
+            // long-enough neighbour still let those reads run past the sector buffer and trap
+            // (audit NET-4). A too-short map of a known type falls through to the generic case below.
+            if type == 1, len >= 6 {
                 let pn = u16(lvd, off+4)
                 partMaps.append(PartMap(isMetadata: false, physicalPartNumber: pn, metadataFileBlock: 0))
-            } else if type == 2 {
+            } else if type == 2, len >= 44 {
                 let pn = u16(lvd, off+38)
                 let metaFileBlock = u32(lvd, off+40)
                 partMaps.append(PartMap(isMetadata: true, physicalPartNumber: pn, metadataFileBlock: metaFileBlock))

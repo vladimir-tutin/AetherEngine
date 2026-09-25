@@ -1,4 +1,4 @@
-name: FlexUI tvOS compile check
+name: FlexUI tvOS/iOS compile check
 
 # Compile-verifies the FlexUI live-audio-DSP changes against the tvOS SDK.
 #
@@ -50,6 +50,38 @@ jobs:
             -destination 'generic/platform=tvOS' \
             -skipMacroValidation \
             CODE_SIGNING_ALLOWED=NO > build.log 2>&1
+          status=$?
+          echo "::group::Diagnostics"
+          grep -nE "error:|warning:.*(Sendable|actor|concurrency)" build.log | head -60 || true
+          echo "::endgroup::"
+          if [ $status -ne 0 ]; then
+            echo "::group::Tail"
+            tail -120 build.log
+            echo "::endgroup::"
+          fi
+          exit $status
+
+  # Same compile gate for iOS: FlexUI's iPad app is taking this engine as its direct-play player,
+  # and the iOS side has its own platform branches (audio session, PiP, background keepalive).
+  ios-build:
+    runs-on: macos-26
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select newest Xcode
+        run: |
+          newest=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -1)
+          echo "Selecting $newest"
+          sudo xcode-select -s "$newest/Contents/Developer"
+
+      - name: Resolve packages
+        run: xcodebuild -resolvePackageDependencies -scheme AetherEngine -destination 'generic/platform=iOS'
+
+      - name: Build AetherEngine for iOS
+        run: |
+          set +e
+          xcodebuild build             -scheme AetherEngine             -destination 'generic/platform=iOS'             -skipMacroValidation             CODE_SIGNING_ALLOWED=NO > build.log 2>&1
           status=$?
           echo "::group::Diagnostics"
           grep -nE "error:|warning:.*(Sendable|actor|concurrency)" build.log | head -60 || true

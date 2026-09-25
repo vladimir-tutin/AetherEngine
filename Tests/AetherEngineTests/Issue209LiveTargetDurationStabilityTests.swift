@@ -45,7 +45,11 @@ final class Issue209LiveTargetDurationStabilityTests: XCTestCase {
             observe: { cadence.value },
             cutTargetSeconds: 0.5,
             disciplineObservationSeconds: 12,
-            initialFloorSeconds: nil,
+            // AE#447: the floor reads closed evidence. The scripted value stands for an interval that
+            // has ended, which is the only kind the seal may be taken from.
+            observeSealEvidence: { LiveCadenceEvidence(closedCadenceSeconds: cadence.value,
+                                                       servedSegmentDurationSeconds: nil) },
+            selfReportedTargetDurationSeconds: nil,
             clock: { 0 }
         )
         let provider = VideoSegmentProvider(
@@ -154,12 +158,13 @@ final class Issue209LiveTargetDurationStabilityTests: XCTestCase {
 
         let result = Issue209WaitResult()
         let finished = expectation(description: "startup waiter finishes after cancellation")
-        DispatchQueue.global().async {
+        Thread.detachNewThread {
             result.store(provider.waitForFirstLiveSegment(timeout: 2))
             finished.fulfill()
         }
 
-        Thread.sleep(forTimeInterval: 0.1)
+        // The park is observable, so it is waited for; a tenth of a second was a guess.
+        while provider.parkedWaiterCount == 0 { usleep(200) }
         cadence.value = 2.2
         provider.appendLiveSegment(index: 2, startSeconds: 1.8, durationSeconds: 0.9)
         provider.appendLiveSegment(index: 3, startSeconds: 2.7, durationSeconds: 0.9)
@@ -167,7 +172,8 @@ final class Issue209LiveTargetDurationStabilityTests: XCTestCase {
         Thread.sleep(forTimeInterval: 0.2)
         XCTAssertNil(
             result.value,
-            "3.6s must not satisfy the refreshed TD=3, 9s holdback"
+            "3.6s must not satisfy the refreshed TD=2, 6s holdback (AE#447 sizes the floor by the "
+            + "patience its 2.2s cadence needs; it is still a refreshed floor, and still binding)"
         )
 
         provider.cancelWaiters()

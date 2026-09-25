@@ -1,44 +1,43 @@
 import Foundation
 import CoreVideo
 import AVFoundation
-import Libavformat
-import Libavcodec
-import Libavutil
+import AetherLibavformat
+import AetherLibavcodec
+import AetherLibavutil
 
 extension AetherEngine {
 
     // MARK: - Probe
 
-    /// One-shot container + stream metadata read; no HLS server or decoders. Network sources pull a HEAD probe + small initial range (typically a few MB). File sources read directly via FFmpeg's file protocol.
+    /// One-shot container + stream metadata read; no HLS server or detail-pass decoders.
+    /// Omit `limits` and `cancellation` to retain the existing open path. Opting in controls the entire
+    /// probe, starting before source I/O; see `ProbeLimits` and `ProbeCancellation`.
     ///
     /// - Parameters:
     ///   - url: Media source (`file://`, `http://`, or `https://`).
     ///   - options: Forwarded for `httpHeaders` only; other flags ignored (no playback session).
-    /// - Throws: Any error the demuxer raises during open / probe.
+    ///   - limits: Optional shared input, packet and monotonic time limits.
+    ///   - cancellation: Optional one-shot token, callable from another thread or a task cancellation handler.
+    /// - Throws: Open errors, `ProbeError` for a controlled stop, or `CancellationError`.
     public nonisolated static func probe(
         url: URL,
-        options: LoadOptions = .init()
+        options: LoadOptions = .init(),
+        limits: ProbeLimits? = nil,
+        cancellation: ProbeCancellation? = nil
     ) throws -> SourceProbe {
-        try probe(source: .url(url), options: options)
+        try probe(source: .url(url), options: options, detecting: [],
+                  limits: limits, cancellation: cancellation)
     }
 
     /// `probe(url:)` for a custom byte source (AetherEngine#27). Caller retains reader ownership; cursor is left at an unspecified position and `close()` is NOT called. Pass a fresh (or rewound) reader to `load(source:)` afterwards. `SourceProbe.url` is `aether-custom://source` for custom readers.
     public nonisolated static func probe(
         source: MediaSource,
-        options: LoadOptions = .init()
+        options: LoadOptions = .init(),
+        limits: ProbeLimits? = nil,
+        cancellation: ProbeCancellation? = nil
     ) throws -> SourceProbe {
-        let demuxer = Demuxer()
-        let displayURL: URL
-        switch source {
-        case .url(let u):
-            try demuxer.open(url: u, extraHeaders: options.httpHeaders)
-            displayURL = u
-        case .custom(let reader, let formatHint):
-            try demuxer.open(reader: reader, formatHint: formatHint)
-            displayURL = URL(string: "aether-custom://source")!
-        }
-        defer { demuxer.close() }
-        return makeSourceProbe(demuxer: demuxer, displayURL: displayURL)
+        try probe(source: source, options: options, detecting: [],
+                  limits: limits, cancellation: cancellation)
     }
 
     // MARK: - Bounded, opt-in Atmos/JOC detail probe
@@ -54,8 +53,7 @@ extension AetherEngine {
     /// host specifically needs an authoritative "Dolby Atmos" badge (e.g. a details screen): it is strictly
     /// more expensive than `probe(url:)` (it opens a real EAC3 decoder and decodes at least one frame) and
     /// MUST NOT be used on the playback-start critical path. `probe(url:)` / `probe(source:)` themselves are
-    /// completely unmodified by this API and remain byte-for-byte the same lightweight demux-only probe --
-    /// this is an additive, separate entry point, not a flag on the existing one.
+    /// demux-only unless detail detection is requested. Whole-probe controls are separately opt-in.
     ///
     /// The decode pass is bounded by `atmosDetection` (packet-count / byte / wall-clock caps -- see
     /// `AtmosDetectionOptions`): it stops at the first successfully decoded audio frame, or at whichever cap
@@ -74,15 +72,18 @@ extension AetherEngine {
     ///     packets / 8 MiB / 2 s wall clock (soft -- see `AtmosDetectionOptions` doc for the same
     ///     AVIO-blocking caveat `Demuxer.seekBounded` already documents: a single blocking `av_read_frame()`
     ///     on a stalled remote socket can still run past the wall-clock budget before the next check fires).
-    /// - Throws: Any error the demuxer raises during open / probe -- identical to `probe(url:)`. Decode-side
+    /// - Throws: Open errors, `ProbeError` for whole-probe stops, or `CancellationError`. Decode-side
     ///   failures (bad EAC3 extradata, no decoder built, a malformed frame, EOF before any frame decodes) are
     ///   NEVER thrown; they only affect whether Atmos gets confirmed.
     public nonisolated static func probeDetectingAtmos(
         url: URL,
         options: LoadOptions = .init(),
-        atmosDetection: AtmosDetectionOptions = .init()
+        atmosDetection: AtmosDetectionOptions = .init(),
+        limits: ProbeLimits? = nil,
+        cancellation: ProbeCancellation? = nil
     ) throws -> SourceProbe {
-        try probeDetectingAtmos(source: .url(url), options: options, atmosDetection: atmosDetection)
+        try probe(source: .url(url), options: options, detecting: .atmos, atmosDetection: atmosDetection,
+                  limits: limits, cancellation: cancellation)
     }
 
     /// `probeDetectingAtmos(url:)` for a custom byte source. Same reader-ownership contract as `probe(source:)`:
@@ -90,33 +91,190 @@ extension AetherEngine {
     public nonisolated static func probeDetectingAtmos(
         source: MediaSource,
         options: LoadOptions = .init(),
-        atmosDetection: AtmosDetectionOptions = .init()
+        atmosDetection: AtmosDetectionOptions = .init(),
+        limits: ProbeLimits? = nil,
+        cancellation: ProbeCancellation? = nil
     ) throws -> SourceProbe {
-        let demuxer = Demuxer()
-        let displayURL: URL
-        switch source {
-        case .url(let u):
-            try demuxer.open(url: u, extraHeaders: options.httpHeaders)
-            displayURL = u
-        case .custom(let reader, let formatHint):
-            try demuxer.open(reader: reader, formatHint: formatHint)
-            displayURL = URL(string: "aether-custom://source")!
-        }
-        defer { demuxer.close() }
+        try probe(source: source, options: options, detecting: .atmos, atmosDetection: atmosDetection,
+                  limits: limits, cancellation: cancellation)
+    }
 
-        let base = makeSourceProbe(demuxer: demuxer, displayURL: displayURL)
-        // Flush what `avformat_find_stream_info` left queued before the decode pass starts. Those packets
-        // were read before `detectAtmos` sets AVDISCARD_ALL, so libavformat hands them back regardless of
-        // the hint: on a source whose audio does not sit at the head, the pass burns its whole foreign-packet
-        // fuse on that queue and reports "not Atmos" for genuinely Atmos media without ever reading a byte
-        // of audio. Seeking to the start discards the queue so the discard takes effect from the first read.
-        // A source that cannot seek is no worse off than before.
-        demuxer.seekBounded(to: 0, timeout: Self.atmosProbeFlushSeekTimeout)
+    // MARK: - Bounded, opt-in detail probe
+
+    /// `probe(url:)` plus the bounded, OPT-IN passes named in `detecting`, over ONE open handle to the source.
+    ///
+    /// Everything the base probe reports comes from the container. Two things a host wants to put on a
+    /// details screen are not in there:
+    ///
+    /// - **Dolby Atmos**, which for E-AC-3 means the JOC flag in the dependent substream and only exists
+    ///   post-decode (`.atmos`, see `AtmosDetectionOptions`), and
+    /// - **HDR10+**, whose ST 2094-40 metadata rides an in-band ITU-T T.35 SEI that no demuxer parses
+    ///   (`.hdr10Plus`, see `HDR10PlusDetectionOptions`).
+    ///
+    /// Both cost reads past `avformat_find_stream_info`, which is why `probe(url:)` does neither.
+    /// Neither is for the playback-start critical path. Asking for both runs both
+    /// over one demuxer: the HDR10+ scan first, out of the packets `find_stream_info` already
+    /// queued, then the queue-flushing seek the Atmos decode pass needs.
+    ///
+    /// Both passes are additive and one-directional. They can only ever SET `isAtmos` /
+    /// `carriesHDR10PlusMetadata`, never clear what the container already declared, and a pass that hits a cap
+    /// leaves the base probe's answer exactly where it was.
+    ///
+    /// - Parameters:
+    ///   - url: Media source, forwarded verbatim to `probe(url:)`.
+    ///   - options: Forwarded verbatim to `probe(url:)` (`httpHeaders` only).
+    ///   - detecting: Which extra passes to run. Empty is the header probe with the same controls.
+    ///   - atmosDetection: Bounds + optional track override for the Atmos decode pass. Ignored without `.atmos`.
+    ///   - hdr10PlusDetection: Bounds for the HDR10+ scan. Ignored without `.hdr10Plus`.
+    ///   - limits: Whole-probe limits, shared across open, stream analysis, seeks and both passes.
+    ///   - cancellation: Cancellation reaches HTTP I/O or the custom reader's `cancel()`.
+    /// - Throws: Open errors, `ProbeError` for whole-probe stops, or `CancellationError`. Ordinary
+    ///   pass-side failures and per-pass caps only mean a detail stays unconfirmed.
+    public nonisolated static func probe(
+        url: URL,
+        options: LoadOptions = .init(),
+        detecting: ProbeDetail,
+        atmosDetection: AtmosDetectionOptions = .init(),
+        hdr10PlusDetection: HDR10PlusDetectionOptions = .init(),
+        limits: ProbeLimits? = nil,
+        cancellation: ProbeCancellation? = nil
+    ) throws -> SourceProbe {
+        try probe(source: .url(url), options: options, detecting: detecting,
+                  atmosDetection: atmosDetection, hdr10PlusDetection: hdr10PlusDetection,
+                  limits: limits, cancellation: cancellation)
+    }
+
+    /// `probe(url:detecting:)` for a custom byte source (SMB, WebDAV, a disc image, anything behind an
+    /// `IOReader`). Same reader-ownership contract as `probe(source:)`: the caller retains ownership, the
+    /// cursor is left at an unspecified position, and `close()` is NOT called.
+    public nonisolated static func probe(
+        source: MediaSource,
+        options: LoadOptions = .init(),
+        detecting: ProbeDetail,
+        atmosDetection: AtmosDetectionOptions = .init(),
+        hdr10PlusDetection: HDR10PlusDetectionOptions = .init(),
+        limits: ProbeLimits? = nil,
+        cancellation: ProbeCancellation? = nil
+    ) throws -> SourceProbe {
+        let control = try limits != nil || cancellation != nil
+            ? ProbeControl(limits: limits, cancellation: cancellation) : nil
+        let demuxer = Demuxer()
+        demuxer.probeControl = control
+        var ownedReader: IOReader?
+        func closeInput() {
+            demuxer.close()
+            ownedReader?.close()
+            ownedReader = nil
+        }
+        defer {
+            closeInput()
+            // Native calls have ended; join interruption callbacks before the host can reuse its reader.
+            control?.finish()
+        }
+        let displayURL: URL
+        do {
+            try control?.check()
+            switch source {
+            case .url(let u):
+                displayURL = u
+                if let control {
+                    let reader: IOReader
+                    if u.isFileURL {
+                        guard let file = FileIOReader(url: u) else { throw DemuxerError.openFailed(code: -1) }
+                        reader = file
+                    } else if ["http", "https"].contains(u.scheme?.lowercased() ?? "") {
+                        reader = ProbeHTTPReader(url: u, headers: options.httpHeaders, control: control)
+                    } else {
+                        throw ProbeError.unsupportedURL
+                    }
+                    ownedReader = reader
+                    let counted = ProbeIOReader(reader: reader, control: control)
+                    try control.check()
+                    if let http = reader as? ProbeHTTPReader { try http.open() }
+                    try control.check()
+                    try demuxer.open(reader: counted, profile: probeOpenProfile(limits: limits))
+                } else {
+                    try demuxer.open(url: u, extraHeaders: options.httpHeaders)
+                }
+            case .custom(let reader, let formatHint):
+                displayURL = URL(string: "aether-custom://source")!
+                if let control {
+                    try demuxer.open(reader: ProbeIOReader(reader: reader, control: control),
+                                     formatHint: formatHint, profile: probeOpenProfile(limits: limits))
+                } else {
+                    try demuxer.open(reader: reader, formatHint: formatHint)
+                }
+            }
+            try control?.check()
+        } catch {
+            try control?.check()
+            throw error
+        }
+
+        var probe = makeSourceProbe(demuxer: demuxer, displayURL: displayURL)
+
+        // HDR10+ first, and before any seek: `avformat_find_stream_info` leaves its packets queued and
+        // `av_read_frame` hands those back first, so at the head of a container the scan gets video packets
+        // that have already been paid for. Running it after the Atmos pass would mean re-reading them.
+        if detecting.contains(.hdr10Plus) {
+            let outcome = Self.detectHDR10Plus(
+                demuxer: demuxer, videoIndex: demuxer.videoStreamIndex, options: hdr10PlusDetection)
+            try control?.check()
+            if outcome.carriesHDR10Plus {
+                probe = Self.enrichHDR10Plus(base: probe)
+            }
+        }
+
         let targetIndex = Self.atmosDecodeTargetIndex(
             options: atmosDetection, defaultAudioStreamIndex: demuxer.audioStreamIndex)
-        let outcome = Self.detectAtmos(demuxer: demuxer, targetIndex: targetIndex, options: atmosDetection)
-        guard outcome.confirmedAtmos else { return base }
-        return Self.enrichAtmos(base: base, confirmedTrackID: Int(targetIndex))
+        if detecting.contains(.atmos),
+           demuxer.stream(at: targetIndex)?.pointee.codecpar.pointee.codec_id == AV_CODEC_ID_EAC3,
+           !probe.audioTracks.contains(where: { $0.id == Int(targetIndex) && $0.isAtmos }) {
+            try control?.check()
+            // Flush what is still queued before the decode pass starts. Those packets were read before
+            // `detectAtmos` sets AVDISCARD_ALL, so libavformat hands them back regardless of the hint: on a
+            // source whose audio does not sit at the head, the pass burns its whole foreign-packet fuse on
+            // that queue and reports "not Atmos" for genuinely Atmos media without ever reading a byte of
+            // audio. Seeking to the start discards the queue so the discard takes effect from the first read.
+            // A source that cannot seek is no worse off than before. (It also puts a source the HDR10+ scan
+            // has just walked back at the start.)
+            demuxer.seekBounded(to: 0, timeout: Self.atmosProbeFlushSeekTimeout)
+            try control?.check()
+            let outcome = Self.detectAtmos(demuxer: demuxer, targetIndex: targetIndex, options: atmosDetection)
+            try control?.check()
+            if outcome.confirmedAtmos {
+                probe = Self.enrichAtmos(base: probe, confirmedTrackID: Int(targetIndex))
+            }
+        }
+
+        closeInput()
+        try control?.complete()
+        return probe
+    }
+
+    /// The caller's own limits are the only thing allowed to bind a controlled probe.
+    ///
+    /// Built from `.playback` rather than `.stillExtraction`: a host that asks for limits is asking to
+    /// bound the COST, not to be answered from a shallower read, and a second hidden budget (the still
+    /// extractor's 2 MiB probe and 2 s analysis) would make `probe(url:limits:)` report fewer streams
+    /// than `probe(url:)` on exactly the sparse sources where that matters. `maxInputBytes` clamps the
+    /// probe size, and the deadline plus the FFmpeg interrupt callback bound the analysis instead.
+    /// The profile's AVIO tuning is not read on this path at all: a controlled probe always opens
+    /// through a reader, whose own transport settings live in `ProbeHTTPReader`.
+    ///
+    /// The recordless Dolby Vision audit stays off, and that is a real gap rather than a tuning choice:
+    /// it opens the source a SECOND time by URL (`DolbyVisionRecordAudit.rpuProfileOfSource`), traffic
+    /// this probe's budget and cancellation do not reach, and `open(reader:)` clears `auditSource`
+    /// regardless. A controlled probe of an untagged 10-bit HEVC source therefore reports no Dolby
+    /// Vision record where an uncontrolled one does (AE#567).
+    private nonisolated static func probeOpenProfile(limits: ProbeLimits?) -> DemuxerOpenProfile {
+        guard let limits else { return .playback }
+        var profile = DemuxerOpenProfile.playback
+        // FFmpeg has a minimum probe size. The input seam still enforces smaller caller limits.
+        profile.probesize = max(32, min(profile.probesize, limits.maxInputBytes))
+        profile.auditsRecordlessDolbyVision = false
+        profile.readerLabel = "probe"
+        return profile
     }
 
     /// Flip `isAtmos` to `true` on exactly the one confirmed audio track, leaving everything else identical.
@@ -133,6 +291,18 @@ extension AetherEngine {
             confirmed.isAtmos = true
             return confirmed
         }
+        return probe
+    }
+
+    /// Record HDR10+ carriage on a probe: set the flag, and move `videoFormat` if it is the one label the
+    /// payload describes (see `hdr10PlusUpgradedFormat`).
+    ///
+    /// Mutates a copy rather than rebuilding the struct field by field: the memberwise init carries defaulted
+    /// parameters, so a hand-copy silently drops any field added later and the compiler stays quiet about it.
+    nonisolated static func enrichHDR10Plus(base: SourceProbe) -> SourceProbe {
+        var probe = base
+        probe.carriesHDR10PlusMetadata = true
+        probe.videoFormat = Self.hdr10PlusUpgradedFormat(base.videoFormat)
         return probe
     }
 
@@ -216,6 +386,10 @@ extension AetherEngine {
         return try swDecodeProbeRun(demuxer: demuxer, maxPackets: maxPackets)
     }
 
+    /// #407: how many decoded picture timestamps `swDecodeProbe` retains. Enough to read a reorder
+    /// cadence off, small enough that a long probe stays a diagnostic.
+    private nonisolated static let probeFrameTimeCap = 240
+
     private nonisolated static func swDecodeProbeRun(
         demuxer: Demuxer,
         maxPackets: Int
@@ -245,12 +419,18 @@ extension AetherEngine {
             var firstFramePixelFormat: String?
             var firstFrameWidth: Int = 0
             var firstFrameHeight: Int = 0
+            /// #407: in decoder output order, i.e. presentation order. Capped so a long run stays a
+            /// diagnostic rather than an allocation.
+            var frameTimesSeconds: [Double] = []
         }
         let accum = Accum()
 
         do {
-            try decoder.open(stream: stream) { pixelBuffer, _, _ in
+            try decoder.open(stream: stream) { pixelBuffer, pts, _ in
                 accum.framesDecoded += 1
+                if accum.frameTimesSeconds.count < Self.probeFrameTimeCap {
+                    accum.frameTimesSeconds.append(pts.seconds)
+                }
                 if accum.firstFramePixelFormat == nil {
                     let pfType = CVPixelBufferGetPixelFormatType(pixelBuffer)
                     let bytes: [UInt8] = [
@@ -323,7 +503,8 @@ extension AetherEngine {
             firstFramePixelFormat: accum.firstFramePixelFormat,
             firstFrameWidth: accum.firstFrameWidth,
             firstFrameHeight: accum.firstFrameHeight,
-            firstError: firstError
+            firstError: firstError,
+            frameTimesSeconds: accum.frameTimesSeconds
         )
     }
 
@@ -426,18 +607,19 @@ extension AetherEngine {
             return override
         }
         // Each preference is scanned across all tracks in order, so an earlier preference on a later
-        // track still beats a later preference on an earlier track.
-        for preferred in preferredLanguages {
-            if let match = tracks.first(where: { languageMatches($0.language, preferred) }) {
-                return Int32(match.id)
-            }
-        }
-        return nil
+        // track still beats a later preference on an earlier track. Within one preference the most
+        // specific tag wins, so an "en-GB" preference takes en-GB over eng over en-US (#590).
+        guard let index = bestLanguageMatchIndex(
+            languages: tracks.map(\.language),
+            preferredLanguages: preferredLanguages,
+            kind: .audio
+        ) else { return nil }
+        return Int32(tracks[index].id)
     }
 
     /// Resolve the subtitle track to auto-activate from `LoadOptions.preferredSubtitleLanguages`: within the
-    /// first preference (scanned in order) that has any language match, the best-ranked track by
-    /// `subtitlePickRank`; else nil. Preference order dominates rank, so an earlier preference always beats a
+    /// first preference (scanned in order) that has any language match, the best track by language
+    /// specificity and then by `subtitlePickRank`; else nil. Preference order dominates rank, so an earlier preference always beats a
     /// later one. Unlike audio there is no explicit index override and no default fallback: nil means "keep
     /// subtitles off" (the default). Pure and nonisolated; the engine calls this at the end of a successful
     /// load and, on a hit, activates the track via the host-overlay path so a host without container metadata
@@ -446,14 +628,13 @@ extension AetherEngine {
         tracks: [TrackInfo],
         preferredLanguages: [String]
     ) -> Int32? {
-        for preferred in preferredLanguages {
-            let matches = tracks.filter { languageMatches($0.language, preferred) }
-            // min(by:) is stable, so equal-rank ties keep container order.
-            if let best = matches.min(by: { subtitlePickRank($0) < subtitlePickRank($1) }) {
-                return Int32(best.id)
-            }
-        }
-        return nil
+        guard let index = bestLanguageMatchIndex(
+            languages: tracks.map(\.language),
+            preferredLanguages: preferredLanguages,
+            kind: .subtitle,
+            secondaryRank: { subtitlePickRank(tracks[$0]) }
+        ) else { return nil }
+        return Int32(tracks[index].id)
     }
 
     /// Lower rank wins. The descriptor axis (full > SDH > forced > commentary, from container dispositions)
@@ -501,21 +682,22 @@ extension AetherEngine {
         return c == "eia_608" || c == "eia_708" || c == "cea708" || c == "cea_708"
     }
 
-    /// Case-insensitive language match across ISO 639-1 / 639-2 (B and T) / English name, e.g.
-    /// `"en" == "eng" == "english"`, `"de" == "deu" == "ger"`. Empty / nil track language never matches.
-    /// Shared by audio (#72) and subtitle (#73) language selection. Pure and unit-tested.
+    /// Whether the two labels name the same language, ignoring how specific either one is: case,
+    /// ISO 639-1 / 639-2 (B and T) / 639-3 / English name, and any region or script subtag. So
+    /// `"en" == "eng" == "english" == "en-US"`, `"de" == "deu" == "ger"`. Empty / nil / `und` / a
+    /// free-form track name never matches. Shared by audio (#72) and subtitle (#73) selection.
+    ///
+    /// This is the plain yes-or-no question, for callers that only need to know whether a track is
+    /// in the right language. Selection goes through `languageMatchRank` instead, which keeps the
+    /// specificity this deliberately drops (#590).
     nonisolated static func languageMatches(_ trackLanguage: String?, _ preferred: String) -> Bool {
-        guard let track = trackLanguage?.lowercased().trimmingCharacters(in: .whitespaces),
-              !track.isEmpty else { return false }
-        let want = preferred.lowercased().trimmingCharacters(in: .whitespaces)
-        guard !want.isEmpty else { return false }
-        if track == want { return true }
-        return languageSynonyms.contains { $0.contains(track) && $0.contains(want) }
+        languageMatchRank(trackLanguage, preferred, kind: .audio) != nil
     }
 
-    /// ISO 639-1 / 639-2/T / 639-2/B equivalence classes (plus common English names); anything outside
-    /// falls back to strict equality. Mirrors the host-side table so engine-resolved selection matches
-    /// what hosts computed before #72.
+    /// ISO 639-1 / 639-2/T / 639-2/B equivalence classes plus the common English names, which is the
+    /// part ICU cannot resolve: `LanguageTag.canonicalPrimary` reads every set through
+    /// `AudioLanguageMap` first and only falls back to this table. Mirrors the host-side table so
+    /// engine-resolved selection matches what hosts computed before #72.
     nonisolated static let languageSynonyms: [Set<String>] = [
         ["de", "deu", "ger", "german"], ["en", "eng", "english"], ["fr", "fra", "fre", "french"],
         ["es", "spa", "spanish"], ["it", "ita", "italian"], ["ja", "jpn", "japanese"],
@@ -549,8 +731,11 @@ extension AetherEngine {
         return "VideoToolbox \(name) (HW)"
     }
 
-    /// User-facing label for the active audio decoder on the SW path (libavcodec -> CoreAudio). nil when no audio track.
-    static func softwareAudioDecoderLabel(
+    /// User-facing label for the active audio decoder on the SW path (libavcodec -> CoreAudio). nil when
+    /// no audio track. AE#462: `activeIndex` is the HOST's resolved index, never the engine's pick. The
+    /// pick says which track was asked for; a session whose decoder refused to open serves none, and
+    /// this label used to name one for it.
+    nonisolated static func softwareAudioDecoderLabel(
         audioTracks: [TrackInfo],
         activeIndex: Int32
     ) -> String? {
@@ -576,19 +761,194 @@ extension AetherEngine {
     }
 
     /// Clamp source format to what the panel can present. On non-DV panels, publishes the HDR10/HLG base layer format (hvc1 path); SDR-base DV (P8.2) collapses to .sdr (HLSVideoEngine refuses to serve it).
-    static func effectiveVideoFormat(
+    ///
+    /// The capability table is passed in rather than read here: on the platforms with no per-mode API it
+    /// carries the host's own assertion (AE#493), and the caller is the one holding this session's options.
+    nonisolated static func effectiveVideoFormat(
         detected: VideoFormat,
-        stream: UnsafeMutablePointer<AVStream>
+        stream: UnsafeMutablePointer<AVStream>,
+        capabilities: DisplayCapabilities
+    ) -> VideoFormat {
+        effectiveVideoFormat(detected: detected,
+                             baseTransfer: stream.pointee.codecpar.pointee.color_trc,
+                             capabilities: capabilities)
+    }
+
+    /// The clamp itself, off the stream so it can be exercised against a capability table the test machine
+    /// does not have. AE#493 turned on what a table of `false` does to a source, and nothing pinned it.
+    nonisolated static func effectiveVideoFormat(
+        detected: VideoFormat,
+        baseTransfer: AVColorTransferCharacteristic,
+        capabilities: DisplayCapabilities
     ) -> VideoFormat {
         guard detected == .dolbyVision else { return detected }
-        let caps = displayCapabilities
-        if caps.supportsDolbyVision { return .dolbyVision }
-        let trc = stream.pointee.codecpar.pointee.color_trc
-        if trc == AVCOL_TRC_ARIB_STD_B67 {
-            return caps.supportsHLG ? .hlg : .sdr
+        if capabilities.supportsDolbyVision { return .dolbyVision }
+        if baseTransfer == AVCOL_TRC_ARIB_STD_B67 {
+            return capabilities.supportsHLG ? .hlg : .sdr
         }
         // SMPTE2084 base (P5/P7/P8.1) or unspecified trc (P5 with empty VUI): AVPlayer tonemaps via dvh1 on non-DV panel.
-        return caps.supportsHDR10 ? .hdr10 : .sdr
+        return capabilities.supportsHDR10 ? .hdr10 : .sdr
+    }
+
+    /// The format to publish as `videoFormat`: what the panel is presenting, not what the file carries
+    /// (`sourceVideoFormat` is that). One funnel for both the load-time answer and the late one the #459
+    /// playback probe can produce seconds later, so the two cannot drift apart.
+    ///
+    /// The HDR10+ carry-over exists because the two can arrive in either order. `handleHDR10PlusDetected`
+    /// upgrades a `videoFormat` that already reads `.hdr10`, and on a panel whose answer is still pending
+    /// the label reads `.sdr` when the T.35 payload lands, so the upgrade is skipped and the evidence
+    /// survives in the session's latch alone. Republishing the bare effective format would then relabel a
+    /// proven HDR10+ session "HDR10+ -> HDR10", trading one wrong arrow for a quieter one.
+    ///
+    /// The latch rather than `sourceVideoFormat == .hdr10Plus`: a Dolby Vision source can carry an HDR10+
+    /// layer too (Blu-ray Profile 7, and Profile 8.1 remuxed from one), `sourceVideoFormat` keeps saying
+    /// Dolby Vision for it, and a display without Dolby Vision presents that HDR10+ base (AE#459).
+    nonisolated static func presentedVideoFormat(
+        effectiveFormat: VideoFormat,
+        panelPresentsHDR: Bool,
+        sourceCarriesHDR10Plus: Bool
+    ) -> VideoFormat {
+        guard effectiveFormat != .sdr, panelPresentsHDR else { return .sdr }
+        if effectiveFormat == .hdr10, sourceCarriesHDR10Plus { return .hdr10Plus }
+        return effectiveFormat
+    }
+
+    /// AE#515 (from #493): the label a loopback session takes back from the item AVFoundation is playing,
+    /// where the platform has no capability table to clamp it against.
+    ///
+    /// `AVPlayer.availableHDRModes` is `API_UNAVAILABLE(macos)`, so `supportsDolbyVision` is false on
+    /// every Mac unless the host asserts it, and `effectiveVideoFormat` sends a Profile 5 PQ base to
+    /// `.hdr10`. Measured with the assertion off on a 16" XDR: Profile 5 and Profile 8.1 both strobe
+    /// against Dolby's reference content, so the RPU reaches the pixels with no claim set anywhere and
+    /// the clamp was moving nothing but the label. `NativeAVPlayerHost` already parses the served item's
+    /// sample entry, and a `dvh1` / `dvhe` entry is that session's own evidence.
+    ///
+    /// An upgrade rather than the unconditional mirror `loadRemoteHLS` wires, and each term earns its
+    /// place by a case it keeps out:
+    ///
+    /// - `perModeCapabilitiesObservable` keeps tvOS and iOS out, where the table answers and the label
+    ///   follows it. A Profile 5 master carries `dvh1` on every panel, so the mirror would relabel a
+    ///   tvOS session parked in SDR, or one on an HDR10-only panel, as Dolby Vision.
+    /// - `.hdr10` is the only clamped value taken back. `.sdr` is the clamp being right about a display
+    ///   that presents no HDR at all, and `.dolbyVision` is a session that already says so.
+    /// - the item term is what the evidence actually is. Profile 8.1 reports `hvc1` and composes anyway,
+    ///   which nothing in the stack reports, so it keeps `.hdr10`.
+    /// - the source term is the engine's own probe agreeing. A probe that did not call the source Dolby
+    ///   Vision leaves no RPU to compose, and the disagreement is a packaging fault worth seeing rather
+    ///   than a label to publish.
+    ///
+    /// `nil` means leave the published label alone.
+    nonisolated static func dolbyVisionLabelUpgrade(
+        publishedFormat: VideoFormat,
+        sourceFormat: VideoFormat,
+        itemFormat: VideoFormat,
+        perModeCapabilitiesObservable: Bool
+    ) -> VideoFormat? {
+        guard !perModeCapabilitiesObservable,
+              publishedFormat == .hdr10,
+              sourceFormat == .dolbyVision,
+              itemFormat == .dolbyVision else { return nil }
+        return .dolbyVision
+    }
+
+    /// AE#459: what this session takes the panel to be presenting, from the host's assertion and the
+    /// engine's own criteria readout.
+    ///
+    /// The assertion is an OR term over the readout, never a replacement for it, and it defaults to
+    /// `false`, so a host that asserts nothing is where it was. Both halves are here because each one goes
+    /// silent somewhere. `currentPanelIsHDR()` rests on the EDR headroom, which only answers around a
+    /// dynamic-range TRANSITION: an Apple TV whose output is locked to HDR never makes one and reads as an
+    /// SDR panel forever, and on tvOS 27 the property stopped moving on at least one box even across a real
+    /// switch. A suppressed-criteria host has no readout to take at all, which is why the assertion used to
+    /// count only there.
+    ///
+    /// `nil` readout means suppressed, not false: the difference matters in the log, where a suppressed
+    /// session has nothing to compare the assertion against.
+    nonisolated static func sessionPanelPresentsHDR(hostAsserts: Bool, criteriaReadout: Bool?) -> Bool {
+        hostAsserts || (criteriaReadout ?? false)
+    }
+
+    /// AE#459: what the ROUTE may assume about the panel, which is deliberately more than what the LABEL
+    /// may claim.
+    ///
+    /// The label answers "what is this display presenting", and where nothing can answer it the honest
+    /// value is SDR. The route answers a different question, "will AVFoundation accept an HDR master
+    /// here", and there is exactly one component that knows: AVFoundation. Predicting its answer from
+    /// `UIScreen.currentEDRHeadroom` was never more than a proxy, and the proxy is measurably unreliable.
+    /// Measured on one Apple TV 4K 3rd gen on tvOS 26.6 against a panel whose own info display reported
+    /// HDR at the time: the property read a flat 1.00 across 46 samples of HDR content and the session
+    /// routed media-direct, and later the same day, same box, same output format, same title, it read
+    /// 1.20. The TV reporting HDR while the property read 1.00 is what rules out a silently dropped link,
+    /// so the panel was presenting HDR and the property was wrong about it. What moves it is NOT
+    /// established: the "4K HDR10+" output mode was blamed and then refuted by running the comparison back
+    /// the other way. The only pattern the data supports is a correlation, that every correct reading
+    /// follows a recent output-format change while every wrong one comes from a box parked in one mode.
+    ///
+    /// So on an unproven panel the engine serves the master and lets acceptance or refusal be the readout
+    /// the display will not give. What refusal costs was measured before this was built rather than
+    /// assumed: output locked to 4K SDR with Match Content off, master forced, a PQ title. AVPlayer failed
+    /// the item with `-11868` after 54 ms with zero `errorLog` events, `MasterFallbackDecision` swapped the
+    /// media playlist onto the live `AVPlayer` at the same position, and the item was playing 223 ms after
+    /// the master was served, with no visible black frame.
+    ///
+    /// Three terms, each earning its place. A panel that PROVED itself short-circuits, so a box on plain
+    /// "4K HDR" never attempts anything and pays nothing. Eligibility is required, so a display that
+    /// cannot do HDR at all is never offered a master it has no business receiving. And the refusal is
+    /// latched for the process, so the 223 ms is paid at most once by a genuinely SDR panel rather than on
+    /// every title.
+    ///
+    /// What this deliberately does NOT do is move the label. Acceptance is better evidence than the
+    /// headroom ever was, but publishing HDR because a master was SERVED would claim exactly what this
+    /// issue was opened about, one frame earlier.
+    nonisolated static func sessionRoutesAsHDRPanel(
+        panelPresentsHDR: Bool,
+        attemptWhenUnproven: Bool,
+        displayEligibleForHDR: Bool,
+        panelRefusedHDRMaster: Bool
+    ) -> Bool {
+        if panelPresentsHDR { return true }
+        return attemptWhenUnproven && displayEligibleForHDR && !panelRefusedHDRMaster
+    }
+
+    /// AE#541: the HDR route of an in-place rebuild, composed from the same two decisions the load makes.
+    ///
+    /// The readout and the display's eligibility are the load's, because the rebuild runs no handshake to
+    /// take them again. The host's assertion and the attempt lever are the session's current options, so a
+    /// `reloadAtCurrentPosition(applying:)` correction still moves the route. The refusal latch is read
+    /// now rather than carried: a master the panel refused after the load must not be served again.
+    nonisolated static func reloadRoutesAsHDRPanel(
+        hostAsserts: Bool,
+        criteriaReadoutAtLoad: Bool?,
+        attemptWhenUnproven: Bool,
+        isLive: Bool,
+        displayEligibleForHDR: Bool,
+        panelRefusedHDRMaster: Bool
+    ) -> Bool {
+        sessionRoutesAsHDRPanel(
+            panelPresentsHDR: sessionPanelPresentsHDR(
+                hostAsserts: hostAsserts, criteriaReadout: criteriaReadoutAtLoad),
+            attemptWhenUnproven: attemptWhenUnproven && !isLive,
+            displayEligibleForHDR: displayEligibleForHDR,
+            panelRefusedHDRMaster: panelRefusedHDRMaster)
+    }
+
+    /// AE#535: the display table an in-place rebuild routes from, on the same principle as the route
+    /// above: the load's answer, because the rebuild is not a fresh look at the display.
+    ///
+    /// `displayCapabilities` answers at call time, and on tvOS a backgrounded process is answered for its
+    /// own state rather than for the display: every per-mode term reads false, the user's Match-Content
+    /// preference reads `off` beside it, and both come back when the app does. A route-death rebuild lands
+    /// inside that window (measured at 0.7 s and 2.5 s after the transition), so a table read there would
+    /// clamp an HDR source to SDR and withhold its master on a panel nothing had changed. The host's
+    /// Dolby Vision assertion is applied to it here, as at the load, because it is the session's claim and
+    /// not an observation. Reading now is the fallback for a rebuild with no load behind it, which the
+    /// engine's own paths cannot produce.
+    nonisolated static func reloadDisplayCapabilities(
+        observedAtLoad: DisplayCapabilities?,
+        hostAssertsDolbyVision: Bool,
+        readNow: () -> DisplayCapabilities
+    ) -> DisplayCapabilities {
+        (observedAtLoad ?? readNow()).assertingDolbyVision(hostAssertsDolbyVision)
     }
 
     private nonisolated static func streamHasDV(stream: UnsafeMutablePointer<AVStream>) -> Bool {
@@ -621,6 +981,22 @@ extension AetherEngine {
             guard item.type == AV_PKT_DATA_DOVI_CONF, let raw = item.data, item.size >= 8 else { continue }
             let record = raw.withMemoryRebound(to: AVDOVIDecoderConfigurationRecord.self, capacity: 1) { $0.pointee }
             return (Int(record.dv_profile), Int(record.dv_bl_signal_compatibility_id))
+        }
+        return nil
+    }
+
+    /// Container-declared stereo layout from stream-level `AV_PKT_DATA_STEREO3D` side data; nil when the
+    /// stream declares none. Matroska StereoMode is the source in practice (`stereo_mode` in the stream
+    /// metadata is the same value spelled as a string). Read for routing: `AV_STEREO3D_FRAMESEQUENCE` on
+    /// H.264 means both views ride in one track (#435).
+    nonisolated static func stereo3DType(stream: UnsafeMutablePointer<AVStream>) -> AVStereo3DType? {
+        let nb = Int(stream.pointee.codecpar.pointee.nb_coded_side_data)
+        guard nb > 0, let sideData = stream.pointee.codecpar.pointee.coded_side_data else { return nil }
+        for i in 0..<nb {
+            let item = sideData[i]
+            guard item.type == AV_PKT_DATA_STEREO3D, let raw = item.data,
+                  item.size >= MemoryLayout<AVStereo3D>.size else { continue }
+            return raw.withMemoryRebound(to: AVStereo3D.self, capacity: 1) { $0.pointee.type }
         }
         return nil
     }

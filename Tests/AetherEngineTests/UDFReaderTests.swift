@@ -94,6 +94,38 @@ final class UDFReaderTests: XCTestCase {
         }
     }
 
+    // audit NET-4: `off + len <= lvd.count` only bounds the map's OWN declared length; a type 1 or
+    // type 2 map short enough to pass that check but too short to hold the fields the reader
+    // indexes (off+4, off+38..43) used to read past the sector buffer and trap once a run of
+    // padding maps pushed `off` near the sector's end.
+    func test_craftedPartitionMapDoesNotReadPastSector() {
+        var data = [UInt8](image())
+        let lvdBase = 258 * 2048
+        var maps: [UInt8] = []
+        for _ in 0..<6 { maps += [0, 255] + [UInt8](repeating: 0, count: 253) } // type 0, len 255 (padding)
+        maps += [0, 74] + [UInt8](repeating: 0, count: 72)                     // type 0, len 74 (padding)
+        maps += [1, 2]                                                         // type 1, len 2: too short for off+4
+        XCTAssertLessThanOrEqual(440 + maps.count, 2048, "the crafted layout must still fit the sector")
+        for (i, b) in maps.enumerated() { data[lvdBase + 440 + i] = b }
+        for (i, b) in UDFFixture.le32(maps.count).enumerated() { data[lvdBase + 264 + i] = b } // MapTableLength
+        for (i, b) in UDFFixture.le32(8).enumerated() { data[lvdBase + 268 + i] = b }          // NumberOfPartitionMaps
+        XCTAssertThrowsError(try UDFReader(reader: DataIOReader(data: Data(data))))
+    }
+
+    // audit NET-11: `vdsLen` is an untrusted u32 from the anchor; unclamped it can drive up to
+    // ~2 million sequential sector reads before parsing fails. The scan must stay capped near the
+    // real Volume Descriptor Sequence's size (ECMA-167: 16 sectors) instead of trusting the anchor.
+    func test_hostileAnchorLengthCapsTheVDSScan() {
+        let mock = SparseSectorReader()
+        var avdp = [UInt8](repeating: 0, count: 2048)
+        UDFFixture.tag(2, location: 256, into: &avdp)
+        avdp[16..<24] = ArraySlice(UDFFixture.extentAD(lenBytes: 0xFFFF_FFFF, location: 300))
+        mock.setSector(256, avdp)
+        XCTAssertThrowsError(try UDFReader(reader: mock))
+        XCTAssertTrue((200...300).contains(mock.sectorReads),
+                      "expected the VDS scan capped near 256 sectors, got \(mock.sectorReads)")
+    }
+
     func test_truncatedImageThrowsNotTrap() throws {
         // UDF image truncated before VDS (AVDP present at sector 256, VDS cut off): must throw, not trap.
         func be16(_ v: Int) -> [UInt8] { [UInt8((v>>8)&0xff), UInt8(v&0xff)] }
@@ -116,4 +148,38 @@ final class UDFReaderTests: XCTestCase {
             _ = try udf.list(path: ["BDMV"])
         }())
     }
+}
+
+/// Answers every sector as zero-filled unless a specific one was set, and counts reads: proves a
+/// scan is bounded rather than trusting an untrusted extent length (audit NET-11).
+private final class SparseSectorReader: IOReader, @unchecked Sendable {
+    private let ss = 2048
+    private var sectors: [Int: [UInt8]] = [:]
+    private var position: Int64 = 0
+    private let lock = NSLock()
+    private var _sectorReads = 0
+    var sectorReads: Int { lock.lock(); defer { lock.unlock() }; return _sectorReads }
+
+    func setSector(_ index: Int, _ bytes: [UInt8]) { sectors[index] = bytes }
+
+    func read(_ buffer: UnsafeMutablePointer<UInt8>?, size: Int32) -> Int32 {
+        guard let buffer, size > 0 else { return -1 }
+        lock.lock(); defer { lock.unlock() }
+        let sector = Int(position / Int64(ss))
+        let bytes = sectors[sector] ?? [UInt8](repeating: 0, count: ss)
+        let n = min(Int(size), bytes.count)
+        bytes.withUnsafeBufferPointer { buffer.update(from: $0.baseAddress!, count: n) }
+        position += Int64(n)
+        _sectorReads += 1
+        return Int32(n)
+    }
+
+    func seek(offset: Int64, whence: Int32) -> Int64 {
+        if whence == 65536 { return Int64.max / 2 }
+        guard whence == SEEK_SET else { return -1 }
+        position = offset
+        return position
+    }
+
+    func close() {}
 }

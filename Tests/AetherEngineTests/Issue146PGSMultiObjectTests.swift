@@ -1,7 +1,7 @@
 import Foundation
 import CoreGraphics
 import Testing
-import Libavcodec
+import AetherLibavcodec
 @testable import AetherEngine
 
 /// #146 (cmcpherson274): a PGS display set can carry MULTIPLE composition objects at the same start

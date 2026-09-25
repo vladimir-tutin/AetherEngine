@@ -94,4 +94,77 @@ struct SubtitleFrameCompositorTests {
         // No active cue at this PTS: passthrough again.
         #expect(compositor.composite(buffer, ptsSeconds: 20) === buffer)
     }
+
+    private func blackFrame(_ format: OSType) throws -> CVPixelBuffer {
+        var pb: CVPixelBuffer?
+        let attrs: [CFString: Any] = [kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary]
+        CVPixelBufferCreate(kCFAllocatorDefault, 720, 480, format, attrs as CFDictionary, &pb)
+        return try #require(pb)
+    }
+
+    private func attachment(_ buffer: CVPixelBuffer, _ key: CFString) -> CFTypeRef? {
+        CVBufferCopyAttachment(buffer, key, nil)
+    }
+
+    /// Audit DEC-3: the renderer describes the frame from the delivered buffer's attachments, so a
+    /// composited frame that dropped them showed anamorphic content at coded size and HDR as SDR
+    /// for exactly as long as a cue was on screen.
+    @Test("a composited frame keeps the source's pixel aspect ratio and colour tags")
+    func compositedFrameKeepsSourceAttachments() throws {
+        let compositor = SubtitleFrameCompositor()
+        compositor.update(cues: [SubtitleCue(id: 1, startTime: 0, endTime: 10, body: .text("HELLO"))], enabled: true)
+
+        let hdr = try blackFrame(kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange)
+        let aspect: NSDictionary = [
+            kCVImageBufferPixelAspectRatioHorizontalSpacingKey: 32,
+            kCVImageBufferPixelAspectRatioVerticalSpacingKey: 27,
+        ]
+        CVBufferSetAttachment(hdr, kCVImageBufferPixelAspectRatioKey, aspect, .shouldPropagate)
+        CVBufferSetAttachment(hdr, kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_2020, .shouldPropagate)
+        CVBufferSetAttachment(hdr, kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ, .shouldPropagate)
+        CVBufferSetAttachment(hdr, kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_2020, .shouldPropagate)
+
+        let out = compositor.composite(hdr, ptsSeconds: 5)
+        #expect(out !== hdr)
+        let par = attachment(out, kCVImageBufferPixelAspectRatioKey) as? NSDictionary
+        #expect(par?[kCVImageBufferPixelAspectRatioHorizontalSpacingKey] as? Int == 32)
+        #expect(par?[kCVImageBufferPixelAspectRatioVerticalSpacingKey] as? Int == 27)
+        #expect(attachment(out, kCVImageBufferTransferFunctionKey) as? String
+                == kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ as String)
+        #expect(attachment(out, kCVImageBufferColorPrimariesKey) as? String
+                == kCVImageBufferColorPrimaries_ITU_R_2020 as String)
+        #expect(attachment(out, kCVImageBufferYCbCrMatrixKey) as? String
+                == kCVImageBufferYCbCrMatrix_ITU_R_2020 as String)
+
+        let space = SubtitleFrameCompositor.renderColorSpace(for: hdr)
+        #expect(space.name == CGColorSpace.itur_2100_PQ)
+    }
+
+    @Test("a recycled output buffer does not keep an earlier source's pixel aspect ratio")
+    func recycledBufferDropsStaleAspect() throws {
+        let compositor = SubtitleFrameCompositor()
+        compositor.update(cues: [SubtitleCue(id: 1, startTime: 0, endTime: 10, body: .text("HELLO"))], enabled: true)
+        let format = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+
+        let anamorphic = try blackFrame(format)
+        let aspect: NSDictionary = [
+            kCVImageBufferPixelAspectRatioHorizontalSpacingKey: 32,
+            kCVImageBufferPixelAspectRatioVerticalSpacingKey: 27,
+        ]
+        CVBufferSetAttachment(anamorphic, kCVImageBufferPixelAspectRatioKey, aspect, .shouldPropagate)
+        // Several rounds, so the pool hands a buffer that already held the ratio back out.
+        for _ in 0..<4 { _ = compositor.composite(anamorphic, ptsSeconds: 5) }
+
+        let square = try blackFrame(format)
+        for _ in 0..<4 {
+            let out = compositor.composite(square, ptsSeconds: 5)
+            #expect(attachment(out, kCVImageBufferPixelAspectRatioKey) == nil)
+        }
+    }
+
+    @Test("an untagged source renders through BT.709")
+    func untaggedSourceFallsBackTo709() throws {
+        let space = SubtitleFrameCompositor.renderColorSpace(for: try blackFrame(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange))
+        #expect(space.name == CGColorSpace.itur_709)
+    }
 }

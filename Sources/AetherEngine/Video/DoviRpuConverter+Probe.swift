@@ -1,7 +1,7 @@
 import Foundation
-import Libavformat
-import Libavcodec
-import Libavutil
+import AetherLibavformat
+import AetherLibavcodec
+import AetherLibavutil
 
 /// Extract VPS/SPS/PPS NALs from hvcC extradata (22-byte header + numOfArrays arrays). Returns raw NAL bytes without length prefix or start code.
 private func parseHVCCParameterSets(_ ed: UnsafePointer<UInt8>, _ size: Int) -> [[UInt8]] {

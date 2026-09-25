@@ -10,9 +10,11 @@ import Testing
 //   22:33:59.355 [PanelProbe] headroom=1.20 switching=no      <- confirmed HDR10 session, 13 s in
 //   22:33:59.615 [PanelProbe] headroom=1.00 switching=no      <- same session, still HDR on the TV
 //
-// It is raised around a dynamic-range TRANSITION and decays while the panel keeps presenting HDR. A
-// replay onto an already-HDR panel makes no transition, so the headroom never rises and the single
-// read concluded "panel is SDR". On tvOS that one boolean is the whole master-vs-media routing gate
+// HDR video on the screen pulls the value down while the panel keeps presenting HDR. A replay starts
+// while the session being replaced was still doing that, so the single read concluded "panel is SDR".
+// (With nothing playing the same box reads its mode honestly and stably, measured 2026-09-02; see
+// `panelPresentsHDR`. The failure is WHEN the question gets asked, not that the panel has no answer.)
+// On tvOS that one boolean is the whole master-vs-media routing gate
 // (`resolveUseMasterPlaylist`: builtInPanelEngagesOnDemand is false there), so the session lost its
 // HDR signaling entirely.
 //

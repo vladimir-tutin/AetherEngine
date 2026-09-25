@@ -102,8 +102,17 @@ final class ISO9660Reader {
 
     // MARK: - Raw IO
 
+    /// Matches `UDFReader.readDirectory`'s directory cap. `length` is an unchecked on-disc u32
+    /// (root record or a subdirectory record); unclamped, a crafted `0xFFFFFFFF` zero-fills up to
+    /// 4 GB (jetsam on tvOS/iOS) and `Int32(count - got)` traps for anything past `Int32.max`
+    /// (audit NET-5).
+    private static let maxExtentBytes = 8 * 1024 * 1024
+
     private func readExtent(lba: Int, length: Int) throws -> [UInt8] {
-        try ISO9660Reader.readBytes(reader, at: lba * sectorSize, count: length)
+        guard length >= 0, length <= Self.maxExtentBytes else {
+            throw DiscError.malformed("extent length \(length) exceeds \(Self.maxExtentBytes) bytes")
+        }
+        return try ISO9660Reader.readBytes(reader, at: lba * sectorSize, count: length)
     }
 
     private static func readBytes(_ reader: IOReader, at offset: Int, count: Int) throws -> [UInt8] {
@@ -114,7 +123,10 @@ final class ISO9660Reader {
         var got = 0
         try buf.withUnsafeMutableBufferPointer { ptr in
             while got < count {
-                let n = reader.read(ptr.baseAddress!.advanced(by: got), size: Int32(count - got))
+                // Clamped so `Int32(...)` is always a checked, in-range conversion, whatever `count`
+                // a future caller passes (audit NET-5: `Int32(count - got)` used to trap directly).
+                let chunk = min(count - got, 1 << 20)
+                let n = reader.read(ptr.baseAddress!.advanced(by: got), size: Int32(chunk))
                 if n == 0 { break }            // EOF
                 if n < 0 { throw DiscError.malformed("read error at \(offset + got)") }
                 got += Int(n)

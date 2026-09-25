@@ -213,12 +213,16 @@ final class AudioOwnershipGate: @unchecked Sendable {
         decoder: AudioDecoder,
         packet: UnsafeMutablePointer<AVPacket>,
         output: AudioOutput,
-        tap: (@Sendable (CMSampleBuffer) -> Void)?
+        tap: (@Sendable (CMSampleBuffer) -> Void)?,
+        admitAfterDecode: () -> Bool = { true }
     ) -> [CMSampleBuffer] {
         lock.lock()
         defer { lock.unlock() }
         guard sideGeneration == nil else { return [] }
         let buffers = decoder.decode(packet: packet)
+        // AE#491: a seek's flush can land inside `decode`; its buffers then belong to the position
+        // the seek left behind and must not join the freshly flushed queue or move the frontier.
+        guard admitAfterDecode() else { return [] }
         mainPacketsDecoded += 1
         mainBuffersProduced += buffers.count
 

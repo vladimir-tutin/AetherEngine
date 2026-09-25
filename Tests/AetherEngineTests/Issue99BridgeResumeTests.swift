@@ -1,6 +1,6 @@
 import XCTest
-import Libavcodec
-import Libavutil
+import AetherLibavcodec
+import AetherLibavutil
 @testable import AetherEngine
 
 /// #99: VOD resume with bridged audio. Two defects:
