@@ -7,6 +7,7 @@ import PackageDescription
 let package = Package(
     name: "FlexUIiPadCheck",
     platforms: [.iOS(.v18)],
+    products: [.library(name: "AppCheck", targets: ["AppCheck"])],
     dependencies: [.package(name: "AetherEngine", path: "..")],
     targets: [
         .target(name: "FlexuiNative", path: "FlexuiNative",
