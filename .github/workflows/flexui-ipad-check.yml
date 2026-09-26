@@ -26,7 +26,7 @@ jobs:
         working-directory: flexui-ipad-check
         run: |
           set +e
-          xcodebuild build -scheme AppCheck -destination 'generic/platform=iOS' \
+          xcodebuild build -scheme FlexUIiPadCheck -destination 'generic/platform=iOS' \
             -skipMacroValidation CODE_SIGNING_ALLOWED=NO > build.log 2>&1
           status=$?
           grep -nE "error:|warning:.*(AetherVideoEngine|FlexVideoEngine)" build.log | head -80 || true
