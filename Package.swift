@@ -19,6 +19,17 @@ let package = Package(
             name: "AetherEngineSMB",
             targets: ["AetherEngineSMB"]
         ),
+        // FlexUI: the same target as a DYNAMIC framework, for hosts that also carry another FFmpeg
+        // (the iPad app ships VLCKit, whose dylib exports every av*/sws* symbol). Linked statically,
+        // the engine's FFmpeg calls are bound at the APP's link, where VLCKit sorts first and wins
+        // (measured: 105 of them, avcodec_find_decoder included, so TrueHD had no decoder). As its
+        // own dylib they are bound when THIS framework links, against AetherLib*, and no other
+        // FFmpeg in the process can take them (see docs/api.md, "Holding a second player").
+        .library(
+            name: "AetherEngineDynamic",
+            type: .dynamic,
+            targets: ["AetherEngine"]
+        ),
         // aetherctl is intentionally not exposed as a product. The target
         // uses Foundation.Process, which is unavailable on tvOS/iOS, so
         // exposing it would force SPM consumers to compile it on those
