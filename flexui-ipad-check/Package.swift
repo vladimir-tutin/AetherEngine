@@ -13,7 +13,7 @@ let package = Package(
         .target(name: "FlexuiNative", path: "FlexuiNative",
                 swiftSettings: [.swiftLanguageMode(.v5)]),
         .target(name: "AppCheck",
-                dependencies: ["FlexuiNative", .product(name: "AetherEngine", package: "AetherEngine")],
+                dependencies: ["FlexuiNative", .product(name: "AetherEngineDynamic", package: "AetherEngine")],
                 path: "AppCheck",
                 swiftSettings: [.swiftLanguageMode(.v5)]),
     ]

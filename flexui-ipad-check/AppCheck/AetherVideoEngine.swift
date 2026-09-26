@@ -2,6 +2,7 @@ import AVFoundation
 import AVKit
 import Combine
 import Foundation
+import MediaPlayer
 import UIKit
 import AetherEngine
 import FlexuiNative
@@ -15,8 +16,13 @@ import FlexuiNative
 // the same shape Plex's player uses, and it is the engine the Apple TV app already direct-plays with.
 //
 // Lives in the App target, not the FlexuiNative pod: AetherEngine is a Swift Package and a CocoaPod
-// cannot depend on one. Registered at launch through FlexVideoEngineRegistry (AppDelegate). VLCKit's
-// FFmpeg lives inside its own dynamic framework, so both engines coexist without symbol capture.
+// cannot depend on one. Registered at launch through FlexVideoEngineRegistry (AppDelegate).
+//
+// Linked as the fork's DYNAMIC product (AetherEngineDynamic). VLCKit's dylib exports the same
+// av*/sws* symbols as AetherLib*; with the engine linked statically into this executable those
+// calls were bound at the app's link where VLCKit sorts first (build 83: 105 of them, so TrueHD had
+// no decoder). As its own framework the engine binds them when IT links, against AetherLib*.
+// Audio-only sessions (no drawable) serve music; live HLS is a plain load.
 //
 // JS chooses the engine per play() (queue item `engine`), so switching back to VLC never needs a
 // native rebuild. UNVERIFIED on device at the time of writing.
@@ -51,6 +57,11 @@ final class AetherVideoEngine: NSObject {
     private var latestCues: [SubtitleCue] = []
     private var endedHandledForIndex = -1
     private var loadStartedAt: CFTimeInterval = 0
+    /// An audio switch the load could not express. Issued once playback is actually running: a
+    /// switch requested before the clock anchors is dropped by the engine (measured: at=0.000s).
+    private var pendingAudioTrackID: Int?
+    /// No drawable: audio-only session (music). No surface, subtitles or PiP.
+    private var isAudioSession = false
 
     private var pipController: AVPictureInPictureController?
     private var pipPlaybackDelegate: SoftwarePiPPlaybackDelegate?
@@ -97,6 +108,7 @@ final class AetherVideoEngine: NSObject {
         queue = items
         currentIndex = min(max(0, startIndex), items.count - 1)
         self.options = options
+        isAudioSession = drawable == nil
         attach(to: drawable)
         startCurrent(startPositionMs: options.startPositionMs)
     }
@@ -171,6 +183,7 @@ final class AetherVideoEngine: NSObject {
         endedHandledForIndex = -1
         latestCues = []
         tick = 0
+        pendingAudioTrackID = nil
         loadStartedAt = CACurrentMediaTime()
 
         var headers = options.headers
@@ -182,7 +195,10 @@ final class AetherVideoEngine: NSObject {
         let startSeconds = startPositionMs > 1000 ? Double(startPositionMs) / 1000 : nil
         log("[AetherHost] action=load rk=\(item.ratingKey) startMs=\(startPositionMs) "
             + "headers=\(headers.keys.sorted().joined(separator: ",")) "
-            + "audioOrdinal=\(item.audioOrdinal) subtitleOrdinal=\(item.subtitleOrdinal)")
+            + "audioOrdinal=\(item.audioOrdinal) audioStream=\(item.audioStreamIndex) "
+            + "subtitleOrdinal=\(item.subtitleOrdinal) subtitleStream=\(item.subtitleStreamIndex) "
+            + "session=\(isAudioSession ? "audio" : "video")")
+        let audioStream: Int32? = item.audioStreamIndex >= 0 ? Int32(item.audioStreamIndex) : nil
 
         loadTask = Task { @MainActor [weak self] in
             guard let self else { return }
@@ -194,7 +210,8 @@ final class AetherVideoEngine: NSObject {
                         httpHeaders: headers,
                         matchContentEnabled: false,
                         autoplay: true
-                    )
+                    ),
+                    audioSourceStreamIndex: audioStream
                 )
                 guard !Task.isCancelled, self.engine === engine else { return }
                 let elapsedMs = Int((CACurrentMediaTime() - self.loadStartedAt) * 1000)
@@ -203,8 +220,12 @@ final class AetherVideoEngine: NSObject {
                          + "duration=\(String(format: "%.1f", engine.duration))s "
                          + "audioTracks=\(engine.audioTracks.count) subtitleTracks=\(engine.subtitleTracks.count)")
                 self.applyStartupSelection(item: item, engine: engine)
-                self.applyCropLayout()
-                self.preparePictureInPicture()
+                if self.isAudioSession {
+                    engine.setAudioNowPlayingInfo([MPMediaItemPropertyTitle: item.title])
+                } else {
+                    self.applyCropLayout()
+                    self.preparePictureInPicture()
+                }
                 self.onItemChanged?(item.ratingKey, self.currentIndex)
                 self.onTracksChanged?()
                 self.startProgressTimer()
@@ -218,30 +239,57 @@ final class AetherVideoEngine: NSObject {
         }
     }
 
-    /// Map the server's per-type ordinals onto Aether's track ids. Both number streams in container
-    /// order, so the ordinal is primary; language only breaks a mismatch in count.
+    /// Plex's container stream index is Aether's track id, so the selection is exact. Audio was
+    /// already opened by index at load; a mismatch (or an ordinal-only request) becomes a switch
+    /// deferred until playback runs. Subtitles select immediately (no clock dependency).
     private func applyStartupSelection(item: FlexVideoQueueItem, engine: AetherEngine) {
         let audio = engine.audioTracks
-        if item.audioOrdinal >= 0, item.audioOrdinal < audio.count {
-            let target = audio[item.audioOrdinal]
-            if engine.activeAudioTrackIndex != target.id {
-                engine.selectAudioTrack(index: target.id)
-            }
-            log("[AetherTracks] audio ordinal=\(item.audioOrdinal) id=\(target.id) "
-                + "codec=\(target.codec) ch=\(target.channels) lang=\(target.language ?? "-") "
-                + "decision=\(engine.activeAudioTrackIndex == target.id ? "already-active" : "select")")
+        var audioTarget: TrackInfo?
+        var audioVia = "none"
+        if item.audioStreamIndex >= 0, let byIndex = audio.first(where: { $0.id == item.audioStreamIndex }) {
+            audioTarget = byIndex
+            audioVia = "stream-index"
+        } else if item.audioOrdinal >= 0, item.audioOrdinal < audio.count {
+            audioTarget = audio[item.audioOrdinal]
+            audioVia = "ordinal"
         }
+        if let target = audioTarget {
+            let active = engine.activeAudioTrackIndex
+            if active != target.id { pendingAudioTrackID = target.id }
+            log("[AetherTracks] audio via=\(audioVia) id=\(target.id) codec=\(target.codec) ch=\(target.channels) "
+                + "lang=\(target.language ?? "-") active=\(active.map(String.init) ?? "-") "
+                + "decision=\(active == target.id ? "opened-at-load" : "deferred-switch")")
+        }
+
         let subtitles = engine.subtitleTracks
-        if item.subtitleOrdinal >= 0, item.subtitleOrdinal < subtitles.count {
-            let target = subtitles[item.subtitleOrdinal]
+        var subtitleTarget: TrackInfo?
+        var subtitleVia = "none"
+        if item.subtitleStreamIndex >= 0, let byIndex = subtitles.first(where: { $0.id == item.subtitleStreamIndex }) {
+            subtitleTarget = byIndex
+            subtitleVia = "stream-index"
+        } else if item.subtitleOrdinal >= 0, item.subtitleOrdinal < subtitles.count {
+            subtitleTarget = subtitles[item.subtitleOrdinal]
+            subtitleVia = "ordinal"
+        }
+        if let target = subtitleTarget {
             engine.selectSubtitleTrack(index: target.id)
-            log("[AetherTracks] subtitle ordinal=\(item.subtitleOrdinal) id=\(target.id) "
-                + "codec=\(target.codec) lang=\(target.language ?? "-") decision=select")
+            log("[AetherTracks] subtitle via=\(subtitleVia) id=\(target.id) codec=\(target.codec) "
+                + "lang=\(target.language ?? "-") decision=select")
         } else if item.subtitleOrdinal < 0 {
             engine.clearSubtitle()
         } else {
-            log("[AetherTracks] subtitle ordinal=\(item.subtitleOrdinal) outOfRange=\(subtitles.count) decision=none")
+            log("[AetherTracks] subtitle ordinal=\(item.subtitleOrdinal) stream=\(item.subtitleStreamIndex) "
+                + "tracks=\(subtitles.count) decision=none")
         }
+    }
+
+    /// Issue the deferred audio switch once the engine is playing past its start.
+    private func applyPendingAudioSwitchIfReady(_ engine: AetherEngine) {
+        guard let id = pendingAudioTrackID, engine.state == .playing, tick >= 1 else { return }
+        pendingAudioTrackID = nil
+        guard engine.activeAudioTrackIndex != id else { return }
+        log("[AetherTracks] audio deferred-switch id=\(id) at=\(positionMs)ms")
+        engine.selectAudioTrack(index: id)
     }
 
     // MARK: - Observation
@@ -333,6 +381,7 @@ final class AetherVideoEngine: NSObject {
                 guard let self, let engine = self.engine else { return }
                 self.onProgress?(self.currentRatingKey, self.positionMs, self.durationMs, self.isPlaying)
                 self.tick += 1
+                self.applyPendingAudioSwitchIfReady(engine)
                 if self.tick % 2 == 0 {
                     self.log("[AetherStats] rk=\(self.currentRatingKey) tMs=\(self.positionMs) "
                              + "state=\(String(describing: engine.state)) "
@@ -430,7 +479,7 @@ final class AetherVideoEngine: NSObject {
     // MARK: - Subtitles (host overlay; the engine publishes cues on the source axis)
 
     private func renderSubtitles() {
-        guard let engine else { return }
+        guard let engine, !isAudioSession else { return }
         let now = engine.sourceTime
         let active = latestCues.filter { now >= $0.startTime && now < $0.endTime }
         var texts: [String] = []
@@ -529,7 +578,7 @@ final class AetherVideoEngine: NSObject {
     // MARK: - Picture in Picture
 
     private func preparePictureInPicture() {
-        guard let engine, AVPictureInPictureController.isPictureInPictureSupported() else { return }
+        guard let engine, !isAudioSession, AVPictureInPictureController.isPictureInPictureSupported() else { return }
         if pipController != nil { return }
         if let layer = engine.nativePlayerLayer {
             pipController = AVPictureInPictureController(playerLayer: layer)

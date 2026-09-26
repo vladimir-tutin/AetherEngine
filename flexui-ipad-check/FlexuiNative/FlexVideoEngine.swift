@@ -14,11 +14,15 @@ public struct FlexVideoQueueItem {
     public let audioTitle: String
     public let subtitleLanguage: String
     public let subtitleTitle: String
+    /// Container stream index (Plex Stream.index) of the selected audio / embedded subtitle; -1 = none.
+    public let audioStreamIndex: Int
+    public let subtitleStreamIndex: Int
 
     public init(url: URL, ratingKey: String, title: String,
                 audioOrdinal: Int, subtitleOrdinal: Int,
                 audioLanguage: String, audioTitle: String,
-                subtitleLanguage: String, subtitleTitle: String) {
+                subtitleLanguage: String, subtitleTitle: String,
+                audioStreamIndex: Int = -1, subtitleStreamIndex: Int = -1) {
         self.url = url
         self.ratingKey = ratingKey
         self.title = title
@@ -28,6 +32,8 @@ public struct FlexVideoQueueItem {
         self.audioTitle = audioTitle
         self.subtitleLanguage = subtitleLanguage
         self.subtitleTitle = subtitleTitle
+        self.audioStreamIndex = audioStreamIndex
+        self.subtitleStreamIndex = subtitleStreamIndex
     }
 }
 

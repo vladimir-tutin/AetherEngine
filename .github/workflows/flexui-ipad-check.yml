@@ -35,3 +35,18 @@ jobs:
           grep -E "BUILD (SUCCEEDED|FAILED)" build.log || true
           if [ $status -ne 0 ]; then tail -80 build.log; fi
           exit $status
+      - name: Prove the engine framework binds FFmpeg to AetherLib*
+        working-directory: flexui-ipad-check
+        run: |
+          fw=$(find ~/Library/Developer/Xcode/DerivedData -path "*Release-iphoneos*" -prune -o -name "AetherEngineDynamic.framework" -type d -print 2>/dev/null | head -1)
+          [ -z "$fw" ] && fw=$(find ~/Library/Developer/Xcode/DerivedData -name "AetherEngineDynamic.framework" -type d 2>/dev/null | head -1)
+          echo "framework: $fw"
+          bin="$fw/AetherEngineDynamic"
+          [ -f "$bin" ] || { echo "ERROR: dynamic framework binary not found"; find ~/Library/Developer/Xcode/DerivedData -name "*.framework" -maxdepth 8 | head -30; exit 1; }
+          file "$bin"
+          nm -m "$bin" | grep -E " _(avcodec_find_decoder|avcodec_open2|avformat_open_input|swr_alloc_set_opts2)$" || true
+          otool -L "$bin" | grep -iE "Aether|VLC" || true
+          bad=$(nm -m "$bin" | grep -E "\(undefined\) external _(av|sws|swr)" | grep -v "from AetherLib" | head -5)
+          [ -z "$bad" ] || { echo "ERROR: FFmpeg symbols not bound to AetherLib*:"; echo "$bad"; exit 1; }
+          echo "OK: every undefined av/sws/swr symbol resolves from AetherLib*"
+
