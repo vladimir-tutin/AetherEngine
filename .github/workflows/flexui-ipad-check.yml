@@ -30,7 +30,8 @@ jobs:
             -skipMacroValidation CODE_SIGNING_ALLOWED=NO > build.log 2>&1
           status=$?
           grep -nE "error:|warning:.*(AetherVideoEngine|FlexVideoEngine)" build.log | head -80 || true
-          echo "== compiled sources =="; grep -oE "(SwiftCompile|CompileSwift)[^
+          echo "== compiled sources =="
+          grep -E "AetherVideoEngine.swift|FlexVideoEngine.swift" build.log | grep -E "SwiftCompile|CompileSwift" | cut -c1-160 | head -6 || true
 ]*(AetherVideoEngine|FlexVideoEngine)\.swift" build.log | sort -u | head || true
           grep -E "BUILD (SUCCEEDED|FAILED)" build.log || true
           if [ $status -ne 0 ]; then tail -80 build.log; fi
