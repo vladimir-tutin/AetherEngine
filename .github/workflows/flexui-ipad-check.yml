@@ -1,0 +1,29 @@
+name: FlexUI iPad host compile check
+
+on:
+  push:
+    branches:
+      - 'flexui/ipad-host-check'
+  workflow_dispatch:
+
+jobs:
+  ipad-host:
+    runs-on: macos-26
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Select newest Xcode
+        run: |
+          newest=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -1)
+          sudo xcode-select -s "$newest/Contents/Developer"
+          xcodebuild -version
+      - name: Build AppCheck for iOS
+        working-directory: .flexui-ipad-check
+        run: |
+          set +e
+          xcodebuild build -scheme AppCheck -destination 'generic/platform=iOS' \
+            -skipMacroValidation CODE_SIGNING_ALLOWED=NO > build.log 2>&1
+          status=$?
+          grep -nE "error:|warning:.*(AetherVideoEngine|FlexVideoEngine)" build.log | head -80 || true
+          if [ $status -ne 0 ]; then tail -80 build.log; fi
+          exit $status
