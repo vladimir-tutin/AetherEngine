@@ -17,8 +17,13 @@ jobs:
           newest=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -1)
           sudo xcode-select -s "$newest/Contents/Developer"
           xcodebuild -version
+      - name: Resolve and list
+        working-directory: flexui-ipad-check
+        run: |
+          xcodebuild -resolvePackageDependencies 2>&1 | tail -30
+          xcodebuild -list 2>&1 | tail -30
       - name: Build AppCheck for iOS
-        working-directory: .flexui-ipad-check
+        working-directory: flexui-ipad-check
         run: |
           set +e
           xcodebuild build -scheme AppCheck -destination 'generic/platform=iOS' \
