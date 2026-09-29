@@ -806,6 +806,13 @@ public struct LoadOptions: Sendable, Equatable {
     /// `AetherEngine.setAudioDelay(_:)`, which is the same value seen from the other end.
     public var audioDelaySeconds: Double = 0
 
+    /// Software path: how far BEFORE the resume position the first decoded sample may land (keyframe
+    /// pre-roll of a long-GOP encode) while the clock still starts AT the resume position, dropping the
+    /// pre-roll audio the way a transport seek does. Default `SWClockAnchorPolicy.keyframePrerollSeconds`
+    /// (30). `0` restores the pre-FlexUI behaviour: any first sample more than 2 s early re-anchors the
+    /// clock there, playing that audio under a video frame held at the resume position.
+    public var resumeKeyframePrerollSeconds: Double = SWClockAnchorPolicy.keyframePrerollSeconds
+
     /// Teletext caption page for `dvb_teletext` subtitle decode. nil (default) = libzvbi auto-detect
     /// (`txt_page=subtitle`); an explicit page (e.g. 801 for AU) targets channels whose caption page
     /// libzvbi does not flag as a subtitle page. Only affects teletext streams (#107).

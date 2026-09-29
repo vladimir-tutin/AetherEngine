@@ -62,6 +62,24 @@ struct SWClockAnchorPolicyTests {
         #expect(r.sessionZeroSeconds == 2.01)
     }
 
+    @Test("long-GOP resume keeps the resume anchor when the keyframe lands behind it")
+    func longGopResumeKeepsAnchor() {
+        // Measured on FlexUI 2026-09-28: resume target 1090.678, keyframe/first audio 1083.559.
+        let r = SWClockAnchorPolicy.resolve(initialSeconds: 1090.678, firstSampleSeconds: 1083.559)
+        #expect(r.anchorSeconds == 1090.678)
+        #expect(r.sessionZeroSeconds == 0)
+        #expect(abs(r.keptPrerollSeconds - 7.119) < 0.001)
+    }
+
+    @Test("pre-roll exactly at the window keeps the anchor; past it re-anchors")
+    func prerollWindowBoundary() {
+        let atWindow = SWClockAnchorPolicy.resolve(initialSeconds: 100, firstSampleSeconds: 70)
+        #expect(atWindow.anchorSeconds == 100)
+        let past = SWClockAnchorPolicy.resolve(initialSeconds: 100, firstSampleSeconds: 69.9)
+        #expect(past.anchorSeconds == 69.9)
+        #expect(past.keptPrerollSeconds == 0)
+    }
+
     @Test("session zero never goes negative when the stream starts before the anchor")
     func firstSampleBehindAnchor() {
         // A first sample far BEHIND the requested anchor (broken seek) still re-anchors

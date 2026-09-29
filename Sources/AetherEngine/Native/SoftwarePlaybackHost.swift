@@ -600,6 +600,8 @@ final class SoftwarePlaybackHost {
 
     /// Start position captured so the demux loop aligns the synchronizer clock to the first sample's PTS; non-zero resume without this would cause "frozen frame, no audio".
     private var initialClockTime: CMTime = .zero
+    /// `LoadOptions.resumeKeyframePrerollSeconds` for this session; read when the demux loop starts.
+    var resumeKeyframePrerollSeconds: Double = SWClockAnchorPolicy.keyframePrerollSeconds
 
     nonisolated var isPlaying: Bool {
         get { flagsLock.lock(); defer { flagsLock.unlock() }; return _isPlaying }
@@ -1875,6 +1877,7 @@ final class SoftwarePlaybackHost {
         let rndr = renderer
         let condition = demuxCondition
         let initialClock = initialClockTime
+        let prerollWindow = resumeKeyframePrerollSeconds
         // Read at arm time, not captured: a host setRate between load and arming must reach
         // the anchor (the eager synchronizer call it replaced is gated on clockArmed, #107).
         let currentRate: @Sendable () -> Float = { [weak self] in
@@ -2066,6 +2069,7 @@ final class SoftwarePlaybackHost {
                 renderer: rndr,
                 condition: condition,
                 initialClockTime: initialClock,
+                keyframePrerollSeconds: prerollWindow,
                 currentRate: currentRate,
                 diag: diag,
                 ring: ring,
@@ -2561,6 +2565,13 @@ final class SoftwarePlaybackHost {
                 category: .swPlayback
             )
             onClockAnchored(resolution.sessionZeroSeconds)
+        } else if resolution.keptPrerollSeconds > 0 {
+            EngineLog.emit(
+                "[SWHost] clock kept at load anchor: anchor=\(String(format: "%.3f", resolution.anchorSeconds))s "
+                + "firstSampleBehind=\(String(format: "%.3f", resolution.keptPrerollSeconds))s "
+                + "reason=keyframe-preroll decision=drop-pre-anchor-audio",
+                category: .swPlayback
+            )
         }
     }
 
@@ -2576,6 +2587,7 @@ final class SoftwarePlaybackHost {
         renderer: SampleBufferRenderer,
         condition: NSCondition,
         initialClockTime: CMTime,
+        keyframePrerollSeconds: Double = SWClockAnchorPolicy.keyframePrerollSeconds,
         currentRate: @Sendable () -> Float,
         diag: SWPlaybackDiagState? = nil,
         ring: PacketRingBuffer?,
@@ -2847,7 +2859,8 @@ final class SoftwarePlaybackHost {
             let pktPtsSec = (packet.pointee.pts != Int64.min && videoTimeBaseSeconds > 0)
                 ? Double(packet.pointee.pts) * videoTimeBaseSeconds : Double.nan
             let resolution = SWClockAnchorPolicy.resolve(
-                initialSeconds: initialClockTime.seconds, firstSampleSeconds: pktPtsSec)
+                initialSeconds: initialClockTime.seconds, firstSampleSeconds: pktPtsSec,
+                keyframePrerollSeconds: keyframePrerollSeconds)
             armClock(aOut, resolution: resolution, initialClockTime: initialClockTime,
                      rate: currentRate(), onClockAnchored: onClockAnchored)
             markClockArmed()
@@ -3144,7 +3157,8 @@ final class SoftwarePlaybackHost {
                             let pktPtsSec = (packet.pointee.pts != Int64.min && videoTimeBaseSeconds > 0)
                                 ? Double(packet.pointee.pts) * videoTimeBaseSeconds : Double.nan
                             let resolution = SWClockAnchorPolicy.resolve(
-                                initialSeconds: initialClockTime.seconds, firstSampleSeconds: pktPtsSec)
+                                initialSeconds: initialClockTime.seconds, firstSampleSeconds: pktPtsSec,
+                keyframePrerollSeconds: keyframePrerollSeconds)
                             armClock(aOut, resolution: resolution, initialClockTime: initialClockTime,
                                      rate: currentRate(), onClockAnchored: onClockAnchored)
                             markClockArmed()
@@ -3248,7 +3262,8 @@ final class SoftwarePlaybackHost {
                     let firstPts = CMSampleBufferGetPresentationTimeStamp(buffers[0])
                     let resolution = SWClockAnchorPolicy.resolve(
                         initialSeconds: initialClockTime.seconds,
-                        firstSampleSeconds: firstPts.isValid ? firstPts.seconds : Double.nan)
+                        firstSampleSeconds: firstPts.isValid ? firstPts.seconds : Double.nan,
+                        keyframePrerollSeconds: keyframePrerollSeconds)
                     armClock(aOut, resolution: resolution, initialClockTime: initialClockTime,
                              rate: currentRate(), onClockAnchored: onClockAnchored)
                     markClockArmed()

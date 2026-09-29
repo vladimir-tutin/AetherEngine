@@ -17,17 +17,36 @@ enum SWClockAnchorPolicy {
     /// minutes to hours. Seconds.
     static let toleranceSeconds: Double = 2.0
 
+    /// How far BEHIND the load anchor a first sample may land and still be keyframe pre-roll.
+    ///
+    /// A resume seeks the demuxer to the keyframe at or before the target, so audio starts up to
+    /// one GOP early. Long-GOP encodes (anime, 7 s measured on FlexUI 2026-09-28) put that past
+    /// `toleranceSeconds`, and re-anchoring there started the clock at the keyframe: ~7 s of
+    /// pre-resume audio under a video frame held at the resume target. The transport seek never
+    /// re-anchors in that case (it seeks the clock straight to the target), so a resume must not
+    /// either. A first sample far further behind is still treated as a broken seek and re-anchors.
+    static let keyframePrerollSeconds: Double = 30.0
+
     struct Resolution: Equatable {
         let anchorSeconds: Double
         let sessionZeroSeconds: Double
+        /// Non-zero when the load anchor was kept although the first sample landed this many
+        /// seconds before it (keyframe pre-roll). Diagnostic only.
+        var keptPrerollSeconds: Double = 0
     }
 
     static func resolve(initialSeconds: Double,
                         firstSampleSeconds: Double,
-                        toleranceSeconds: Double = SWClockAnchorPolicy.toleranceSeconds) -> Resolution {
+                        toleranceSeconds: Double = SWClockAnchorPolicy.toleranceSeconds,
+                        keyframePrerollSeconds: Double = SWClockAnchorPolicy.keyframePrerollSeconds) -> Resolution {
         guard firstSampleSeconds.isFinite,
               abs(firstSampleSeconds - initialSeconds) > toleranceSeconds else {
             return Resolution(anchorSeconds: initialSeconds, sessionZeroSeconds: 0)
+        }
+        let behind = initialSeconds - firstSampleSeconds
+        if initialSeconds > 0, behind > 0, behind <= keyframePrerollSeconds {
+            return Resolution(anchorSeconds: initialSeconds, sessionZeroSeconds: 0,
+                              keptPrerollSeconds: behind)
         }
         return Resolution(anchorSeconds: firstSampleSeconds,
                           sessionZeroSeconds: max(0, firstSampleSeconds - initialSeconds))

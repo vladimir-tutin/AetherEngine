@@ -1912,6 +1912,7 @@ extension AetherEngine {
         self.softwareSubtitlePacketStore = packetStore
         host.preserveASSMarkupForSubtitleTap = loadedOptions.preserveASSMarkup
         host.teletextPageForSubtitleTap = loadedOptions.teletextPage
+        host.resumeKeyframePrerollSeconds = max(0, loadedOptions.resumeKeyframePrerollSeconds)
         host.subtitleTapSink = { idx, pkt, tb, assembleSplitSets in
             packetStore.harvest(streamIndex: idx, packet: pkt, timeBase: tb,
                                 assembleSplitDisplaySets: assembleSplitSets)
