@@ -234,8 +234,104 @@ final class SampleBufferRenderer: @unchecked Sendable {
     /// Demux-loop back-pressure gate. Read from the renderer, never the layer: the layer's own
     /// isReadyForMoreMediaData stays optimistically true even when the renderer queue is full, causing
     /// FigVideoQueueRemote -12080 on over-enqueue.
+    ///
+    /// FlexUI: ALSO closed while the decoded lead over the running timebase exceeds the memory
+    /// budget (`DecodedFrameBudgetPolicy.swift`). Every video feed already waits on this property,
+    /// so the budget needs no loop of its own; the clock-arming guards that read it see "full"
+    /// only once the clock runs, which is after they have done their work.
     var isReadyForMoreMediaData: Bool {
-        queueTarget.isReadyForMoreMediaData
+        queueTarget.isReadyForMoreMediaData && !decodedLeadOverBudget()
+    }
+
+    // MARK: - FlexUI decoded-frame budget
+
+    private let budgetLock = NSLock()
+    private var _budgetFrameBytes = 0
+    private var _budgetFrameDurationSeconds = 0.0
+    private var _budgetLimit = AetherDecodedFrameLimit.unlimited
+    private var _budgetRevision = -1
+    private var _budgetHolding = false
+    private var _budgetHolds = 0
+
+    /// Host: the stream's frame interval (1 / avg_frame_rate), set at open. 0 = unknown, gate open.
+    func setDecodedFrameDuration(seconds: Double) {
+        budgetLock.lock()
+        _budgetFrameDurationSeconds = seconds
+        _budgetRevision = -1
+        budgetLock.unlock()
+    }
+
+    /// Host: the decoded buffer the stream actually produces, measured off the first frame. Read
+    /// per plane so biplanar 10-bit (3 bytes/px) and 8-bit (1.5 bytes/px) cost what they cost.
+    func noteDecodedFrameSize(_ pixelBuffer: CVPixelBuffer) {
+        let planes = CVPixelBufferGetPlaneCount(pixelBuffer)
+        var bytes = 0
+        if planes == 0 {
+            bytes = CVPixelBufferGetBytesPerRow(pixelBuffer) * CVPixelBufferGetHeight(pixelBuffer)
+        } else {
+            for plane in 0..<planes {
+                bytes += CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, plane)
+                    * CVPixelBufferGetHeightOfPlane(pixelBuffer, plane)
+            }
+        }
+        budgetLock.lock()
+        _budgetFrameBytes = bytes
+        _budgetRevision = -1
+        budgetLock.unlock()
+    }
+
+    /// Cumulative budget parks for the diagnostic line.
+    var budgetHolds: Int {
+        budgetLock.lock()
+        defer { budgetLock.unlock() }
+        return _budgetHolds
+    }
+
+    /// The limit for the open stream under the CURRENT policy; re-resolved when the host changes
+    /// the policy or the stream's frame cost/interval becomes known. Logged once per resolution.
+    private func currentBudgetLimit() -> AetherDecodedFrameLimit {
+        let revision = AetherDecodedFrameBudget.revision
+        budgetLock.lock()
+        if _budgetRevision == revision { defer { budgetLock.unlock() }; return _budgetLimit }
+        let limit = AetherDecodedFrameBudget.policy.resolve(
+            frameBytes: _budgetFrameBytes, frameDurationSeconds: _budgetFrameDurationSeconds)
+        let changed = limit != _budgetLimit
+        _budgetLimit = limit
+        _budgetRevision = revision
+        budgetLock.unlock()
+        if changed {
+            AetherDecodedFrameBudget.recordApplied(limit)
+            EngineLog.emit(
+                "[DecodedFrameBudget] applied reason=\(limit.reason) "
+                + "frameMiB=\(String(format: "%.2f", Double(limit.frameBytes) / 1048576)) "
+                + "frameMs=\(String(format: "%.2f", limit.frameDurationSeconds * 1000)) "
+                + "maxFrames=\(limit.frames) "
+                + "maxLeadS=\(limit.isLimited ? String(format: "%.3f", limit.leadSeconds) : "open") "
+                + "mechanism=renderer-ready-gate-on-timebase-lead",
+                category: .swPlayback)
+        }
+        return limit
+    }
+
+    /// True while the newest admitted frame sits further ahead of the RUNNING timebase than the
+    /// budget allows. A stopped timebase (unarmed, paused, starvation hold) never closes the gate:
+    /// the queue cannot drain against it, so holding decode there would be a deadlock, not a saving.
+    private func decodedLeadOverBudget() -> Bool {
+        let limit = currentBudgetLimit()
+        guard limit.isLimited else { return false }
+        let timebase = queueTarget.timebase
+        guard CMTimebaseGetRate(timebase) > 0 else { return false }
+        let clock = CMTimebaseGetTime(timebase).seconds
+        guard clock.isFinite, let frontier = newestEnqueuedPtsSeconds else { return false }
+        let over = frontier - clock > limit.leadSeconds
+        budgetLock.lock()
+        if over, !_budgetHolding {
+            _budgetHolds += 1
+            AetherDecodedFrameBudget.noteHold()
+        }
+        _budgetHolding = over
+        budgetLock.unlock()
+        return over
     }
 
     private var queueStatus: AVQueuedSampleBufferRenderingStatus { videoRenderer.status }

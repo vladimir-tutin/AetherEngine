@@ -769,6 +769,16 @@ final class SoftwarePlaybackHost {
         self.videoStreamIndex = dem.videoStreamIndex
         let vtb = vStream.pointee.time_base
         self.videoTimeBaseSeconds = vtb.den > 0 ? Double(vtb.num) / Double(vtb.den) : 0
+        // FlexUI decoded-frame budget: the frame interval turns a frame count into the lead the
+        // renderer gate enforces. avg_frame_rate first (container-declared), r_frame_rate as the
+        // fallback; 0 leaves the budget unresolved and the gate open rather than guessing.
+        let avgRate = vStream.pointee.avg_frame_rate
+        let rawRate = vStream.pointee.r_frame_rate
+        let videoFrameRate: Double = avgRate.num > 0 && avgRate.den > 0
+            ? Double(avgRate.num) / Double(avgRate.den)
+            : (rawRate.num > 0 && rawRate.den > 0 ? Double(rawRate.num) / Double(rawRate.den) : 0)
+        renderer.setDecodedFrameDuration(seconds: videoFrameRate > 0 ? 1 / videoFrameRate : 0)
+        AetherDecodedFrameBudget.resetTelemetry()
         // #315: armed once there is a video stream to display. A fresh host means a fresh layer, so
         // there is no carried-in picture to guard against here (the native path's problem).
         armReadyForDisplayObserver()
@@ -874,6 +884,9 @@ final class SoftwarePlaybackHost {
                     self.renderer.drainReorderBuffer()
                     self.presentFirstFrameUnderPause(pts: pts.seconds, generation: self.decodeGeneration)
                 }
+                // FlexUI decoded-frame budget: the measured cost of ONE decoded frame of this
+                // stream; the renderer gate resolves its lead cap from it.
+                self.renderer.noteDecodedFrameSize(pixelBuffer)
                 let pfType = CVPixelBufferGetPixelFormatType(pixelBuffer)
                 EngineLog.emit(
                     "[SWHost] first video frame enqueued: "
@@ -3449,6 +3462,8 @@ final class SoftwarePlaybackHost {
                 + "delay=\(delay >= 0 ? String(format: "%.2f", delay) : "-")"
                 + "(\(dDelay >= 0 ? "+" : "")\(String(format: "%.2f", dDelay))) "
                 + "corrupt=\(m?.corrupted ?? -1) "
+                // FlexUI: parks taken on the decoded-frame memory budget (cumulative).
+                + "bHold=\(self.renderer.budgetHolds) "
                 + "status=\(self.renderer.diagStatusName) surf=\(surface) "
                 + "r4d=\(r4d)",
                 category: .swPlayback
